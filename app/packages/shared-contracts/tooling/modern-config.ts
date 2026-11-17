@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import type { AppUserConfig } from '@modern-js/app-tools';
 import { getBuildConfigEnvironment, resolveDeployTarget } from '@modern-js/app-tools-extensions/config';
 import {
   getOrElse as getOptionOrElse,
@@ -30,6 +31,13 @@ import type {
 } from '../../core-runtime/src/db/database-identity-manifest.ts';
 
 type BuildEnvironmentReader = (name: string) => string | undefined;
+
+const BROWSER_TARGETS = ['Chrome >= 144', 'Safari >= 27', 'iOS >= 27'];
+
+const browserTargetTools: AppUserConfig['tools'] = {
+  // A function replaces the preset's ['defaults'] list instead of merging it into our targets.
+  autoprefixer: (config) => ({ ...config, overrideBrowserslist: BROWSER_TARGETS }),
+};
 
 /**
  * The Hyperdrive bindings a Worker build declares: the `cloudflareHyperdrive` of each database
@@ -250,10 +258,16 @@ export const createWorkspaceModernConfig = ({
     setupMiddlewares: appId === 'shell-super-app' ? [] : [createDevelopmentContractMiddleware(moduleUrl)],
   },
   output: {
+    overrideBrowserslist: BROWSER_TARGETS,
     // The native TS-Go checker blocks every first compile on a check of the whole reference graph, which
-    // holds a cold dev server past readiness budgets. Builds keep the checker; in `modern dev`,
-    // `pnpm typecheck` owns type diagnostics.
-    disableTsChecker: readBuildEnvironmentValue('NODE_ENV') === 'development',
+    // holds a cold dev server past readiness budgets. The required workspace CI job owns type
+    // diagnostics once; deployment and local builds still check unless explicitly separated.
+    disableTsChecker:
+      readBuildEnvironmentValue('NODE_ENV') === 'development' ||
+      readBuildEnvironmentValue('ONTOS_CI_TYPECHECK_SEPARATE') === '1',
+    ...(readBuildEnvironmentValue('ONTOS_CI_TYPECHECK_SEPARATE') === '1'
+      ? { sourceMap: { js: false as const } }
+      : undefined),
   },
   server: {
     publicDir: ['./.dev-public'],
@@ -264,4 +278,7 @@ export const createWorkspaceModernConfig = ({
       ULTRAMODERN_SHELL_ORIGIN: readBuildEnvironmentValue('ULTRAMODERN_MF_DEV_ORIGIN') ?? 'http://localhost:3020',
     },
   },
+  tools: {
+    ...browserTargetTools,
+  } satisfies AppUserConfig['tools'],
 });
