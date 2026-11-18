@@ -219,7 +219,7 @@ runs:
 
     - name: Save the pnpm store
       if: >-
-        inputs.save-store == 'true' && github.ref == 'refs/heads/main' &&
+        inputs.save-store == 'true' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/bench/')) &&
         steps.restored.outputs.usable != 'true' && steps.restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:

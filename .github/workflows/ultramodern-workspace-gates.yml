@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+      # Benchmark harness: a push to a bench base branch only seeds the caches its PRs restore.
+      - 'bench/**'
     paths-ignore:
       - 'docs/**'
       - CONTEXT-MAP.md
@@ -14,12 +16,11 @@ on:
   pull_request:
     branches:
       - main
+      - 'bench/**'
   # The merge queue proves the exact commit that lands on main. Its push then deploys without re-running the gates.
   merge_group:
     types:
       - checks_requested
-  schedule:
-    - cron: '30 2 * * *'
   workflow_dispatch:
     inputs:
       force-ci-full:
@@ -220,7 +221,7 @@ jobs:
   ci-plan:
     name: Select required checks from changed inputs
     needs: [queue-proof]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/bench/')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # actions: read finds the newest green push run of a branch without a merge queue.
@@ -315,7 +316,7 @@ jobs:
   # while ubuntu-latest moved the gates to 26.04, and every run missed both entries.
   warm-caches:
     name: Warm the gate caches on main
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/bench/'))
     runs-on: &gate-image ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -1369,7 +1370,7 @@ jobs:
   # Keep one required check. Selected jobs must succeed and every skipped job must be explicitly planned.
   workspace-gates:
     name: Workspace gates
-    if: ${{ always() }}
+    if: ${{ always() && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/bench/')) }}
     needs:
       [
         queue-proof,
