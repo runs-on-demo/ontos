@@ -20,7 +20,7 @@ import { pspReadOperationForExecution } from '../../persistence/psp-worker-routi
 import type { PspOperationForExecution } from '../../persistence/psp-worker-routines.ts';
 import { GatewayBindingResolver } from './binding-resolver.ts';
 import { ProviderDispatchLedger, replayRequestOf } from './dispatch-ledger.ts';
-import type { ProviderDispatchIdentity, ProviderDispatchRecord, RefundSerialization } from './dispatch-ledger.ts';
+import type { ProviderDispatchIdentity, ProviderDispatchRecord } from './dispatch-ledger.ts';
 import { ProviderEvidenceStore } from './evidence-store.ts';
 import { GatewayProviderAdapters } from './psp-adapter.ts';
 import type { GatewayProviderAdapter } from './psp-adapter.ts';
@@ -34,7 +34,6 @@ import type {
   GatewayProviderUnavailableError,
   GatewayProviderUnsupportedError,
 } from './psp-errors.ts';
-import { toGatewayPayerContact } from './psp-request.ts';
 import type { GatewayExecutionTarget, GatewayExpectedEffect, ProviderObjectRef } from './psp-request.ts';
 import type {
   PreparedProviderRequest,
@@ -384,26 +383,16 @@ const continueFromRecord = (execution: Execution, adapter: GatewayProviderAdapte
 // Preparing a new request
 // ---------------------------------------------------------------------------------------------
 
-/**
- * Commits the prepared request (the durable handoff) and hands it to the send step. A GoPay refund baseline goes
- * with the refund dispatch count of the serialization check it was read after (`refundDispatchCount`).
- */
+/** Commits the prepared request (the durable handoff) and hands it to the send step. */
 const commitPrepared = Effect.fn('GatewayOperationExecutor.commitPrepared')(function* commitPrepared(
   execution: Execution,
   adapter: GatewayProviderAdapter,
   prepared: PreparedProviderRequest,
   returnToken: Option.Option<GatewayReturnToken>,
-  refundDispatchCount: Option.Option<number>,
   onDeferred: () => StepEffect,
 ) {
   const ledger = yield* ProviderDispatchLedger;
-  const result = yield* ledger.prepare({
-    ...writeOf(execution),
-    identity: execution.identity,
-    prepared,
-    refundDispatchCount: Option.isSome(prepared.refundBaseline) ? refundDispatchCount : Option.none(),
-    returnToken,
-  });
+  const result = yield* ledger.prepare({ ...writeOf(execution), identity: execution.identity, prepared, returnToken });
   return yield* Match.valueTags(result, {
     CONFLICT: ({ existing }) =>
       Effect.fail(
@@ -417,9 +406,6 @@ const commitPrepared = Effect.fn('GatewayOperationExecutor.commitPrepared')(func
     EXISTING: () => Effect.succeed(defer(DateTime.toEpochMillis(execution.now) + MIN_DEFERRAL_DELAY_MS)),
     PREPARED: ({ record }) =>
       Effect.succeed(dispatchStep({ adapter, execution, prepared, record, replay: Option.none() })),
-    // Another refund of the payment was prepared after the baseline was read: nothing was written or sent; the
-    // next delivery checks and reads the baseline again (#1158).
-    REFUND_BASELINE_STALE: onDeferred,
     WITHHELD: () => withheldCollection(execution),
   });
 });
@@ -430,7 +416,6 @@ const prepareThen = (
   adapter: GatewayProviderAdapter,
   prepare: Effect.Effect<PreparedProviderRequest, GatewayProviderUnavailableError | GatewayProviderUnsupportedError>,
   returnToken: Option.Option<GatewayReturnToken>,
-  refundDispatchCount: Option.Option<number>,
   onDeferred: () => StepEffect,
 ): StepEffect =>
   prepare.pipe(
@@ -441,8 +426,7 @@ const prepareThen = (
             waitOr(execution, () => notSent(execution, 'PREPARE_UNAVAILABLE', 'prepare_unavailable')),
           GatewayProviderUnsupported: () => unsupported(execution),
         }),
-      onSuccess: (prepared) =>
-        commitPrepared(execution, adapter, prepared, returnToken, refundDispatchCount, onDeferred),
+      onSuccess: (prepared) => commitPrepared(execution, adapter, prepared, returnToken, onDeferred),
     }),
   );
 
@@ -470,12 +454,11 @@ const executeCollect = Effect.fn('GatewayOperationExecutor.collect')(function* e
       correlation: deriveProviderCorrelation(payload.operationId),
       issuedAt: execution.now,
       operationId: payload.operationId,
-      payerContact: execution.operation.payerContact.pipe(Option.map(toGatewayPayerContact)),
+      payerContact: Option.none(),
       paymentId: payload.paymentId,
       returnToken,
     }),
     Option.some(returnToken),
-    Option.none(),
     () => Effect.succeed(defer(DateTime.toEpochMillis(execution.now) + MIN_DEFERRAL_DELAY_MS)),
   );
 });
@@ -529,7 +512,6 @@ const refundProviderTarget = Effect.fn('GatewayOperationExecutor.refundProviderT
   }
   const findings = yield* adapter
     .lookup(execution.target, {
-      acknowledgedRefundBaseline: Option.none(),
       dispatchedAt: targetRecord.preparedAt,
       expected: { _tag: 'COLLECT', amount: amount.value, operationId: targetRecord.operationId },
       target: { _tag: 'PROVIDER_OBJECT', ref: collectionRef },
@@ -563,17 +545,15 @@ const executeRefund = Effect.fn('GatewayOperationExecutor.refund')(function* exe
   }
   const priorRefundUnresolved = () =>
     waitOr(execution, () => notSent(execution, 'PRIOR_REFUND_UNRESOLVED', 'prior_refund_unresolved'));
-  const serialization = REFUND_SERIALIZED_FAMILIES.has(execution.delivery.binding.providerFamily)
-    ? Option.some(
-        yield* ledger.refundSerialization({
-          bindingId: execution.target.bindingId,
-          providerPaymentRef: providerTarget.value,
-          scope: execution.scope,
-        }),
-      )
-    : Option.none<RefundSerialization>();
-  if (Option.exists(serialization, ({ unresolved }) => unresolved)) {
-    return yield* priorRefundUnresolved();
+  if (REFUND_SERIALIZED_FAMILIES.has(execution.delivery.binding.providerFamily)) {
+    const unresolved = yield* ledger.hasUnresolvedRefund({
+      bindingId: execution.target.bindingId,
+      providerPaymentRef: providerTarget.value,
+      scope: execution.scope,
+    });
+    if (unresolved) {
+      return yield* priorRefundUnresolved();
+    }
   }
   return yield* prepareThen(
     execution,
@@ -587,8 +567,6 @@ const executeRefund = Effect.fn('GatewayOperationExecutor.refund')(function* exe
       targetOperationId,
     }),
     Option.none(),
-    // The count of this check travels with a GoPay baseline read after it; prepare refuses it once stale (#1158).
-    serialization.pipe(Option.map(({ refundDispatchCount }) => refundDispatchCount)),
     priorRefundUnresolved,
   );
 });
@@ -660,7 +638,6 @@ const cancelAgainstTarget = (
         providerTarget,
         targetOperationId: targetOperation.operationId,
       }),
-      Option.none(),
       Option.none(),
       () => cancelTargetUnresolved(execution),
     );

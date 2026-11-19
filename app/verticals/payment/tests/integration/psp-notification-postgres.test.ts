@@ -237,21 +237,13 @@ const preparedCollect = Effect.fn('PspNotificationFixture.collect')(function* pr
     ],
     idempotencyKey: Option.some(idempotencyKey),
     orderReference,
-    refundBaseline: Option.none(),
     replayWindowMs: Option.some(86_400_000),
     requestHash: 'a'.repeat(64),
   });
   yield* inWorker(runtime, scope, ({ scope: worker, workerContext }) =>
     Effect.service(ProviderDispatchLedger).pipe(
       Effect.flatMap((ledger) =>
-        ledger.prepare({
-          identity,
-          prepared,
-          refundDispatchCount: Option.none(),
-          returnToken: Option.none(),
-          scope: worker,
-          workerContext,
-        }),
+        ledger.prepare({ identity, prepared, returnToken: Option.none(), scope: worker, workerContext }),
       ),
     ),
   ).pipe(Effect.provide(storesLayer));

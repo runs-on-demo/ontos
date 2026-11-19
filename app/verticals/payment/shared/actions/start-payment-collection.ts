@@ -4,7 +4,6 @@ import { PaymentIdSchema, PaymentOperationKeySchema } from '../domain/payment-id
 import { PaymentMonetaryAmountSchema } from '../domain/payment-money.ts';
 import { PaymentMethodSchema } from '../domain/payment-vocabulary.ts';
 import { PaymentOperationViewSchema } from '../domain/lifecycle-views.ts';
-import { PAYER_CONTACT_PROBLEM_CODES, PaymentPayerContactSchema } from '../domain/payment-payer-contact.ts';
 
 /**
  * Start the one COLLECT operation of a Payment (#1148 aggregate collection invariant, #1149). The
@@ -13,15 +12,11 @@ import { PAYER_CONTACT_PROBLEM_CODES, PaymentPayerContactSchema } from '../domai
  * `operationKey` is the business idempotency anchor: the same key and material request recover the same
  * operation, a changed request under the same key is a conflict, and a second distinct live or proven
  * COLLECT is a conflict.
- * `payerContact` is operation-scoped input, not operation material: it is not part of the material hash,
- * Reads, views or events, and it is never stored beyond dispatch preparation. Which fields a binding
- * requires is decided by its provider family (see `payerContactProblemFor`).
  */
 export const StartPaymentCollectionPayloadSchema = Schema.Struct({
   amount: PaymentMonetaryAmountSchema,
   method: PaymentMethodSchema,
   operationKey: PaymentOperationKeySchema,
-  payerContact: Schema.optionalKey(PaymentPayerContactSchema),
   paymentId: PaymentIdSchema,
 });
 export type StartPaymentCollectionPayload = typeof StartPaymentCollectionPayloadSchema.Type;
@@ -33,15 +28,3 @@ export const StartPaymentCollectionResultSchema = Schema.Struct({
   replayed: Schema.Boolean,
 });
 export type StartPaymentCollectionResult = typeof StartPaymentCollectionResultSchema.Type;
-
-/**
- * The payer contact does not fit the provider family of the Payment's original gateway binding, or a
- * contact was given for a binding that sends none (plan D-P3). Nothing was written.
- */
-export class PaymentPayerContactRefused extends Schema.TaggedError<PaymentPayerContactRefused>()(
-  'PaymentPayerContactRefused',
-  {
-    code: Schema.Literals(PAYER_CONTACT_PROBLEM_CODES),
-    reason: Schema.String,
-  },
-) {}

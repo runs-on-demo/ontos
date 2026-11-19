@@ -3,7 +3,6 @@
 // @ontos-action-slug capture-provider-notification
 import type { ActionHandlerContext, OperationalScope, ScopedTransactionExecutor } from '@app/core-runtime';
 import { OperationContextUnavailable, defineAction, defineTenantModuleEntrypoint } from '@app/core-runtime';
-import { readVerifiedGatewayRouteScope } from '@app/core-runtime/auth/system-principal-context-provenance';
 import { DateTime, Effect, Match, Option, Schema } from 'effect';
 
 import {
@@ -23,11 +22,6 @@ import { GatewayProviderAdapters } from '../integrations/psp/psp-adapter.ts';
 import type { GatewayProviderAdaptersContract } from '../integrations/psp/psp-adapter.ts';
 import type { GatewayProviderUnavailableError } from '../integrations/psp/psp-errors.ts';
 import type { GatewayExecutionTarget } from '../integrations/psp/psp-request.ts';
-import {
-  pspBindingRouteReaderForTransaction,
-  routeScopeNamesBindingRoute,
-} from '../persistence/psp-binding-route-persistence.ts';
-import type { BoundProviderBindingRoute, PspBindingRouteReader } from '../persistence/psp-binding-route-persistence.ts';
 import { pspNotificationCapturePersistenceForTransaction } from '../persistence/psp-notification-capture-persistence.ts';
 import type {
   CaptureProviderNotificationOutcome,
@@ -48,7 +42,6 @@ export interface CaptureProviderNotificationServices {
   readonly adapters: GatewayProviderAdaptersContract;
   readonly bindings: GatewayCaptureBindingReader;
   readonly notifications: PspNotificationCapturePersistence;
-  readonly routes: PspBindingRouteReader;
 }
 
 type CaptureContext = ActionHandlerContext<typeof domainEvents, CaptureProviderNotificationServices>;
@@ -67,26 +60,6 @@ const ownerScopeOf = (context: CaptureContext) =>
     : decodeOwnerScope({ legalEntityId: context.scope.legalEntityId, tenantId: context.scope.tenantId }).pipe(
         Effect.mapError((cause) => paymentUnavailable('The verified invocation scope is not a Payment scope', cause)),
       );
-
-/**
- * AUTHORIZATION.md:127, #1157: the admitted invocation must carry the Shell-signed route scope of exactly one
- * binding route. Without one nothing is read or written; the relay gets a retryable failure.
- */
-const requireRouteScope = (context: CaptureContext) =>
-  Effect.fromNullishOr(readVerifiedGatewayRouteScope(context.scope)).pipe(
-    Effect.mapError((cause) =>
-      paymentUnavailable('Provider notification capture requires a verified provider binding route scope', cause),
-    ),
-  );
-
-/**
- * The binding the signed route names, and only when the payload's family, environment and account ref are that
- * binding's: a payload can never redirect a notification to another merchant's binding or environment.
- */
-const routeMatchesPayload = (route: BoundProviderBindingRoute, payload: CaptureProviderNotificationPayload) =>
-  route.providerFamily === payload.family &&
-  route.environment === payload.environment &&
-  route.providerAccountRef === payload.providerAccountRef;
 
 /** The envelope exactly as received, stamped with OntOS's own receipt instant. */
 const rawNotificationOf = (
@@ -203,9 +176,6 @@ const captureForBinding = Effect.fn('CaptureProviderNotification.captureForBindi
  * #1157: captures one provider notification for the Provider Account Binding it was addressed to, in the
  * trusted Tenant and Selling Legal Entity of the admitted workload invocation.
  *
- * - No verified binding route scope: unavailable, before anything is read or written.
- * - The signed route does not name a route of this scope, or its binding is not the payload's family,
- *   environment and ref: REJECTED `BINDING_UNKNOWN`; nothing is stored.
  * - No binding of the route family with this ref in this scope and environment: REJECTED `BINDING_UNKNOWN`.
  * - Not authentic for that binding: REJECTED with the adapter's reason; nothing is stored.
  * - An already stored delivery identity of the binding: DUPLICATE; nothing new is written.
@@ -219,25 +189,16 @@ const captureForBinding = Effect.fn('CaptureProviderNotification.captureForBindi
 export const handleCaptureProviderNotification = Effect.fn('CaptureProviderNotification.handle')(
   function* handleCaptureProviderNotification(payload: CaptureProviderNotificationPayload, context: CaptureContext) {
     const scope = yield* ownerScopeOf(context);
-    const proof = yield* requireRouteScope(context);
     const receivedAt = yield* DateTime.now;
     const notification = rawNotificationOf(payload, receivedAt);
-    const routed = (yield* context.services.routes.readRouteOfBinding(proof.sourceRouteId)).pipe(
-      Option.filter((route) => routeScopeNamesBindingRoute(proof, route, scope) && routeMatchesPayload(route, payload)),
-    );
-    const target = Option.isNone(routed)
-      ? Option.none<GatewayExecutionTarget>()
-      : (yield* context.services.bindings
-          .resolveForCapture({
-            environment: payload.environment,
-            providerAccountRef: payload.providerAccountRef,
-            providerFamily: payload.family,
-            scope,
-          })
-          .pipe(Effect.mapError(gatewayUnavailable))).pipe(
-          // The resolved binding must be the routed one itself, never another binding sharing its ref.
-          Option.filter((candidate) => candidate.bindingId === proof.sourceRouteId),
-        );
+    const target = yield* context.services.bindings
+      .resolveForCapture({
+        environment: payload.environment,
+        providerAccountRef: payload.providerAccountRef,
+        providerFamily: payload.family,
+        scope,
+      })
+      .pipe(Effect.mapError(gatewayUnavailable));
     yield* recordProviderAccountBindingLookup(context, {
       recordId: target.pipe(
         Option.map((resolved) => resolved.bindingId),
@@ -276,7 +237,6 @@ const captureServices = Effect.fn('CaptureProviderNotificationAction.captureServ
     adapters,
     bindings: gatewayCaptureBindingResolverForTransaction(transaction),
     notifications: pspNotificationCapturePersistenceForTransaction(transaction),
-    routes: pspBindingRouteReaderForTransaction(transaction),
   } satisfies CaptureProviderNotificationServices;
 });
 

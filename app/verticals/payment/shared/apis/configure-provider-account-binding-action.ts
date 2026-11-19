@@ -33,7 +33,6 @@ export const ConfigureProviderAccountBindingActionForbiddenProblemSchema = makeP
       'operation_context_denied',
       'operation_context_invalid',
     ]),
-    reasons: Schema.optionalKey(Schema.Array(Schema.String)),
   },
 );
 export const ConfigureProviderAccountBindingActionNotFoundProblemSchema = makeProblemDetailsSchema(
@@ -76,7 +75,6 @@ export const ConfigureProviderAccountBindingActionUnavailableProblemSchema = mak
       'action_transaction_failed',
       'module_state_check_unavailable',
       'operation_context_unavailable',
-      'payment_notification_route_unavailable',
       'payment_unavailable',
     ]),
   },

@@ -2,7 +2,7 @@ import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 import { DateTime, Effect, Option, Redacted, Schema } from 'effect';
-import type { Duration, Scope } from 'effect';
+import type { Scope } from 'effect';
 import { HttpClientRequest } from 'effect/http';
 import { describe, expect, it } from 'effect-rstest';
 import type { TestContext } from 'effect-rstest';
@@ -10,7 +10,6 @@ import type { TestContext } from 'effect-rstest';
 import type { ProviderHttpContract } from '../../src/integrations/psp/provider-http.ts';
 import { ProviderObjectIdSchema } from '../../src/integrations/psp/psp-request.ts';
 import type { ProviderObjectRef } from '../../src/integrations/psp/psp-request.ts';
-import type { ProviderFindingResult } from '../../src/integrations/psp/psp-result.ts';
 import {
   HOSTED_PAYMENT_WAIT,
   HOSTED_POLL,
@@ -20,7 +19,7 @@ import {
   SETTLE_POLL,
   StripeCheckoutSessionRefSchema,
   StripeRefundRefSchema,
-  announceHostedPage,
+  announce,
   cancelExpected,
   cancelRequestOf,
   collectExpected,
@@ -32,8 +31,6 @@ import {
   objectLookup,
   orderReferenceLookup,
   pollUntil,
-  providerCallMark,
-  providerCallsSince,
   providerRefOf,
   rawNotification,
   refundExpected,
@@ -44,55 +41,21 @@ import {
   stripeSandboxCredentials,
   withheldObjectId,
 } from './sandbox-harness.ts';
-import type {
-  SandboxAmount,
-  SandboxOperation,
-  SandboxScenarioInput,
-  StripeSandboxCredentials,
-} from './sandbox-harness.ts';
+import type { SandboxOperation, SandboxScenarioInput, StripeSandboxCredentials } from './sandbox-harness.ts';
 
 /**
  * #1159 level 4: Stripe test mode through the production `StripePaymentService` (plan §6 Stripe).
- * Needs `ONTOS_C17_SANDBOX_STRIPE_SECRET_KEY` (`sk_test_`, `rk_test_` or `rkcs_test_` with write access to Checkout
- * Sessions, PaymentIntents and Refunds and read access to Events), `ONTOS_C17_SANDBOX_STRIPE_WEBHOOK_SECRET`
- * (`whsec_`) and `ONTOS_C17_SANDBOX_STRIPE_ACCOUNT_ID` (`acct_`). The suite never calls `GET /v1/account`: a
- * claimable-sandbox key gets HTTP 403 there, so the account id always comes from the variable.
+ * Needs `ONTOS_C17_SANDBOX_STRIPE_SECRET_KEY` (`sk_test_`/`rk_test_` with write access to Checkout Sessions,
+ * PaymentIntents and Refunds), `ONTOS_C17_SANDBOX_STRIPE_WEBHOOK_SECRET` (`whsec_`) and
+ * `ONTOS_C17_SANDBOX_STRIPE_ACCOUNT_ID` (`acct_`).
  *
- * The refund scenarios confirm their PaymentIntents through the API with the documented test PaymentMethods
- * `pm_card_visa`, `pm_card_pendingRefund` and `pm_card_refundFail`
- * (https://docs.stripe.com/testing#refunds). Only the two hosted Checkout scenarios (payment confirmed by lookup;
- * expiring the paid session) need a human or a browser agent: test card 4242 4242 4242 4242, any future expiry,
- * any CVC.
- *
- * Real sandbox shapes (2026-11-13) the scenarios pin: expiring a complete/paid session answers HTTP 400
- * `invalid_request_error` with no `error.code`; the adapter decides it by lookup (cancel NOT_EFFECTED, collection
- * still confirmed). Reusing an idempotency key with a changed amount answers HTTP 400 `idempotency_error`; the
- * adapter reports OUTCOME_UNKNOWN and sends nothing else. A `pm_card_refundFail` refund is first `succeeded`, then
- * `failed`.
- *
- * Either route gives the three variables:
- * - Anonymous sandbox (https://docs.stripe.com/cli/sandbox): `stripe sandbox create --email <reserved address>
- *   --non-interactive` prints `secret_key` (`rkcs_test_`) and `account_id`; then `stripe listen --print-secret` with
- *   the same CLI profile gives the `whsec_` secret. The sandbox expires after 7 days.
- * - Account (plan D-P6): in the Dashboard sandbox copy the `sk_test_` key or a restricted `rk_test_` key with the
- *   scopes above, take `acct_` from Settings → Account, and run `stripe listen --print-secret` after `stripe login`.
+ * The refund scenario confirms its PaymentIntent through the API with the documented test PaymentMethod
+ * `pm_card_visa`, so only the hosted Checkout scenario needs a human (test card 4242 4242 4242 4242).
  */
 
 const COLLECT_AMOUNT = { amountMinor: 10_000, currency: 'CZK' } as const;
 const REFUND_AMOUNT = { amountMinor: 4000, currency: 'CZK' } as const;
-/** The same create with one minor unit more: Stripe must refuse the reused idempotency key. */
-const CHANGED_COLLECT_AMOUNT = { amountMinor: 10_001, currency: 'CZK' } as const;
 const STRIPE_API = 'https://api.stripe.com';
-/**
- * The asynchronous test refunds change state "some time later" / "after a few minutes"; the real sandbox took about
- * three and a half minutes (agent-scratch L4 evidence), so these polls allow ten.
- */
-const REFUND_TRANSITION_POLL = { every: '15 seconds', within: '10 minutes' } as const;
-const REFUND_TRANSITION_TIMEOUT_MS = 12 * 60 * 1000;
-
-/** Documented test PaymentMethods whose charge succeeds (https://docs.stripe.com/testing#refunds). */
-const TestPaymentMethodSchema = Schema.Literals(['pm_card_pendingRefund', 'pm_card_refundFail', 'pm_card_visa']);
-type TestPaymentMethod = typeof TestPaymentMethodSchema.Type;
 
 const setup = {
   credentials: stripeSandboxCredentials,
@@ -154,15 +117,11 @@ const StripeEventListSchema = Schema.Struct({
 });
 const decodeEventList = Schema.decodeUnknownOption(Schema.fromJsonString(StripeEventListSchema));
 
-/**
- * A PaymentIntent confirmed through the API with a documented test PaymentMethod. Stripe rejects
- * `payment_method_types` with HTTP 400 for this account, so payment methods are automatic with redirects disabled.
- */
+/** A PaymentIntent confirmed through the API with the documented test PaymentMethod `pm_card_visa`. */
 const confirmedTestPaymentIntent = (
   http: ProviderHttpContract,
   credentials: StripeSandboxCredentials,
   operation: SandboxOperation,
-  paymentMethod: TestPaymentMethod,
 ) =>
   Effect.gen(function* confirmedTestPaymentIntentEffect() {
     const response = yield* http.mutate({
@@ -172,12 +131,11 @@ const confirmedTestPaymentIntent = (
         HttpClientRequest.bearerToken(credentials.secretKey),
         HttpClientRequest.bodyUrlParams({
           amount: String(COLLECT_AMOUNT.amountMinor),
-          'automatic_payment_methods[allow_redirects]': 'never',
-          'automatic_payment_methods[enabled]': 'true',
           confirm: 'true',
           currency: 'czk',
           'metadata[ontos_order_reference]': operation.correlation.orderReference,
-          payment_method: paymentMethod,
+          payment_method: 'pm_card_visa',
+          'payment_method_types[]': 'card',
         }),
       ),
     });
@@ -196,64 +154,18 @@ const readStripe = (http: ProviderHttpContract, credentials: StripeSandboxCreden
     request: HttpClientRequest.get(`${STRIPE_API}${path}`).pipe(HttpClientRequest.bearerToken(credentials.secretKey)),
   });
 
-/** The id of the `type` event Stripe emitted for `objectId`, polled with `poll`. */
-const eventIdOf = (
-  http: ProviderHttpContract,
-  credentials: StripeSandboxCredentials,
-  type: 'checkout.session.expired' | 'refund.failed' | 'refund.updated',
-  objectId: string,
-  poll: { readonly every: Duration.Input; readonly within: Duration.Input },
-) =>
+/** The id of the `checkout.session.expired` event Stripe emitted for `sessionId`, polled for up to 2 minutes. */
+const expiredEventIdOf = (http: ProviderHttpContract, credentials: StripeSandboxCredentials, sessionId: string) =>
   pollUntil(
-    Effect.map(readStripe(http, credentials, `/v1/events?type=${type}&limit=50`), (response) =>
+    Effect.map(readStripe(http, credentials, '/v1/events?type=checkout.session.expired&limit=50'), (response) =>
       decodeEventList(response.bodyText).pipe(
-        Option.flatMap((list) => Option.fromUndefinedOr(list.data.find((event) => event.data.object.id === objectId))),
+        Option.flatMap((list) => Option.fromUndefinedOr(list.data.find((event) => event.data.object.id === sessionId))),
         Option.map((event) => event.id),
       ),
     ),
     Option.isSome,
-    poll,
+    SETTLE_POLL,
   );
-
-/**
- * Charges `paymentMethod` and refunds `amount` of it (part by default) through the adapter; returns the refund and
- * its first finding.
- */
-const refundThroughAdapter = (
-  input: StripeScenario,
-  paymentMethod: TestPaymentMethod,
-  amount: SandboxAmount = REFUND_AMOUNT,
-) =>
-  Effect.gen(function* refundThroughAdapterEffect() {
-    const collection = yield* newOperation;
-    const intent = yield* confirmedTestPaymentIntent(input.provider.http, input.credentials, collection, paymentMethod);
-    const refund = yield* newOperation;
-    const refundedAt = yield* sandboxNow;
-    const prepared = yield* input.provider.adapter.prepareRefund(
-      input.target,
-      refundRequestOf({ amount, collection, providerTarget: intent, refund }),
-    );
-    const response = yield* input.provider.adapter.send(input.target, prepared, refundExpected(refund, amount));
-    expect(dispatchOutcomeOf(response)).toBe('ACKNOWLEDGED');
-    const refundRef = Option.getOrThrow(providerRefOf(response.finding, StripeRefundRefSchema));
-    const lookup = input.provider.adapter.lookup(
-      input.target,
-      objectLookup(refundRef, refundExpected(refund, amount), refundedAt),
-    );
-    return { collection, intent, lookup, refund, refundRef, sent: response.finding.finding };
-  });
-
-/** The error body Stripe returns for a refused request; `code` is optional (a paid-session expiry has none). */
-const StripeErrorBodySchema = Schema.Struct({
-  error: Schema.Struct({ code: Schema.optionalKey(Schema.String), type: Schema.String }),
-});
-const decodeStripeError = Schema.decodeUnknownOption(Schema.fromJsonString(StripeErrorBodySchema));
-
-const findingFor = (findings: readonly ProviderFindingResult[], operationId: string) =>
-  Option.fromUndefinedOr(findings.find((finding) => finding.target.operationId === operationId));
-
-const factKindOf = (finding: ProviderFindingResult) =>
-  finding.evidence.pipe(Option.map((evidence) => evidence.factKind));
 
 /** Stripe's documented `v1` scheme: HMAC-SHA256(secret, `${t}.` || body) in lower-case hex. */
 const stripeSignatureOf = (rawBody: Uint8Array, secret: Redacted.Redacted, signedAtSeconds: number): string => {
@@ -263,20 +175,6 @@ const stripeSignatureOf = (rawBody: Uint8Array, secret: Redacted.Redacted, signe
   signed.set(rawBody, prefix.length);
   return `t=${signedAtSeconds},v1=${bytesToHex(hmac(sha256, utf8ToBytes(Redacted.value(secret)), signed))}`;
 };
-
-const signedAtOf = (now: DateTime.Utc) => Math.floor(DateTime.toEpochMillis(now) / 1000);
-
-/** `rawBody` delivered for event `eventId` at `now` with the `Stripe-Signature` header `signature`. */
-const eventNotificationOf = (rawBody: Uint8Array, eventId: string, signature: string, now: DateTime.Utc) =>
-  rawNotification({
-    contentType: Option.some('application/json'),
-    family: 'STRIPE',
-    paymentRef: Option.none(),
-    rawBody,
-    receivedAt: now,
-    stripeSignature: Option.some(signature),
-    transportDeliveryRef: `sandbox-${eventId}`,
-  });
 
 // ---------------------------------------------------------------------------------------------------
 // Scenarios
@@ -303,15 +201,11 @@ describe('#1159 Stripe sandbox conformance', () => {
       stripe(ctx, (input) =>
         Effect.gen(function* hostedPayment() {
           const created = yield* createSession(input);
-          yield* announceHostedPage({
-            lines: [
-              'Stripe hosted payment step (human): open this URL and pay with test card 4242 4242 4242 4242,',
-              `any future expiry and any CVC. Polling lookup for up to ${HOSTED_PAYMENT_WAIT}.`,
-            ],
-            provider: 'STRIPE',
-            scenario: 'hosted-payment',
-            url: created.redirectUrl,
-          });
+          yield* announce([
+            'Stripe hosted payment step (human): open this URL and pay with test card 4242 4242 4242 4242,',
+            `any future expiry and any CVC. Polling lookup for up to ${HOSTED_PAYMENT_WAIT}.`,
+            created.redirectUrl,
+          ]);
           const findings = yield* pollUntil(
             lookupCollection(input, created.operation, created.session, created.issuedAt),
             (current) => findingKindFor(current, created.operation.operationId) === 'EFFECT_CONFIRMED',
@@ -324,193 +218,47 @@ describe('#1159 Stripe sandbox conformance', () => {
     HOSTED_SCENARIO_TIMEOUT_MS,
   );
 
-  it.live(
-    '#1159 Stripe sandbox: expiring a paid session is refused without an error code; lookup keeps it paid and the cancel NOT_EFFECTED',
-    (ctx) =>
-      stripe(ctx, (input) =>
-        Effect.gen(function* paidSessionExpiry() {
-          const created = yield* createSession(input);
-          yield* announceHostedPage({
-            lines: [
-              'Stripe hosted payment step (human or browser agent): open this URL and pay with test card',
-              `4242 4242 4242 4242, any future expiry and any CVC. Polling lookup for up to ${HOSTED_PAYMENT_WAIT}.`,
-            ],
-            provider: 'STRIPE',
-            scenario: 'paid-session-expiry',
-            url: created.redirectUrl,
-          });
-          const paid = yield* pollUntil(
-            lookupCollection(input, created.operation, created.session, created.issuedAt),
-            (current) => findingKindFor(current, created.operation.operationId) === 'EFFECT_CONFIRMED',
-            HOSTED_POLL,
-          );
-          expect(findingKindFor(paid, created.operation.operationId)).toBe('EFFECT_CONFIRMED');
-
-          const cancel = yield* newOperation;
-          const prepared = yield* input.provider.adapter.prepareCancel(
-            input.target,
-            cancelRequestOf({ cancel, collection: created.operation, providerTarget: created.session }),
-          );
-          const mark = yield* providerCallMark(input.provider);
-          const refused = yield* input.provider.adapter.send(
-            input.target,
-            prepared,
-            cancelExpected(cancel, created.operation, COLLECT_AMOUNT),
-          );
-          const calls = yield* providerCallsSince(input.provider, mark);
-          const after = yield* lookupCollection(input, created.operation, created.session, created.issuedAt);
-
-          // Stripe: HTTP 400 invalid_request_error with no `code`; the adapter decides it by one session read.
-          expect(calls.map(({ kind, response }) => [kind, response.pipe(Option.map(({ status }) => status))])).toEqual([
-            ['mutate', Option.some(400)],
-            ['read', Option.some(200)],
-          ]);
-          expect(
-            Option.flatMap(Option.fromUndefinedOr(calls[0]), (call) => call.response).pipe(
-              Option.flatMap(({ bodyText }) => decodeStripeError(bodyText)),
-            ),
-          ).toEqual(Option.some({ error: { type: 'invalid_request_error' } }));
-          expect(dispatchOutcomeOf(refused)).toBe('REJECTED_BEFORE_EFFECT');
-          expect(refused.finding.finding).toBe('NOT_EFFECTED');
-          expect(factKindOf(refused.finding)).toEqual(Option.some('CANCEL_NOT_EFFECTED'));
-          expect(refused.targetFinding.pipe(Option.map((found) => found.finding))).toEqual(
-            Option.some('EFFECT_CONFIRMED'),
-          );
-          expect(findingKindFor(after, created.operation.operationId)).toBe('EFFECT_CONFIRMED');
-        }),
-      ),
-    HOSTED_SCENARIO_TIMEOUT_MS,
-  );
-
-  it.live('#1159 Stripe sandbox: a confirmed PaymentIntent is refunded in full and the refund is confirmed', (ctx) =>
-    stripe(ctx, (input) =>
-      Effect.gen(function* fullRefundScenario() {
-        const refunded = yield* refundThroughAdapter(input, 'pm_card_visa', COLLECT_AMOUNT);
-        const settled = yield* pollUntil(
-          refunded.lookup,
-          (current) => findingKindFor(current, refunded.refund.operationId) === 'EFFECT_CONFIRMED',
-          SETTLE_POLL,
-        );
-        const confirmed = Option.getOrThrow(findingFor(settled, refunded.refund.operationId));
-
-        expect(['ACCEPTED_PENDING', 'EFFECT_CONFIRMED']).toContain(refunded.sent);
-        expect(confirmed.finding).toBe('EFFECT_CONFIRMED');
-        expect(factKindOf(confirmed)).toEqual(Option.some('REFUND_CONFIRMED'));
-        expect(
-          confirmed.evidence.pipe(
-            Option.flatMap((evidence) => evidence.observedAmount),
-            Option.map(({ amountMinor }) => amountMinor),
-          ),
-        ).toEqual(Option.some(COLLECT_AMOUNT.amountMinor));
-      }),
-    ),
-  );
-
   it.live('#1159 Stripe sandbox: a confirmed PaymentIntent is found by order reference and refunded', (ctx) =>
     stripe(ctx, (input) =>
       Effect.gen(function* refundScenario() {
+        const collection = yield* newOperation;
         const dispatchedAt = yield* sandboxNow;
-        const refunded = yield* refundThroughAdapter(input, 'pm_card_visa');
+        const intent = yield* confirmedTestPaymentIntent(input.provider.http, input.credentials, collection);
         const byOrderReference = yield* pollUntil(
           input.provider.adapter.lookup(
             input.target,
-            orderReferenceLookup(
-              refunded.collection,
-              collectExpected(refunded.collection, COLLECT_AMOUNT),
-              dispatchedAt,
-            ),
+            orderReferenceLookup(collection, collectExpected(collection, COLLECT_AMOUNT), dispatchedAt),
           ),
-          (current) => findingKindFor(current, refunded.collection.operationId) === 'EFFECT_CONFIRMED',
+          (current) => findingKindFor(current, collection.operationId) === 'EFFECT_CONFIRMED',
           SETTLE_POLL,
         );
+        expect(findingKindFor(byOrderReference, collection.operationId)).toBe('EFFECT_CONFIRMED');
+
+        const refund = yield* newOperation;
+        const refundedAt = yield* sandboxNow;
+        const prepared = yield* input.provider.adapter.prepareRefund(
+          input.target,
+          refundRequestOf({ amount: REFUND_AMOUNT, collection, providerTarget: intent, refund }),
+        );
+        const response = yield* input.provider.adapter.send(
+          input.target,
+          prepared,
+          refundExpected(refund, REFUND_AMOUNT),
+        );
+        expect(dispatchOutcomeOf(response)).toBe('ACKNOWLEDGED');
+        const refundRef = Option.getOrThrow(providerRefOf(response.finding, StripeRefundRefSchema));
         const settled = yield* pollUntil(
-          refunded.lookup,
-          (current) => findingKindFor(current, refunded.refund.operationId) === 'EFFECT_CONFIRMED',
+          input.provider.adapter.lookup(
+            input.target,
+            objectLookup(refundRef, refundExpected(refund, REFUND_AMOUNT), refundedAt),
+          ),
+          (current) => findingKindFor(current, refund.operationId) === 'EFFECT_CONFIRMED',
           SETTLE_POLL,
         );
 
-        expect(findingKindFor(byOrderReference, refunded.collection.operationId)).toBe('EFFECT_CONFIRMED');
-        expect(findingKindFor(settled, refunded.refund.operationId)).toBe('EFFECT_CONFIRMED');
+        expect(findingKindFor(settled, refund.operationId)).toBe('EFFECT_CONFIRMED');
       }),
     ),
-  );
-
-  it.live(
-    '#1159 Stripe sandbox: an asynchronous refund moves from pending to confirmed by refund-id lookup',
-    (ctx) =>
-      stripe(ctx, (input) =>
-        Effect.gen(function* pendingRefundScenario() {
-          const refunded = yield* refundThroughAdapter(input, 'pm_card_pendingRefund');
-          const first = yield* refunded.lookup;
-          const settled = yield* pollUntil(
-            refunded.lookup,
-            (current) => findingKindFor(current, refunded.refund.operationId) === 'EFFECT_CONFIRMED',
-            REFUND_TRANSITION_POLL,
-          );
-          const updated = yield* eventIdOf(
-            input.provider.http,
-            input.credentials,
-            'refund.updated',
-            refunded.refundRef.id,
-            SETTLE_POLL,
-          );
-
-          expect(refunded.sent).toBe('ACCEPTED_PENDING');
-          expect(['ACCEPTED_PENDING', 'EFFECT_CONFIRMED']).toContain(
-            findingKindFor(first, refunded.refund.operationId),
-          );
-          expect(findingKindFor(settled, refunded.refund.operationId)).toBe('EFFECT_CONFIRMED');
-          expect(Option.isSome(updated)).toBe(true);
-        }),
-      ),
-    REFUND_TRANSITION_TIMEOUT_MS,
-  );
-
-  it.live(
-    '#1159 Stripe sandbox: a refund Stripe fails after reporting success is first confirmed, then ends NOT_EFFECTED',
-    (ctx) =>
-      stripe(ctx, (input) =>
-        Effect.gen(function* failedRefundScenario() {
-          const refunded = yield* refundThroughAdapter(input, 'pm_card_refundFail');
-          const settled = yield* pollUntil(
-            refunded.lookup,
-            (current) => findingKindFor(current, refunded.refund.operationId) === 'NOT_EFFECTED',
-            REFUND_TRANSITION_POLL,
-          );
-          const failed = yield* eventIdOf(
-            input.provider.http,
-            input.credentials,
-            'refund.failed',
-            refunded.refundRef.id,
-            SETTLE_POLL,
-          );
-          const failedEventId = Option.getOrThrow(failed);
-          const event = yield* readStripe(input.provider.http, input.credentials, `/v1/events/${failedEventId}`);
-          const now = yield* sandboxNow;
-          const rawBody = utf8ToBytes(event.bodyText);
-          const trigger = yield* input.provider.adapter.verifyNotification(
-            input.target,
-            eventNotificationOf(
-              rawBody,
-              failedEventId,
-              stripeSignatureOf(rawBody, input.credentials.webhookSecret, signedAtOf(now)),
-              now,
-            ),
-          );
-
-          // Stripe answers `succeeded` first (the adapter confirms), then fails the refund (the lookup supersedes it).
-          expect(refunded.sent).toBe('EFFECT_CONFIRMED');
-          expect(findingKindFor(settled, refunded.refund.operationId)).toBe('NOT_EFFECTED');
-          expect(event.status).toBe(200);
-          expect(trigger).toMatchObject({
-            actionable: true,
-            authenticity: 'SIGNATURE_VERIFIED',
-            deliveryIdentity: `stripe:evt:${failedEventId}`,
-          });
-          expect(trigger.providerRefs).toContainEqual(refunded.refundRef);
-        }),
-      ),
-    REFUND_TRANSITION_TIMEOUT_MS,
   );
 
   it.live('#1159 Stripe sandbox: cancel expires an open session, and a second cancel is decided by lookup', (ctx) =>
@@ -557,22 +305,24 @@ describe('#1159 Stripe sandbox conformance', () => {
           cancelExpected(cancel, created.operation, COLLECT_AMOUNT),
         );
         const eventId = Option.getOrThrow(
-          yield* eventIdOf(
-            input.provider.http,
-            input.credentials,
-            'checkout.session.expired',
-            created.session.id,
-            SETTLE_POLL,
-          ),
+          yield* expiredEventIdOf(input.provider.http, input.credentials, created.session.id),
         );
         const event = yield* readStripe(input.provider.http, input.credentials, `/v1/events/${eventId}`);
         expect(event.status).toBe(200);
 
         const now = yield* sandboxNow;
-        const signedAt = signedAtOf(now);
+        const signedAt = Math.floor(DateTime.toEpochMillis(now) / 1000);
         const rawBody = utf8ToBytes(event.bodyText);
         const notificationOf = (body: Uint8Array, signature: string) =>
-          eventNotificationOf(body, eventId, signature, now);
+          rawNotification({
+            contentType: Option.some('application/json'),
+            family: 'STRIPE',
+            paymentRef: Option.none(),
+            rawBody: body,
+            receivedAt: now,
+            stripeSignature: Option.some(signature),
+            transportDeliveryRef: `sandbox-${eventId}`,
+          });
         const signature = stripeSignatureOf(rawBody, input.credentials.webhookSecret, signedAt);
         const trigger = yield* input.provider.adapter.verifyNotification(
           input.target,
@@ -649,54 +399,5 @@ describe('#1159 Stripe sandbox conformance', () => {
         expect(Option.getOrThrow(providerRefOf(replayed.finding, StripeCheckoutSessionRefSchema)).id).toBe(createdId);
       }),
     ),
-  );
-
-  it.live(
-    '#1159 Stripe sandbox: the same idempotency key with a changed amount is an idempotency_error and nothing else is sent',
-    (ctx) =>
-      stripe(ctx, (input) =>
-        Effect.gen(function* changedAmountReuse() {
-          const [operation, returnToken, issuedAt] = yield* Effect.all([newOperation, newReturnToken, sandboxNow], {
-            concurrency: 1,
-          });
-          const prepareFor = (amount: SandboxAmount) =>
-            input.provider.adapter.prepareCollect(
-              input.target,
-              collectRequestOf({ amount, issuedAt, operation, payerContact: Option.none(), returnToken }),
-            );
-          const original = yield* prepareFor(COLLECT_AMOUNT);
-          const first = yield* input.provider.adapter.send(
-            input.target,
-            original,
-            collectExpected(operation, COLLECT_AMOUNT),
-          );
-          const changed = yield* prepareFor(CHANGED_COLLECT_AMOUNT);
-          const mark = yield* providerCallMark(input.provider);
-          const conflict = yield* Effect.flip(
-            input.provider.adapter.send(input.target, changed, collectExpected(operation, CHANGED_COLLECT_AMOUNT)),
-          );
-          const calls = yield* providerCallsSince(input.provider, mark);
-
-          expect(dispatchOutcomeOf(first)).toBe('ACKNOWLEDGED');
-          expect(changed.idempotencyKey).toEqual(original.idempotencyKey);
-          expect(changed.requestHash).not.toBe(original.requestHash);
-          // Exactly the one changed POST reached Stripe; no retry, search or second create followed it.
-          expect(calls.map(({ kind, method, url }) => [kind, method, url])).toEqual([
-            ['mutate', 'POST', `${STRIPE_API}/v1/checkout/sessions`],
-          ]);
-          expect(
-            Option.flatMap(Option.fromUndefinedOr(calls[0]), (call) => call.response).pipe(
-              Option.filter(({ status }) => status === 400),
-              Option.flatMap(({ bodyText }) => decodeStripeError(bodyText)),
-              Option.map(({ error }) => error.type),
-            ),
-          ).toEqual(Option.some('idempotency_error'));
-          expect(conflict).toMatchObject({
-            code: 'gateway_provider_outcome_unknown',
-            operationId: operation.operationId,
-            reason: 'stripe_idempotency_conflict',
-          });
-        }),
-      ),
   );
 });
