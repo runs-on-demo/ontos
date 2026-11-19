@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import type { AppUserConfig } from '@modern-js/app-tools';
 import { getBuildConfigEnvironment, resolveDeployTarget } from '@modern-js/app-tools-extensions/config';
 import {
   getOrElse as getOptionOrElse,
@@ -13,7 +12,6 @@ import type { Option } from 'effect/Option';
 import { getOrThrow as getResultOrThrow, isSuccess as isResultSuccess } from 'effect/Result';
 import {
   Array as ArraySchema,
-  Literal,
   Literals,
   OptionFromNullOr,
   OptionFromUndefinedOr,
@@ -22,7 +20,6 @@ import {
   Trim,
   check,
   decodeUnknownResult,
-  is,
   isMinLength,
   makeFilter,
 } from 'effect/Schema';
@@ -33,13 +30,6 @@ import type {
 } from '../../core-runtime/src/db/database-identity-manifest.ts';
 
 type BuildEnvironmentReader = (name: string) => string | undefined;
-
-const BROWSER_TARGETS = ['Chrome >= 144', 'Safari >= 27', 'iOS >= 27'];
-
-const browserTargetTools: AppUserConfig['tools'] = {
-  // A function replaces the preset's ['defaults'] list instead of merging it into our targets.
-  autoprefixer: (config) => ({ ...config, overrideBrowserslist: BROWSER_TARGETS }),
-};
 
 /**
  * The Hyperdrive bindings a Worker build declares: the `cloudflareHyperdrive` of each database
@@ -59,52 +49,29 @@ interface DevelopmentMiddlewareSetup {
   unshift: (
     middleware: (
       request: { url?: string | undefined },
-      // `end` always takes a body: the HTTP/2 response has no single `end` overload for an absent body and a Buffer.
-      response: { end: (body: Buffer) => void; setHeader: (name: string, value: string) => void; statusCode: number },
+      response: { end: (body: Buffer) => void; setHeader: (name: string, value: string) => void },
       next: () => void,
     ) => void,
   ) => void;
 }
 
-const DEVELOPMENT_MCP_TOOL_CATALOG = '/.well-known/ontos-module-mcp-tools.json';
-
-const isMissingFileError = is(Struct({ code: Literal('ENOENT') }));
-
-const DEVELOPMENT_CONTRACT_ARTIFACTS: ReadonlySet<string> = new Set([
-  '/.well-known/ontos-module-manifest.json',
-  DEVELOPMENT_MCP_TOOL_CATALOG,
-]);
-
-/** Serves the unit's prepared development module contract and its MCP tool catalog ahead of locale redirects. */
-export const createDevelopmentContractMiddleware =
-  (moduleUrl: string) =>
-  ({ unshift }: DevelopmentMiddlewareSetup) => {
+/** Serves the unit's prepared development module contract ahead of locale redirects. */
+export const createDevelopmentContractMiddleware = (moduleUrl: string) => {
+  const contractPath = fileURLToPath(new URL('.dev-public/.well-known/ontos-module-manifest.json', moduleUrl));
+  return ({ unshift }: DevelopmentMiddlewareSetup) => {
     unshift((request, response, next) => {
-      const requestPath = request.url?.split('?', 1)[0];
-      if (requestPath === undefined || !DEVELOPMENT_CONTRACT_ARTIFACTS.has(requestPath)) {
+      if (request.url?.split('?', 1)[0] !== '/.well-known/ontos-module-manifest.json') {
         next();
         return;
       }
-      let contract: Buffer;
-      try {
-        contract = readFileSync(fileURLToPath(new URL(`.dev-public${requestPath}`, moduleUrl)));
-      } catch (error) {
-        // Preparation removes the catalog of a module without an MCP contribution; the manifest is always prepared.
-        if (requestPath === DEVELOPMENT_MCP_TOOL_CATALOG && isMissingFileError(error)) {
-          response.statusCode = 404;
-          // A catalog prepared later at the same URL must not be shadowed by a cached absence.
-          response.setHeader('Cache-Control', 'no-cache');
-          response.end(Buffer.alloc(0));
-          return;
-        }
-        throw error;
-      }
+      const contract = readFileSync(contractPath);
       response.setHeader('Cache-Control', 'no-cache');
       response.setHeader('Content-Type', 'application/json');
       response.setHeader('Content-Length', String(contract.byteLength));
       response.end(contract);
     });
   };
+};
 
 const requiredCloudflareBuildValue = (envValue: BuildEnvironmentReader, name: string): string =>
   getResultOrThrow(
@@ -283,16 +250,10 @@ export const createWorkspaceModernConfig = ({
     setupMiddlewares: appId === 'shell-super-app' ? [] : [createDevelopmentContractMiddleware(moduleUrl)],
   },
   output: {
-    overrideBrowserslist: BROWSER_TARGETS,
     // The native TS-Go checker blocks every first compile on a check of the whole reference graph, which
-    // holds a cold dev server past readiness budgets. The required workspace CI job owns type
-    // diagnostics once; deployment and local builds still check unless explicitly separated.
-    disableTsChecker:
-      readBuildEnvironmentValue('NODE_ENV') === 'development' ||
-      readBuildEnvironmentValue('ONTOS_CI_TYPECHECK_SEPARATE') === '1',
-    ...(readBuildEnvironmentValue('ONTOS_CI_TYPECHECK_SEPARATE') === '1'
-      ? { sourceMap: { js: false as const } }
-      : undefined),
+    // holds a cold dev server past readiness budgets. Builds keep the checker; in `modern dev`,
+    // `pnpm typecheck` owns type diagnostics.
+    disableTsChecker: readBuildEnvironmentValue('NODE_ENV') === 'development',
   },
   server: {
     publicDir: ['./.dev-public'],
@@ -303,7 +264,4 @@ export const createWorkspaceModernConfig = ({
       ULTRAMODERN_SHELL_ORIGIN: readBuildEnvironmentValue('ULTRAMODERN_MF_DEV_ORIGIN') ?? 'http://localhost:3020',
     },
   },
-  tools: {
-    ...browserTargetTools,
-  } satisfies AppUserConfig['tools'],
 });
