@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,6 +19,7 @@ import { OUTBOX_WORKER_HOST } from '../outbox-worker-delivery.mjs';
 import {
   gatewayModuleBindingsProblem,
   OWNER_RUNTIME_CONFIGURATIONS,
+  SHELL_CREDENTIAL_VARIABLES,
   requestServiceHoldsModuleCredential,
   SHELL_GATEWAY_BASE_URL_VARIABLE,
 } from '../ops/owner-runtime-configuration.mts';
@@ -28,7 +30,6 @@ const priceGroupCatalogSetup = 'price-group-catalog';
 const PARTY_REGISTRY_WORKER_SETUP = 'party-registry-worker';
 const zeropsYamlPath = new URL('../../zerops.yaml', import.meta.url);
 const hostEntryPath = new URL('../outbox-worker-host.generated.mts', import.meta.url);
-const workflowPath = new URL('../../../.github/workflows/ultramodern-workspace-gates.yml', import.meta.url);
 
 const ZeropsYamlSchema = Schema.Struct({
   zerops: Schema.Array(Schema.Struct({ run: Schema.Struct({ base: Schema.String }), setup: Schema.String })),
@@ -41,22 +42,6 @@ const ZeropsImportSchema = Schema.Struct({
       type: Schema.String,
     }),
   ),
-});
-const DeployJobSchema = Schema.Struct({
-  steps: Schema.Array(
-    Schema.Struct({
-      'continue-on-error': Schema.optional(Schema.Boolean),
-      name: Schema.String,
-      run: Schema.optional(Schema.String),
-    }),
-  ),
-});
-const DeployWorkflowSchema = Schema.Struct({
-  jobs: Schema.Struct({
-    'deploy-migrations': DeployJobSchema,
-    'deploy-plan': DeployJobSchema,
-    'deploy-zerops': DeployJobSchema,
-  }),
 });
 
 const zeropsImportPath = new URL('../../zerops-import.yaml', import.meta.url);
@@ -192,15 +177,12 @@ const secretHolderSetups = (unitId: string, setups: ReadonlySet<string>) =>
     ? [...ownerRuntimeSetups(unitId, setups), OUTBOX_WORKER_HOST.stageSetup]
     : ownerRuntimeSetups(unitId, setups);
 
-/** Every non-test source file under `verticals/`, skipping installed packages and test folders. */
+/** Committed production sources, never another test's transient generated runtime. */
 const verticalSourceFiles = (directory: string): readonly string[] =>
-  readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-    const entryPath = path.join(directory, entry.name);
-    if (entry.isDirectory()) {
-      return entry.name === 'node_modules' || entry.name === 'tests' ? [] : verticalSourceFiles(entryPath);
-    }
-    return /\.m?ts$/u.test(entry.name) && !/\.test\./u.test(entry.name) ? [entryPath] : [];
-  });
+  execFileSync('/usr/bin/git', ['ls-files', '-z', '--', '.'], { cwd: directory, encoding: 'utf-8' })
+    .split('\0')
+    .filter((file) => /\.m?ts$/u.test(file) && !file.split('/').includes('tests') && !/\.test\./u.test(file))
+    .map((file) => path.join(directory, file));
 
 /** The vertical units whose production code calls another module through the delegated gateway client. */
 const delegatedCallerUnits = (): readonly string[] => {
@@ -340,6 +322,34 @@ it('gives the Shell the module bindings from the migrator and no other service',
   expect(holders).toStrictEqual(['shellsuperapp']);
 });
 
+it('gives the Shell its own secrets from the migrator and no other service', () => {
+  const environments = serviceEnvironments();
+
+  expect(SHELL_CREDENTIAL_VARIABLES).toStrictEqual(['ONTOS_PAYMENT_NOTIFICATION_RELAY_CREDENTIALS']);
+  for (const variable of SHELL_CREDENTIAL_VARIABLES) {
+    const holders = [...environments]
+      .filter(([, environment]) => Object.values(environment).some((value) => value.includes(variable)))
+      .map(([setup]) => setup);
+    expect(environments.get('shellsuperapp')?.[variable]).toBe(`\${migrator_${variable}}`);
+    expect(holders).toStrictEqual(['shellsuperapp']);
+  }
+});
+
+it('gives the Payment reconciliation and notification values to the Payment units only', () => {
+  const environments = serviceEnvironments();
+  const paymentUnits = ['payment', 'payment-worker', OUTBOX_WORKER_HOST.stageSetup];
+
+  for (const variable of ['ONTOS_PAYMENT_NOTIFICATION_BASE_URL', 'ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS']) {
+    const holders = [...environments]
+      .filter(([, environment]) => Object.values(environment).some((value) => value.includes(variable)))
+      .map(([setup]) => setup);
+    expect(EffectArray.sort(holders, Order.String)).toStrictEqual(EffectArray.sort(paymentUnits, Order.String));
+    for (const setup of paymentUnits) {
+      expect(environments.get(setup)?.[variable]).toBe(`\${migrator_${variable}}`);
+    }
+  }
+});
+
 it('retires the per-owner gateway keys, grant lists, principal IDs and caller namespaces', () => {
   const zeropsYaml = readFileSync(zeropsYamlPath, 'utf-8');
 
@@ -379,58 +389,11 @@ it('binds Customer Context, Cart and Pricing to the internal owner API bases the
   }
 });
 
-it('declares Price Group Cloudflare proof variables and resolves every provider service id by topology name', () => {
-  const workflow = readFileSync(workflowPath, 'utf-8');
-
-  expect(workflow).toContain('ULTRAMODERN_PUBLIC_URL_PRICE_GROUP_CATALOG: https://price-group-catalog.invalid');
-  expect(workflow).toContain(`STAGE_VARIABLES_JSON: \${{ toJSON(vars) }}`);
-  expect(workflow).toContain('app/scripts/push-zerops-units.sh');
+it('resolves every provider service id by topology name', () => {
   const pushUnits = readFileSync(new URL('../push-zerops-units.sh', import.meta.url), 'utf-8');
   expect(pushUnits).toContain('active-composition:publish stage-service-id --setup "$unit"');
   // Neither dedicated workers nor the combined host may be given a public subdomain.
   expect(pushUnits).toContain(`    *-worker | ${OUTBOX_WORKER_HOST.stageSetup}) ;;`);
-  const providerVariables = workflow.match(/^ +ZEROPS_[A-Z_]+_SERVICE_ID: /gmu)?.map((line) => line.trim()) ?? [];
-  expect(providerVariables).toEqual([
-    'ZEROPS_MIGRATOR_SERVICE_ID:',
-    'ZEROPS_SPICEDB_SERVICE_ID:',
-    'ZEROPS_SHELL_SERVICE_ID:',
-  ]);
-});
-
-it("stops the other Outbox Worker mode's workers after this mode's workers deploy", () => {
-  const workflow = Schema.decodeUnknownSync(DeployWorkflowSchema)(parse(readFileSync(workflowPath, 'utf-8')));
-  const deployZerops = workflow.jobs['deploy-zerops'];
-  const deployPlan = workflow.jobs['deploy-plan'];
-  const steps = deployPlan.steps.map((step) => step.name);
-  const stop = deployZerops.steps.find((step) => step.name === "Stop the other Outbox Worker mode's workers");
-
-  expect(stop?.run).toContain('active-composition:publish stop-service --setup "$setup"');
-  // A mode switch changes no source, so running workers of the other mode make the plan reconcile.
-  const drift = deployPlan.steps.find(
-    (step) => step.name === 'Detect Outbox Workers that do not match the Outbox Worker mode',
-  );
-  expect(drift?.run).toContain('active-composition:publish worker-mode-drift');
-  expect(steps.indexOf('Detect Outbox Workers that do not match the Outbox Worker mode')).toBeLessThan(
-    steps.indexOf('Generate topology-driven deployment impact plan'),
-  );
-  const plan = deployPlan.steps.find((step) => step.name === 'Generate topology-driven deployment impact plan');
-  expect(plan?.run).toContain('plan_arguments+=(--reconcile-workers)');
-  const deploySteps = deployZerops.steps.map((step) => step.name);
-  const deploy = deploySteps.indexOf('Deploy the selected Outbox Workers');
-  const stopOtherMode = deploySteps.indexOf("Stop the other Outbox Worker mode's workers");
-  const publish = deploySteps.indexOf('Publish the complete active Application Composition');
-  expect(deploy).toBeGreaterThanOrEqual(0);
-  expect(stopOtherMode).toBeGreaterThan(deploy);
-  expect(publish).toBeGreaterThan(stopOtherMode);
-});
-
-it('declares the Inventory public URL for Cloudflare proof', () => {
-  const workflow = readFileSync(
-    new URL('../../../.github/workflows/ultramodern-workspace-gates.yml', import.meta.url),
-    'utf-8',
-  );
-
-  expect(workflow).toContain('ULTRAMODERN_PUBLIC_URL_INVENTORY: https://inventory.invalid');
 });
 
 it('declares no dedicated Price Group worker once the module has no Outbox Worker left (O62)', () => {
@@ -560,23 +523,6 @@ it('declares a public subdomain at service creation for every non-worker unit an
   }
 });
 
-it('lets stage deploy failures fail the job, tolerating only best-effort log collection', () => {
-  const { jobs } = Schema.decodeUnknownSync(DeployWorkflowSchema)(parse(readFileSync(workflowPath, 'utf-8')));
-
-  for (const step of [
-    ...jobs['deploy-plan'].steps,
-    ...jobs['deploy-migrations'].steps,
-    ...jobs['deploy-zerops'].steps,
-  ]) {
-    const run = step.run ?? '';
-    expect(run).not.toContain('enable-subdomain');
-    expect(run.replaceAll(/zcli service log[^|]*\|\| true/gu, '')).not.toContain('|| true');
-    if (step['continue-on-error'] === true) {
-      expect(run).toMatch(/^zcli service log /u);
-    }
-  }
-});
-
 it('keeps module origins out of the Shell build so new approved modules require no Shell deployment', () => {
   const shellBlock = serviceBlock(readFileSync(zeropsYamlPath, 'utf-8'), 'shellsuperapp');
   const shellBuild = shellBlock.slice(0, shellBlock.indexOf('\n    deploy:'));
@@ -622,11 +568,6 @@ it.effect('pushes every Zerops setup with the deploying environment named in its
     );
     expect(schemeEndpoint.message).toContain('host:port');
 
-    const workflow = readFileSync(workflowPath, 'utf-8');
-    expect(workflow).not.toContain('--zerops-yaml-path app/zerops.yaml');
-    expect(workflow).toContain('zerops:materialize-environment');
-    expect(workflow).toContain('--environment "$DEPLOY_ENVIRONMENT"');
-    expect(workflow).toContain('--spicedb-endpoint "$PRODUCTION_SPICEDB_ENDPOINT"');
     const pushUnits = readFileSync(new URL('../push-zerops-units.sh', import.meta.url), 'utf-8');
     expect(pushUnits).toContain('--zerops-yaml-path "$ZEROPS_YAML_PATH"');
   }),

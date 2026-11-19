@@ -31,8 +31,8 @@ import type { ProviderNotSentReason } from '../../../shared/domain/psp-vocabular
 import { deriveProviderCorrelation, GatewayOrderReferenceSchema } from './psp-correlation.ts';
 import type { GatewayIdempotencyKey, GatewayOrderReference } from './psp-correlation.ts';
 import type { GatewayCorrelationConflictError, GatewayLedgerUnavailableError } from './psp-errors.ts';
-import { ProviderObjectRefSchema } from './psp-request.ts';
-import type { GatewayExecutionTarget, ProviderObjectRef } from './psp-request.ts';
+import { GatewayRefundBaselineSchema, ProviderObjectRefSchema } from './psp-request.ts';
+import type { GatewayExecutionTarget, GatewayRefundBaseline, ProviderObjectRef } from './psp-request.ts';
 import { ProviderReplayRequestSchema, ProviderRequestHeaderSchema } from './psp-result.ts';
 import type { PreparedProviderRequest, ProviderReplayRequest } from './psp-result.ts';
 
@@ -76,6 +76,8 @@ export const ProviderDispatchRecordSchema = Schema.Struct({
   /** Collection object: GoPay payment, Stripe session or payment intent, Comgate transaction. */
   providerPaymentRef: Schema.Option(ProviderObjectRefSchema),
   providerRefundRef: Schema.Option(ProviderObjectRefSchema),
+  /** GoPay REFUND only: the refund-history rows read before the send, committed with the prepared request. */
+  refundBaseline: Schema.Option(GatewayRefundBaselineSchema),
   replayExpiresAt: Schema.Option(Schema.DateTimeUtc),
   replayStartsAt: Schema.Option(Schema.DateTimeUtc),
   /** Exact persisted request bytes and non-secret headers; present only with a replay window (Stripe). */
@@ -126,6 +128,11 @@ export interface CancelRegistration {
 export interface PrepareDispatchInput extends LedgerWrite {
   readonly identity: ProviderDispatchIdentity;
   readonly prepared: PreparedProviderRequest;
+  /**
+   * Present exactly when `prepared.refundBaseline` is (GoPay REFUND): the `refundDispatchCount` of the
+   * `refundSerialization` read the baseline was read after. A different count by now is REFUND_BASELINE_STALE.
+   */
+  readonly refundDispatchCount: Option.Option<number>;
   /** COLLECT only; generated before the commit so the return URL in `prepared` already carries it. */
   readonly returnToken: Option.Option<typeof GatewayReturnTokenSchema.Type>;
 }
@@ -134,14 +141,17 @@ export interface PrepareDispatchInput extends LedgerWrite {
  * PREPARED: committed now, safe to send. EXISTING: a row already exists with equal material and
  * request (a concurrent identical prepare). WITHHELD: a COLLECT targeted by a cancel, stored NOT_SENT.
  * DEFERRED: a GoPay or Comgate REFUND while another refund of the same provider payment is unresolved
- * (checked under the target's lock); nothing was written. CONFLICT: same operation, different material
- * or request; nothing may be sent.
+ * (checked under the target's lock); nothing was written. REFUND_BASELINE_STALE: a GoPay REFUND whose
+ * baseline was read before another refund dispatch of the same provider payment was prepared (it may own a
+ * history row the baseline lacks); nothing was written and nothing may be sent. CONFLICT: same operation,
+ * different material or request; nothing may be sent.
  */
 export const ProviderPrepareResultSchema = Schema.Union([
   Schema.TaggedStruct('PREPARED', { record: ProviderDispatchRecordSchema }),
   Schema.TaggedStruct('EXISTING', { record: ProviderDispatchRecordSchema }),
   Schema.TaggedStruct('WITHHELD', { record: ProviderDispatchRecordSchema }),
   Schema.TaggedStruct('DEFERRED', { unresolvedRefundOperationIds: Schema.Array(PaymentOperationIdSchema) }),
+  Schema.TaggedStruct('REFUND_BASELINE_STALE', {}),
   Schema.TaggedStruct('CONFLICT', { existing: ProviderDispatchRecordSchema }),
 ]);
 export type ProviderPrepareResult = typeof ProviderPrepareResultSchema.Type;
@@ -189,9 +199,16 @@ export interface ReadByOrderReferenceInput extends LedgerScope {
   readonly orderReference: GatewayOrderReference;
 }
 
-export interface HasUnresolvedRefundInput extends LedgerScope {
+export interface RefundSerializationInput extends LedgerScope {
   readonly bindingId: GatewayProviderAccountBindingId;
   readonly providerPaymentRef: ProviderObjectRef;
+}
+
+/** One snapshot of the refunds of a provider payment. */
+export interface RefundSerialization {
+  /** Refund dispatches of the provider payment in any state; `prepare` compares it under the target's lock. */
+  readonly refundDispatchCount: number;
+  readonly unresolved: boolean;
 }
 
 export interface ProviderDispatchLedgerContract {
@@ -202,13 +219,6 @@ export interface ProviderDispatchLedgerContract {
   readonly correlateUnknown: (
     input: CorrelateUnknownInput,
   ) => Effect.Effect<Option.Option<ProviderDispatchRecord>, GatewayCorrelationConflictError | LedgerFailure>;
-  /**
-   * True while another REFUND of this provider payment is unresolved: PREPARED, OUTCOME_UNKNOWN, or
-   * ACKNOWLEDGED without REFUND_CONFIRMED or REFUND_NOT_EFFECTED evidence (GoPay and Comgate
-   * serialization; `prepare` re-checks it under the target's lock and answers DEFERRED). A Comgate refund
-   * stays unresolved until such evidence exists (completion is unprovable, plan N10).
-   */
-  readonly hasUnresolvedRefund: (input: HasUnresolvedRefundInput) => Effect.Effect<boolean, LedgerFailure>;
   readonly prepare: (input: PrepareDispatchInput) => Effect.Effect<ProviderPrepareResult, LedgerFailure>;
   readonly readByOperation: (
     input: ReadByOperationInput,
@@ -232,6 +242,15 @@ export interface ProviderDispatchLedgerContract {
   ) => Effect.Effect<ProviderDispatchRecord, LedgerFailure>;
   /** Inserts an UNSUPPORTED row (e.g. GoPay cancel); nothing was or will be sent. */
   readonly recordUnsupported: (input: RecordUnsupportedInput) => Effect.Effect<ProviderDispatchRecord, LedgerFailure>;
+  /**
+   * `unresolved` while another REFUND of this provider payment is unresolved (GoPay and Comgate serialization;
+   * `prepare` re-checks it under the target's lock and answers DEFERRED): PREPARED or OUTCOME_UNKNOWN, and
+   * for GoPay also ACKNOWLEDGED without REFUND_CONFIRMED or REFUND_NOT_EFFECTED evidence. An ACKNOWLEDGED
+   * Comgate refund no longer blocks (own refId and effect key, Comgate caps the total, D-P2); a lost one is
+   * released once recovery's statement lookup proves it exists and correlates it. `refundDispatchCount` from
+   * the same snapshot goes back to `prepare` with a GoPay baseline read after this check.
+   */
+  readonly refundSerialization: (input: RefundSerializationInput) => Effect.Effect<RefundSerialization, LedgerFailure>;
   /** Inserts the cancel row AWAITING_TARGET under an advisory lock on the target operation id. */
   readonly registerCancel: (input: RegisterCancelInput) => Effect.Effect<CancelRegistration, LedgerFailure>;
 }
@@ -270,6 +289,7 @@ export const replayRequestOf = (record: ProviderDispatchRecord): Option.Option<P
           headers,
           idempotencyKey: Option.some(idempotencyKey),
           orderReference: record.orderReference,
+          refundBaseline: record.refundBaseline,
           replayWindowMs: Option.some(DateTime.toEpochMillis(expiresAt) - DateTime.toEpochMillis(startsAt)),
           requestHash,
         },
@@ -278,3 +298,12 @@ export const replayRequestOf = (record: ProviderDispatchRecord): Option.Option<P
     ),
   );
 };
+
+/**
+ * The refund baseline a lookup may attribute against: only that of a REFUND row the provider acknowledged. For
+ * GoPay a REFUND row reaches ACKNOWLEDGED only from its own dispatch response: GoPay never replays, its order
+ * reference names the collection (never a refund row), and recovery correlates a lost refund only on a finding
+ * that already needs this baseline. A lost response (OUTCOME_UNKNOWN) therefore never confirms by the history.
+ */
+export const acknowledgedRefundBaselineOf = (record: ProviderDispatchRecord): Option.Option<GatewayRefundBaseline> =>
+  record.operationKind === 'REFUND' && record.state === 'ACKNOWLEDGED' ? record.refundBaseline : Option.none();
