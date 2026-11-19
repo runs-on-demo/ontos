@@ -56,7 +56,6 @@
       "default": "./src/modules/active-application-composition-source.node.ts"
     },
     "./modules/manifest": "./src/modules/manifest.ts",
-    "./modules/mcp-contribution": "./src/modules/mcp-contribution.ts",
     "./operations/context": "./src/operations/context.ts",
     "./operations/external-authentication": "./src/operations/external-authentication.ts",
     "./outbox/core-identity-principal-binding-activated-v1": "./src/outbox/core-identity-principal-binding-activated-v1.ts",
@@ -122,10 +121,10 @@
     "effect": "4.0.7"
   },
   "devDependencies": {
-    "@rstest/core": "0.12.6",
+    "@rstest/core": "0.11.12",
     "@types/node": "^26.4.1",
     "drizzle-kit": "1.0.0-rc.5-ab785fc",
-    "effect-rstest": "1.0.0",
+    "effect-rstest": "https://pkg.pr.new/ScriptedAlchemy/effect-rstest@cbbf87e05c7517a85eb412d33421cd2ab5234597",
     "pg": "8.22.0",
     "yaml": "2.9.1"
   }
