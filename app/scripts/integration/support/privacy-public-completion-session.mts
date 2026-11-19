@@ -86,7 +86,7 @@ class PrivacyCompletionTestFailure extends Schema.TaggedError<PrivacyCompletionT
 ) {}
 const failure = (reason: string) => new PrivacyCompletionTestFailure({ reason });
 export const PUBLIC_COMPLETION_COMMAND = 'dispatch-business-rejected-and-ack';
-export const PublicCompletionCapabilitySchema = Schema.Struct({
+const PublicCompletionCapabilitySchema = Schema.Struct({
   creatorPid: Schema.Int.check(Schema.isGreaterThan(0)),
   databaseName: Schema.String.check(Schema.isPattern(/^ontos_test_party_gateway_[a-f\d]{32}$/u)),
   databaseOid: Schema.String.check(Schema.isPattern(/^\d+$/u)),
@@ -170,6 +170,7 @@ const workerFailureSchema = Schema.Struct({
 });
 const childEnvironment = (
   transport: {
+    readonly NODE_COMPILE_CACHE?: string;
     readonly PATH: string;
     readonly SPICEDB_CA_CERT: string;
     readonly SPICEDB_ENDPOINT: string;
@@ -177,6 +178,7 @@ const childEnvironment = (
   },
   values: Readonly<Record<string, string>>,
 ) => ({
+  NODE_COMPILE_CACHE: transport.NODE_COMPILE_CACHE ?? '',
   PATH: transport.PATH,
   SPICEDB_CA_CERT: transport.SPICEDB_CA_CERT,
   SPICEDB_ENDPOINT: transport.SPICEDB_ENDPOINT,
@@ -284,6 +286,7 @@ const prepareNativeIdentities = Effect.fn('PrivacyFixture.prepareNativeIdentitie
       env: {
         DATABASE_ADMIN_URL: connections.admin.connectionString,
         DATABASE_URL: connections.runtime.connectionString,
+        NODE_COMPILE_CACHE: yield* Config.String('NODE_COMPILE_CACHE').pipe(Config.withDefault('')),
         ...urls,
       },
       extendEnv: false,
@@ -508,6 +511,7 @@ const start = Effect.fn('PrivacyCompletionTest.start')(function* start(
   bootstrap?: Parameters<typeof receivePrivateShellResponse>[2],
 ) {
   const transport = yield* Config.all({
+    NODE_COMPILE_CACHE: Config.String('NODE_COMPILE_CACHE').pipe(Config.withDefault('')),
     PATH: Config.String('PATH'),
     SPICEDB_CA_CERT: Config.String('SPICEDB_CA_CERT'),
     SPICEDB_ENDPOINT: Config.String('SPICEDB_ENDPOINT'),
@@ -602,6 +606,12 @@ const bootstrapOwnerCapabilities = Effect.fn('PrivacyPublicSession.bootstrapOwne
         if (!relation?.owned || (item.rls && !relation.rls)) {
           return yield* failure('Owner relation capability was refused');
         }
+        // Replace copied deployment grants with this owned fixture's exact
+        // direct grants. Effective inherited rights are still checked below.
+        yield* database.executor.execute(
+          sql`revoke all on ${sql.identifier(item.schema)}.${sql.identifier(table)} from ${role}`,
+          'objects',
+        );
         if (item.operations === 'select') {
           yield* database.executor.execute(
             sql`grant select on ${sql.identifier(item.schema)}.${sql.identifier(table)} to ${role}`,
@@ -833,14 +843,7 @@ const openPrivacyPublicCompletionSession = Effect.fn('PrivacyPublicSession.open'
         revision: digest(canonicalizeApplicationComposition({ ...composition, revision: '0'.repeat(64) })),
       },
     });
-    const environment = {
-      DATABASE_ADMIN_URL: input.connections.admin.connectionString,
-      DATABASE_URL: input.connections.runtime.connectionString,
-    };
-    // Supported owner migration entrypoints, never foreign migration/source imports.
-    for (const owner of ['@app/shell-super-app', '@app/party-registry']) {
-      yield* command(['--filter', owner, 'db:migrate'], environment);
-    }
+    // The creator supplies an empty schema-only clone of the migrated source.
     yield* bootstrapOwnerCapabilities(input.connections.runtime.user);
     // Creator-bound Core-only test setup reproduces the pre-owner-verifier active authority.
     // It never deletes authority, touches owner history, or substitutes for operator acceptance.
