@@ -223,8 +223,13 @@ const stripeEnvironmentOf = (
   );
 };
 
+/**
+ * Test keys: secret `sk_test_`, restricted `rk_test_` (https://docs.stripe.com/keys), and the claimable sandbox's
+ * limited restricted key `rkcs_test_` issued by `stripe sandbox create` (https://docs.stripe.com/cli/sandbox).
+ * Live keys: `sk_live_` and `rk_live_` only; Stripe documents no live claimable-sandbox key.
+ */
 const keyEnvironmentOf = (secretKey: string): Option.Option<GatewayEnvironment> => {
-  if (/^(?:sk|rk)_test_/u.test(secretKey)) {
+  if (/^(?:sk|rk|rkcs)_test_/u.test(secretKey)) {
     return Option.some('SANDBOX');
   }
   if (/^(?:sk|rk)_live_/u.test(secretKey)) {
@@ -311,6 +316,7 @@ const preparedOf = (input: {
     headers,
     idempotencyKey: Option.some(input.correlation.idempotencyKey),
     orderReference: input.correlation.orderReference,
+    refundBaseline: Option.none(),
     replayWindowMs: Option.some(STRIPE_REPLAY_WINDOW_MS),
     requestHash: requestHashOf(endpointRef, headers, input.correlation.idempotencyKey, body),
   }).pipe(Effect.catchTag('SchemaError', () => Effect.fail(unavailable('prepared_request_invalid'))));

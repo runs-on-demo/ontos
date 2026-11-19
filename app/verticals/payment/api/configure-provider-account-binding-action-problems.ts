@@ -37,7 +37,7 @@ type DomainProblemIdentity =
       readonly kind: 'conflict';
     }
   | { readonly code: 'gateway_binding_not_found'; readonly kind: 'notFound' }
-  | { readonly code: 'payment_unavailable'; readonly kind: 'unavailable' };
+  | { readonly code: 'payment_notification_route_unavailable' | 'payment_unavailable'; readonly kind: 'unavailable' };
 
 const problemStatus = {
   authentication: 401,
@@ -84,10 +84,12 @@ export const configureProviderAccountBindingActionProblem = {
     }),
   forbidden: (
     code: ProblemOf<'ConfigureProviderAccountBindingActionForbiddenProblem'>['code'],
+    reasons: readonly string[] = [],
   ): ProblemOf<'ConfigureProviderAccountBindingActionForbiddenProblem'> =>
     ConfigureProviderAccountBindingActionForbiddenProblemSchema.make({
       code,
       detail: 'The principal is not permitted to perform this Action.',
+      reasons,
       status: problemStatus.forbidden,
       title: 'Action forbidden',
       type: 'https://ontos.dev/problems/action-forbidden',
@@ -163,6 +165,8 @@ const mapDomainIdentity = (identity: DomainProblemIdentity): ConfigureProviderAc
 const mapDomainProblem = (error: DomainError): ConfigureProviderAccountBindingActionProblem =>
   Match.value(error).pipe(
     Match.tags({
+      PaymentNotificationRouteUnavailable: () =>
+        configureProviderAccountBindingActionProblem.unavailable('payment_notification_route_unavailable'),
       PaymentUnavailable: () => configureProviderAccountBindingActionProblem.unavailable('payment_unavailable'),
       ProviderAccountBindingConflict: (failure) =>
         mapDomainIdentity(providerAccountBindingConflictProblemByCode[failure.code]),
@@ -205,7 +209,8 @@ const mapCoreProblem = (error: ActionCoreError): ConfigureProviderAccountBinding
       ActionInvocationStateError: (failure) => configureProviderAccountBindingActionProblem.conflict(failure.code),
       ActionPayloadValidationError: configureProviderAccountBindingActionProblem.invalid,
       ActionPermissionCheckError: (failure) => configureProviderAccountBindingActionProblem.unavailable(failure.code),
-      ActionPermissionDenied: (failure) => configureProviderAccountBindingActionProblem.forbidden(failure.code),
+      ActionPermissionDenied: (failure) =>
+        configureProviderAccountBindingActionProblem.forbidden(failure.code, failure.reasons ?? []),
       ActionPolicyDenied: (failure) => configureProviderAccountBindingActionProblem.ineligible(failure.code),
       ActionPolicyEvaluationError: (failure) => configureProviderAccountBindingActionProblem.unavailable(failure.code),
       ActionRequestHashConflict: (failure) => configureProviderAccountBindingActionProblem.conflict(failure.code),

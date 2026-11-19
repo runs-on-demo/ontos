@@ -649,6 +649,298 @@ it('proves Set membership, spreads and owned collection reads without admitting 
   );
 });
 
+/** A factory that decodes `{ entries }` through the given entries schema and builds its input from `value`. */
+const decodedEntriesFactory = (entries: string, parameter: string, input: string): string =>
+  `import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ entries: ${entries} })); export const makeData = (${parameter}) => decode({ entries: ${input} });`;
+
+/** A factory that returns the values of a decoded `Record(String, value)`. */
+const recordValuesFactory = (value: string): string =>
+  `import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ entries: Schema.Record(Schema.String, ${value}) })); export const makeData = (value: string) => Object.values(decode({ entries: { key: value } }).entries);`;
+
+/** A factory that reads `member` from a decoded `Record(String, String)`. */
+const recordMemberFactory = (member: string): string =>
+  `import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ entries: Schema.Record(Schema.String, Schema.String) })); export const makeData = (value: string) => decode({ entries: { key: value } }).entries${member};`;
+
+const stringParameter = 'value: string';
+const stringEntry = [stringParameter, '{ key: value }'] as const;
+
+it('proves a Record only when its key is a closed string schema and its value is closed data', () => {
+  expectDataFactoryProofs(
+    [
+      decodedEntriesFactory('Schema.Record(Schema.String, Schema.String)', ...stringEntry),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.String.check(Schema.isMinLength(1)), Schema.Number)',
+        'value: number',
+        '{ key: value }',
+      ),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.Literal("key"), Schema.Struct({ id: Schema.String }))',
+        stringParameter,
+        '{ key: { id: value } }',
+      ),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.NonEmptyString, Schema.Array(Schema.String))',
+        stringParameter,
+        '{ key: [value] }',
+      ),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Boolean))',
+        'value: boolean',
+        '{ key: { nested: value } }',
+      ),
+      decodedEntriesFactory('Schema.Record(Schema.String, Schema.Json)', ...stringEntry),
+      recordValuesFactory('Schema.String'),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.TemplateLiteral(["key-", Schema.String]), Schema.String)',
+        ...stringEntry,
+      ),
+    ],
+    [
+      // An open value: unknown, any, a function or a class instance must never prove.
+      decodedEntriesFactory('Schema.Record(Schema.String, Schema.Unknown)', ...stringEntry),
+      decodedEntriesFactory('Schema.Record(Schema.String, Schema.Any)', ...stringEntry),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.String, Schema.declare((input): input is () => void => typeof input === "function"))',
+        ...stringEntry,
+      ),
+      'import { Schema } from "effect"; class Payload { readonly id = "fixed"; } const decode = Schema.decodeUnknownSync(Schema.Struct({ entries: Schema.Record(Schema.String, Schema.instanceOf(Payload)) })); export const makeData = (value: string) => decode({ entries: { key: value } });',
+      decodedEntriesFactory(
+        'Schema.Record(Schema.String, Schema.Struct({ id: Schema.String, extra: Schema.Unknown }))',
+        ...stringEntry,
+      ),
+      decodedEntriesFactory(
+        'Schema.Record(Schema.String, Schema.Record(Schema.String, Schema.Unknown))',
+        ...stringEntry,
+      ),
+      // `Object.values` keeps only own fields, so only the value guard on the Record keeps this open value out.
+      recordValuesFactory('Schema.Unknown'),
+      // A key that is not closed string data must never prove.
+      decodedEntriesFactory('Schema.Record(Schema.Number, Schema.String)', ...stringEntry),
+      decodedEntriesFactory('Schema.Record(Schema.Literal(1), Schema.String)', ...stringEntry),
+      decodedEntriesFactory('Schema.Record(Schema.Symbol, Schema.String)', ...stringEntry),
+      decodedEntriesFactory('Schema.Record(Schema.Unknown, Schema.String)', ...stringEntry),
+      decodedEntriesFactory('Schema.Record(Schema.Json, Schema.String)', ...stringEntry),
+      // A nullable or optional string is not string data.
+      decodedEntriesFactory('Schema.Record(Schema.NullOr(Schema.String), Schema.String)', ...stringEntry),
+      decodedEntriesFactory('Schema.Record(Schema.UndefinedOr(Schema.Literal("key")), Schema.String)', ...stringEntry),
+    ],
+  );
+});
+
+it('proves own Record entries without admitting inherited Object members as data', () => {
+  expectDataFactoryProofs(
+    [recordMemberFactory('.key'), recordMemberFactory('["key"]')],
+    [
+      recordMemberFactory('.toString'),
+      recordMemberFactory('.valueOf'),
+      recordMemberFactory('.hasOwnProperty'),
+      recordMemberFactory('.constructor'),
+      recordMemberFactory('["toString"]'),
+      recordMemberFactory('["__proto__"]'),
+    ],
+  );
+});
+
+/** A factory that decodes `input` through `schema`, by default a caller's open `{ text }` object as `query`. */
+const jsonCodecFactory = (schema: string, input = '{ query: value }', parameter = 'value: { text: string }'): string =>
+  `import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(${schema}); export const makeData = (${parameter}) => decode(${input});`;
+
+it('decodes Json only from closed input, because Effect returns the very object it validated', () => {
+  expectDataFactoryProofs(
+    [
+      jsonCodecFactory('Schema.Struct({ query: Schema.Json })', '{ query: { text: value } }', 'value: string'),
+      // A Struct builds a new object of its own fields, so an open caller object may still go in.
+      jsonCodecFactory('Schema.Struct({ query: Schema.Struct({ text: Schema.String }) })'),
+      jsonCodecFactory(
+        'Schema.Struct({ query: Schema.Json, owner: Schema.Struct({ text: Schema.String }) })',
+        '{ query: [value.text], owner: value }',
+      ),
+    ],
+    [
+      // A caller object may carry a non-enumerable function that Json keeps.
+      jsonCodecFactory('Schema.Struct({ query: Schema.Json })'),
+      jsonCodecFactory('Schema.Struct({ query: Schema.Union([Schema.String, Schema.Json]) })'),
+      jsonCodecFactory('Schema.Struct({ query: Schema.Union([Schema.Struct({ id: Schema.String }), Schema.Json]) })'),
+      jsonCodecFactory(
+        'Schema.Struct({ queries: Schema.Record(Schema.String, Schema.Json) })',
+        '{ queries: { key: value } }',
+      ),
+    ],
+  );
+});
+
+/** A data factory beside a module-level declaration that runs during initialisation. */
+const initialisedFactory = (declaration: string): string =>
+  `import { DateTime, Option, Schema, SchemaGetter } from "effect"; ${declaration} export const makeData = () => ({ id: "data" });`;
+
+it('proves the callbacks a module-level schema pipe calls during initialisation', () => {
+  expectDataFactoryProofs(
+    [
+      initialisedFactory('const Tag = Schema.String.pipe(Schema.brand("Tag"));'),
+      initialisedFactory(
+        'const Icon = Schema.TemplateLiteral(["icon-[", Schema.String, "]"]).pipe((schema) => schema);',
+      ),
+      // The shape of party-registry's counterparty instant schema.
+      initialisedFactory(
+        'const canonical = (value: string): string | undefined => { const parsed = DateTime.make(value); return Option.isSome(parsed) && DateTime.formatIso(parsed.value) === value ? undefined : "not canonical"; }; const Instant = Schema.String.check(Schema.makeFilter(canonical)).pipe((schema) => schema.pipe(Schema.decodeTo(Schema.toType(Schema.DateTimeUtc), { decode: SchemaGetter.transform(DateTime.makeUnsafe), encode: SchemaGetter.transform(DateTime.formatIso) })));',
+      ),
+    ],
+    [
+      initialisedFactory(
+        'const Icon = Schema.TemplateLiteral(["icon"]).pipe((schema) => { fetch("icon"); return schema; });',
+      ),
+      initialisedFactory('const Query = Schema.Json.pipe((schema) => { fetch("query"); return schema; });'),
+      initialisedFactory(
+        'const stage = <S,>(schema: S): S => { fetch("stage"); return schema; }; const Name = Schema.String.pipe(stage);',
+      ),
+      // A stage reached through a member or returned by a call runs just as eagerly.
+      initialisedFactory(
+        'const stages = { evil: <S,>(schema: S): S => { fetch("stage"); return schema; } }; const Name = Schema.String.pipe(stages.evil);',
+      ),
+      initialisedFactory(
+        'const make = () => <S,>(schema: S): S => { fetch("stage"); return schema; }; const Name = Schema.String.pipe(make());',
+      ),
+      initialisedFactory(
+        'const stages = { evil: <S,>(schema: S): S => { fetch("stage"); return schema; } }; const Name = Schema.String.pipe(Schema.brand("Tag"), stages.evil);',
+      ),
+      initialisedFactory('const stages = { evil: () => () => 1 }; const Name = Schema.String.pipe(stages.evil);'),
+    ],
+  );
+});
+
+/** A factory that returns data or `otherwise` by comparing a decoded entry with `test`. */
+const literalBranchFactory = (schema: string, input: string, read: string, test: string, otherwise: string): string =>
+  `import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ entry: ${schema} })); export const makeData = (value: string) => decode({ entry: ${input} }).entry${read} === ${test} ? { ok: true } : ${otherwise};`;
+
+it('keeps no exact literal for a nullable value or an absent Record key, so a branch on it cannot hide a function', () => {
+  expectDataFactoryProofs(
+    [
+      // Both branches are data, so the widened comparison still proves.
+      literalBranchFactory('Schema.NullOr(Schema.Literal("ok"))', 'value', '', '"ok"', '{ ok: false }'),
+      literalBranchFactory(
+        'Schema.Record(Schema.String, Schema.Literal("ok"))',
+        '{ present: value }',
+        '.missing',
+        '"ok"',
+        '{ ok: false }',
+      ),
+      // A required literal is exact: the other branch is unreachable.
+      literalBranchFactory('Schema.Literal("ok")', 'value', '', '"ok"', '() => 1'),
+      literalBranchFactory('Schema.Struct({ k: Schema.Literal("ok") })', '{ k: value }', '.k', '"ok"', '() => 1'),
+    ],
+    [
+      // null, undefined or an absent key reaches the function branch at runtime.
+      literalBranchFactory('Schema.NullOr(Schema.Literal("ok"))', 'value', '', '"ok"', '() => 1'),
+      literalBranchFactory('Schema.UndefinedOr(Schema.Literal(true))', 'value', '', 'true', '() => 1'),
+      literalBranchFactory(
+        'Schema.Record(Schema.String, Schema.Literal("ok"))',
+        '{ present: value }',
+        '.missing',
+        '"ok"',
+        '() => 1',
+      ),
+      // The literal sits inside a value that may be absent, so `?.` yields undefined instead.
+      literalBranchFactory(
+        'Schema.NullOr(Schema.Struct({ k: Schema.Literal("ok") }))',
+        'null',
+        '?.k',
+        '"ok"',
+        '() => 1',
+      ),
+      literalBranchFactory(
+        'Schema.optionalKey(Schema.Struct({ k: Schema.Literal("ok") }))',
+        '{ k: "ok" }',
+        '?.k',
+        '"ok"',
+        '() => 1',
+      ),
+      literalBranchFactory(
+        'Schema.Record(Schema.String, Schema.Struct({ k: Schema.Literal("ok") }))',
+        '{ a: { k: value } }',
+        '.missing?.k',
+        '"ok"',
+        '() => 1',
+      ),
+      // An index the array does not list may be past its end.
+      literalBranchFactory('Schema.Array(Schema.Literal("ok"))', '[value]', '[3]', '"ok"', '() => 1'),
+      literalBranchFactory('Schema.Array(Schema.Literal("ok"))', '[value]', '.at(3)', '"ok"', '() => 1'),
+    ],
+  );
+});
+
+it('proves Json as a closed value without admitting the unknown it is often confused with', () => {
+  expectDataFactoryProofs(
+    [
+      'import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ query: Schema.Json })); export const makeData = (value: string) => decode({ query: { value } });',
+      'import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ queries: Schema.Array(Schema.Json) })); export const makeData = (value: string) => decode({ queries: [value] });',
+    ],
+    [
+      'import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ query: Schema.Unknown })); export const makeData = (value: string) => decode({ query: { value } });',
+      'import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ queries: Schema.Array(Schema.Unknown) })); export const makeData = (value: string) => decode({ queries: [value] });',
+    ],
+  );
+});
+
+/** The generated factory's default icon input, the template literal `icon-[${value}]`. */
+const iconTemplateInput = `\`icon-[\${value}]\``;
+
+/** A factory that decodes `{ icon }` through a template literal of the given parts. */
+const iconFactory = (parts: string, input = iconTemplateInput): string =>
+  `import { Schema } from "effect"; const decode = Schema.decodeUnknownSync(Schema.Struct({ icon: Schema.TemplateLiteral(${parts}) })); export const makeData = (value: string) => decode({ icon: ${input} });`;
+
+it('proves a TemplateLiteral only when every part is a string literal or a closed string schema', () => {
+  expectDataFactoryProofs(
+    [
+      iconFactory('["icon-[", Schema.String, "]"]'),
+      iconFactory('["icon-[", Schema.NonEmptyString, "]"]'),
+      iconFactory('["icon-[", Schema.Literal("lucide"), "--", Schema.String, "]"]'),
+      iconFactory('["icon-[", Schema.TemplateLiteral([Schema.String, "--", Schema.String]), "]"]'),
+      iconFactory('["icon"]', '"icon"'),
+    ],
+    [
+      iconFactory('["icon-[", Schema.Unknown, "]"]'),
+      iconFactory('["icon-[", Schema.Any, "]"]'),
+      iconFactory('["icon-[", Schema.Number, "]"]'),
+      iconFactory('["icon-[", Schema.Struct({ id: Schema.String }), "]"]'),
+      iconFactory('["icon-[", Schema.Json, "]"]'),
+      iconFactory('["icon-[", Schema.NullOr(Schema.String), "]"]'),
+      iconFactory('["icon-[", Schema.UndefinedOr(Schema.String), "]"]'),
+      'import { Schema } from "effect"; const parts = ["icon-[", Schema.String, "]"] as const; const decode = Schema.decodeUnknownSync(Schema.Struct({ icon: Schema.TemplateLiteral([...parts, Schema.Unknown]) })); export const makeData = (value: string) => decode({ icon: value });',
+      // A spread has no per-part fields, so even closed parts are not modelled.
+      'import { Schema } from "effect"; const parts = ["icon-[", Schema.String, "]"] as const; const decode = Schema.decodeUnknownSync(Schema.Struct({ icon: Schema.TemplateLiteral([...parts]) })); export const makeData = (value: string) => decode({ icon: value });',
+    ],
+  );
+});
+
+/** A factory that decodes through a TemplateLiteral of a local parts array after `mutation`. */
+const localPartsFactory = (mutation: string): string =>
+  `import { Schema } from "effect"; export const makeData = (value: string) => { const parts = ["icon-"]; ${mutation} return Schema.decodeUnknownSync(Schema.TemplateLiteral(parts))(value); };`;
+
+it('proves a TemplateLiteral of local parts only while every position is known', () => {
+  expectDataFactoryProofs(
+    [localPartsFactory('')],
+    [
+      // A pushed part is a new position the stale fields would not list.
+      localPartsFactory('parts.push(1);'),
+      localPartsFactory('parts.push("x");'),
+    ],
+  );
+});
+
+it('proves an explicit all-string Literals list as a closed string schema', () => {
+  expectDataFactoryProofs(
+    [
+      iconFactory('["id-", Schema.Literals(["a", "b"])]', '"id-a"'),
+      decodedEntriesFactory('Schema.Record(Schema.Literals(["key", "other"]), Schema.String)', ...stringEntry),
+    ],
+    [
+      iconFactory('["id-", Schema.Literals(["a", 1])]', '"id-a"'),
+      iconFactory('["id-", Schema.Literals([])]', '"id-"'),
+      decodedEntriesFactory('Schema.Record(Schema.Literals(["key", null]), Schema.String)', ...stringEntry),
+    ],
+  );
+});
+
 const resultPipelineFactory = (errorClass: string, finalStep: string): string =>
   [
     'import { Result, Schema } from "effect";',
@@ -2127,7 +2419,13 @@ describe('closes strict scalar observations and rejects computed evaluator capab
 describe('proves the actual Shell API composition factory from current owner source without executing it', () => {
   const { accept, directory, register, write } = recordScenario(serviceRuleTitle);
   const owner = nodePath.join(directory, 'app/apps/shell-super-app');
-  for (const file of ['api/index.ts', 'api/symmy/transport.ts', 'shared/api.ts', 'src/module-api/transport.ts']) {
+  for (const file of [
+    'api/index.ts',
+    'api/payment-gateway/transport.ts',
+    'api/symmy/transport.ts',
+    'shared/api.ts',
+    'src/module-api/transport.ts',
+  ]) {
     const target = nodePath.join(owner, file);
     write(target, readFileSync(nodePath.join(appRoot, 'apps/shell-super-app', file), 'utf-8'));
   }

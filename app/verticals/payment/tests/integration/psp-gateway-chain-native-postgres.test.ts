@@ -5,7 +5,10 @@ import { DateTime, Effect, Exit, Option, Schema } from 'effect';
 import { expect, it } from 'effect-rstest';
 
 import { deriveProviderCorrelation } from '../../src/integrations/psp/psp-correlation.ts';
-import { GatewayPayerContactSchema, ProviderObjectRefSchema } from '../../src/integrations/psp/psp-request.ts';
+import { ProviderObjectRefSchema } from '../../src/integrations/psp/psp-request.ts';
+import { pspPayerContactPersistenceForTransaction } from '../../src/persistence/psp-payer-contact-persistence.ts';
+import type { PaymentPayerContact } from '../../shared/domain/payment-payer-contact.ts';
+import { installOperationalScope } from '../../../../packages/core-runtime/src/db/scoped-transaction.ts';
 import {
   makeTestDatabaseFromClient,
   testDatabaseClients,
@@ -15,6 +18,7 @@ import {
   inScope,
   makeTestScope,
   newPaymentInput,
+  operationalScopeOf,
   paymentTestRelations,
   withPersistence,
 } from './database-fixture.ts';
@@ -24,7 +28,7 @@ import {
   gopayCreateResponseBody,
   gopayInquiryResponseBody,
 } from '../fixtures/gopay/payment-responses.ts';
-import { gopayRefundResponseBody, gopayTimestampedRefundHistoryBody } from '../fixtures/gopay/refund-responses.ts';
+import { gopayRefundHistoryBody, gopayRefundResponseBody } from '../fixtures/gopay/refund-responses.ts';
 import {
   STRIPE_FIXTURE_PAYMENT_INTENT_ID,
   STRIPE_FIXTURE_SESSION_ID,
@@ -39,7 +43,6 @@ import {
   respond,
 } from '../support/psp-conformance-provider.fixture.ts';
 import type { CredentialDocument, RouteScript } from '../support/psp-conformance-provider.fixture.ts';
-import type { GatewayProviderAdaptersContract } from '../../src/integrations/psp/psp-adapter.ts';
 import {
   capturedStripeNotification,
   deliverExecution,
@@ -58,7 +61,7 @@ import {
   processNotification,
   reprepareDispatch,
 } from '../support/psp-native-gateway.fixture.ts';
-import type { NativeBinding, NativeHarness } from '../support/psp-native-gateway.fixture.ts';
+import type { NativeBinding, NativeFamily, NativeHarness } from '../support/psp-native-gateway.fixture.ts';
 
 /**
  * #1159 level 3 (native owner boundary). Boundary of every test in this file: the production gateway executor and
@@ -85,6 +88,8 @@ const GOPAY_CREATE = `POST ${GOPAY_API}/payments/payment`;
 const GOPAY_PAYMENT = `GET ${GOPAY_API}/payments/payment/${GOPAY_FIXTURE_PAYMENT_ID}`;
 const GOPAY_REFUND = `POST ${GOPAY_API}/payments/payment/${GOPAY_FIXTURE_PAYMENT_ID}/refund`;
 const GOPAY_REFUND_HISTORY = `GET ${GOPAY_API}/payments/payment/${GOPAY_FIXTURE_PAYMENT_ID}/refunds`;
+/** A refund of the payment made outside OntOS before the refund under test (captured v3 row shape). */
+const GOPAY_EARLIER_REFUND_ROW = { amount: 1000, id: '4493293835', state: 'SUCCESS' } as const;
 const GOPAY_AMOUNT = 10_000;
 const COMGATE_SECRET_REF = 'comgate.native.conformance';
 const COMGATE_SECRET = 'comgate-shop-secret-c17-native';
@@ -125,24 +130,37 @@ const comgateStatus = (refId: string, status: string) =>
   );
 
 /**
- * C16 has no payer-contact owner yet (plan N9), so the executor prepares a Comgate COLLECT without one and Comgate
- * refuses it. Only for the COLLECT that sets up a Comgate cancel or refund, this stands in for that missing owner by
- * handing the production adapter a payer contact; every other call is the production adapter unchanged.
+ * The payer contact each family's collection Action input must carry (plan D-P3): Comgate a full name and an email,
+ * GoPay and Stripe none.
  */
-const NATIVE_PAYER = Schema.decodeUnknownSync(GatewayPayerContactSchema)({
-  email: Option.some('payer@example.test'),
-  fullName: Option.some('Test Payer'),
-  phone: Option.none(),
-});
-const withPayerContact = (adapters: GatewayProviderAdaptersContract): GatewayProviderAdaptersContract => ({
-  forFamily: (family) =>
-    adapters.forFamily(family).pipe(
-      Effect.map((adapter) => ({
-        ...adapter,
-        prepareCollect: (target, request) =>
-          adapter.prepareCollect(target, { ...request, payerContact: Option.some(NATIVE_PAYER) }),
-      })),
-    ),
+const PAYER_CONTACTS = {
+  COMGATE: Option.some<PaymentPayerContact>({ email: 'payer@example.test', fullName: 'Test Payer' }),
+  GOPAY: Option.none<PaymentPayerContact>(),
+  STRIPE: Option.none<PaymentPayerContact>(),
+} as const satisfies Record<NativeFamily, Option.Option<PaymentPayerContact>>;
+
+/**
+ * A gateway COLLECT whose payer contact is stored exactly as the collection Action stores it: the production
+ * insert-only persistence in a Core-scoped runtime transaction. The executor then reads it through
+ * `psp_read_operation_for_execution`; the Action path itself is `start-payment-collection-payer-contact-postgres`.
+ */
+const contactedCollectionFor = Effect.fn('PspGatewayChainTest.contactedCollection')(function* contactedCollectionFor(
+  harness: NativeHarness,
+  binding: NativeBinding,
+  amountMinor: number,
+) {
+  const collect = yield* nativeCollectionFor(harness, binding, amountMinor);
+  const contact = PAYER_CONTACTS[binding.executionBinding.providerFamily];
+  if (Option.isSome(contact)) {
+    yield* harness.database.transaction((transaction) =>
+      installOperationalScope(transaction, operationalScopeOf(harness.scope)).pipe(
+        Effect.flatMap((scoped) =>
+          pspPayerContactPersistenceForTransaction(scoped).rememberForCollect(collect.operationId, contact.value),
+        ),
+      ),
+    );
+  }
+  return collect;
 });
 
 const intentRef = Schema.decodeUnknownSync(ProviderObjectRefSchema)({
@@ -441,10 +459,9 @@ const collectThrough = Effect.fn('PspGatewayChainTest.collectThrough')(function*
   collect: OutboxPayload,
   routes: RouteScript,
   credentials: CredentialDocument,
-  adapt: (adapters: GatewayProviderAdaptersContract) => GatewayProviderAdaptersContract = (adapters) => adapters,
 ) {
   const step = yield* adaptersOver(routes, credentials);
-  const exit = yield* deliverExecution(harness, collect, adapt(step.adapters)).pipe(
+  const exit = yield* deliverExecution(harness, collect, step.adapters).pipe(
     Effect.provide(credentialConfig(credentials)),
   );
   expect(Exit.isSuccess(exit)).toBe(true);
@@ -540,14 +557,19 @@ it.live(
         const credentials = { [COMGATE_SECRET_REF]: comgateEntry };
         const harness = yield* nativeHarness;
         const binding = yield* nativeBindingFor(harness, 'COMGATE', COMGATE_SECRET_REF);
-        const collect = yield* nativeCollectionFor(harness, binding, COMGATE_AMOUNT);
-        yield* collectThrough(
+        const collect = yield* contactedCollectionFor(harness, binding, COMGATE_AMOUNT);
+        const created = yield* collectThrough(
           harness,
           collect,
           { [COMGATE_CREATE]: [respond(200, comgateFixture('create-success.json'))] },
           credentials,
-          withPayerContact,
         );
+        // The caller's contact reached the Comgate create, read from the stored row, not from the Outbox payload.
+        const createBody = Schema.decodeUnknownSync(
+          Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+        )(created.callsTo(COMGATE_CREATE)[0]?.body ?? '');
+        expect([createBody.fullName, createBody.email]).toEqual(['Test Payer', 'payer@example.test']);
+        expect(collect).not.toHaveProperty('payerContact');
         expect(yield* dispatchStateOf(harness, collect.operationId)).toEqual(
           Option.some(['ACKNOWLEDGED', null, `COMGATE_TRANSACTION:${COMGATE_TRANS_ID}`]),
         );
@@ -632,7 +654,9 @@ it.live(
         const credentials = { [COMGATE_SECRET_REF]: comgateEntry, [GOPAY_SECRET_REF]: gopayEntry };
         const harness = yield* nativeHarness;
 
-        // GoPay: refund of 40 CZK on the acknowledged payment, then the refund-history read.
+        // GoPay: the payment's refund history is read first (one earlier refund made outside OntOS) and committed with
+        // the prepared request, then the refund of 40 CZK is sent once and the history read again: the one new row
+        // (captured v3 row shape) is still REQUESTED, so the refund stays pending.
         const gopayBinding = yield* nativeBindingFor(harness, 'GOPAY', GOPAY_SECRET_REF);
         const gopayCollect = yield* nativeCollectionFor(harness, gopayBinding, GOPAY_AMOUNT);
         const gopayOrder = deriveProviderCorrelation(gopayCollect.operationId).orderReference;
@@ -658,12 +682,14 @@ it.live(
                 }),
               ),
             ],
-            [GOPAY_REFUND]: [respond(200, gopayRefundResponseBody('ACCEPTED'))],
+            [GOPAY_REFUND]: [respond(200, gopayRefundResponseBody(GOPAY_FIXTURE_PAYMENT_ID, 'ACCEPTED'))],
             [GOPAY_REFUND_HISTORY]: [
+              respond(200, gopayRefundHistoryBody([GOPAY_EARLIER_REFUND_ROW])),
               respond(
                 200,
-                gopayTimestampedRefundHistoryBody([
-                  { amount: 4000, dateRequested: '2026-11-12T11:00:00.000+0100', state: 'REQUESTED' },
+                gopayRefundHistoryBody([
+                  GOPAY_EARLIER_REFUND_ROW,
+                  { amount: 4000, id: '4493293900', state: 'REQUESTED' },
                 ]),
               ),
             ],
@@ -673,6 +699,19 @@ it.live(
         );
         expect(gopayStep.callsTo(GOPAY_REFUND)).toHaveLength(1);
         expect(gopayStep.callsTo(GOPAY_REFUND)[0]?.body).toContain('amount=4000');
+        expect(gopayStep.sent.map(({ route }) => route)).toEqual([
+          GOPAY_TOKEN,
+          GOPAY_REFUND_HISTORY,
+          GOPAY_REFUND,
+          GOPAY_PAYMENT,
+          GOPAY_REFUND_HISTORY,
+        ]);
+        // The baseline is a column of the dispatch row the prepare committed before the send (#1158).
+        expect(
+          (yield* dispatchRecordOf(harness, gopayRefund.operationId)).pipe(
+            Option.map(({ providerRefundBaseline }) => providerRefundBaseline),
+          ),
+        ).toEqual(Option.some([GOPAY_EARLIER_REFUND_ROW.id]));
         expect((yield* dispatchStateOf(harness, gopayRefund.operationId)).pipe(Option.map(([state]) => state))).toEqual(
           Option.some('ACKNOWLEDGED'),
         );
@@ -682,13 +721,12 @@ it.live(
 
         // Comgate: refund of 40 CZK on the acknowledged transaction; Comgate documents no completion (N10).
         const comgateBinding = yield* nativeBindingFor(harness, 'COMGATE', COMGATE_SECRET_REF);
-        const comgateCollect = yield* nativeCollectionFor(harness, comgateBinding, COMGATE_AMOUNT);
+        const comgateCollect = yield* contactedCollectionFor(harness, comgateBinding, COMGATE_AMOUNT);
         yield* collectThrough(
           harness,
           comgateCollect,
           { [COMGATE_CREATE]: [respond(200, comgateFixture('create-success.json'))] },
           credentials,
-          withPayerContact,
         );
         const comgateRefund = yield* nativeRefundFor(harness, comgateBinding, comgateCollect, 4000);
         const comgateStep = yield* collectThrough(
