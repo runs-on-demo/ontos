@@ -33,7 +33,6 @@ export const ConfigureGatewayEnablementActionForbiddenProblemSchema = makeProble
       'operation_context_denied',
       'operation_context_invalid',
     ]),
-    reasons: Schema.optionalKey(Schema.Array(Schema.String)),
   },
 );
 export const ConfigureGatewayEnablementActionNotFoundProblemSchema = makeProblemDetailsSchema(
@@ -43,6 +42,7 @@ export const ConfigureGatewayEnablementActionNotFoundProblemSchema = makeProblem
     code: Schema.Literals([
       'action_invocation_not_found',
       'gateway_binding_not_found',
+      'gateway_payer_contact_source_missing',
       'gateway_source_authority_missing',
     ]),
   },

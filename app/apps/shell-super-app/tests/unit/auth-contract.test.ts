@@ -53,14 +53,9 @@ const problemTag = (schema: Schema.Top): SchemaAST.LiteralValue => {
   return tag.literal;
 };
 
-it('shares each browser group with the server and mounts the ingress groups only on the server contract', () => {
+it('shares each browser group with the server and mounts Symmy only on the server contract', () => {
   expect(ShellServerApi.identifier).toBe(ShellAuthenticationApi.identifier);
-  expect(Object.keys(ShellServerApi.groups)).toEqual([
-    ...Object.keys(ShellAuthenticationApi.groups),
-    'symmy',
-    'paymentNotifications',
-    'paymentReconciliation',
-  ]);
+  expect(Object.keys(ShellServerApi.groups)).toEqual([...Object.keys(ShellAuthenticationApi.groups), 'symmy']);
   for (const group of Object.values(ShellAuthenticationApi.groups)) {
     expect(ShellServerApi.groups[group.identifier]).toBe(group);
   }

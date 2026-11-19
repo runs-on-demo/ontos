@@ -3,7 +3,6 @@ import { hmac } from '@noble/hashes/hmac.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 import { and, eq } from 'drizzle-orm';
-import type { TrustedPrincipalContext } from '@app/core-runtime';
 import { Crypto, DateTime, Effect, Layer, Match, Option, Predicate, Redacted, Schema } from 'effect';
 import type { Scope } from 'effect';
 import { TestClock } from 'effect/testing';
@@ -57,11 +56,6 @@ import {
 } from '../fixtures/stripe/stripe-events.ts';
 import { stripePaymentIntentObject } from '../fixtures/stripe/stripe-objects.ts';
 import { credentialConfig, recordedGatewayAdapters } from '../support/psp-conformance-provider.fixture.ts';
-import {
-  CAPTURE_ROUTE_OPERATION,
-  routeScopedPrincipalOf,
-  testNotificationRouteOf,
-} from '../support/route-scope.fixture.ts';
 import { installPaymentTestCompositionAuthority } from './composition-authority-fixture.ts';
 import { makeTestScope, operationalScopeOf, provenanceFor } from './database-fixture.ts';
 import type { PaymentTestScope } from './database-fixture.ts';
@@ -190,10 +184,10 @@ const createBinding = Effect.fn('PspCaptureNative.createBinding')(function* crea
         pspBindingPersistenceForTransaction(scoped).createBinding({
           environment: 'SANDBOX',
           merchantIdentity,
+          notificationUrl: 'https://hooks.example.test/psp/stripe',
           provenance,
           reason: 'Configure the sandbox gateway account',
           replaces: Option.none(),
-          route: testNotificationRouteOf(scope.tenantId, merchantIdentity._tag),
           secretRef,
         }),
       ),
@@ -228,16 +222,11 @@ interface DeliveryInput {
   /** The verifying adapters; the fixture Stripe adapter unless given (the production set for Comgate). */
   readonly adapters?: GatewayProviderAdaptersContract;
   readonly body: Uint8Array;
-  readonly environment?: 'LIVE' | 'SANDBOX';
   readonly family?: GatewayFamily;
   /** The relay headers; when absent, a JSON body with `signature` as its Stripe-Signature header. */
   readonly headers?: Readonly<Record<string, string>>;
   readonly idempotencyKey: string;
-  /** The invoking context; the relay principal with the signed route of `routeBindingId` unless given. */
-  readonly principal?: TrustedPrincipalContext;
   readonly providerAccountRef: GatewayProviderAccountRef;
-  /** The binding whose route Shell signed for this delivery. */
-  readonly routeBindingId: string;
   readonly signature: string;
   readonly smuggled?: SmuggledScope;
 }
@@ -251,7 +240,7 @@ const deliver = Effect.fn('PspCaptureNative.deliver')(function* deliver(
   // The relay's JSON body, exactly as the HTTP runner hands its encoded form to the Core runtime.
   const payload = {
     ...input.smuggled,
-    environment: input.environment ?? 'SANDBOX',
+    environment: 'SANDBOX',
     family: input.family ?? 'STRIPE',
     headers: input.headers ?? { contentType: 'application/json; charset=utf-8', stripeSignature: input.signature },
     providerAccountRef: input.providerAccountRef,
@@ -263,13 +252,7 @@ const deliver = Effect.fn('PspCaptureNative.deliver')(function* deliver(
     yield* TestClock.setTime(RECEIVED_AT_SECONDS * 1000);
     return yield* actions.runAction({
       payload,
-      principal:
-        input.principal ??
-        routeScopedPrincipalOf(scope, {
-          bindingId: input.routeBindingId,
-          compositionRevision: COMPOSITION_R1,
-          operation: CAPTURE_ROUTE_OPERATION,
-        }),
+      principal: principalOf(scope),
       registration: captureProviderNotificationAction,
       transport: { correlationId: 'payment-psp-capture', idempotencyKey: input.idempotencyKey },
     });
@@ -432,7 +415,6 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
           body,
           idempotencyKey: 'capture-authentic',
           providerAccountRef: binding.providerAccountRef,
-          routeBindingId: binding.bindingId,
           signature,
         });
         const row = yield* onlyRow(yield* notificationRows(database, scope.tenantId));
@@ -497,7 +479,6 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
         const delivery = {
           body,
           providerAccountRef: binding.providerAccountRef,
-          routeBindingId: binding.bindingId,
           signature: signatureOf(body, WEBHOOK_SECRET),
         };
         const first = yield* deliver(actions, scope, { ...delivery, idempotencyKey: 'capture-first' });
@@ -519,7 +500,6 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
         const unmapped = {
           body: balance,
           providerAccountRef: binding.providerAccountRef,
-          routeBindingId: binding.bindingId,
           signature: signatureOf(balance, WEBHOOK_SECRET),
         };
         const ignored = yield* deliver(actions, scope, { ...unmapped, idempotencyKey: 'capture-ignored' });
@@ -544,13 +524,12 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
       Effect.gen(function* forgedSignature() {
         const { actions, binding, database, scope } = yield* scenario();
         const body = bodyOf(succeededEvent('evt_c17_capture_forged'));
-        const { bindingId: routeBindingId, providerAccountRef } = binding;
+        const { providerAccountRef } = binding;
         // Signed with a secret that is not the binding's webhook secret.
         const forged = yield* deliver(actions, scope, {
           body,
           idempotencyKey: 'capture-forged',
           providerAccountRef,
-          routeBindingId,
           signature: signatureOf(body, 'whsec_attacker_controlled_secret'),
         });
         // A genuine signature over other bytes does not cover a tampered body.
@@ -558,14 +537,12 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
           body,
           idempotencyKey: 'capture-tampered',
           providerAccountRef,
-          routeBindingId,
           signature: signatureOf(bodyOf(succeededEvent('evt_c17_capture_other')), WEBHOOK_SECRET),
         });
         const malformed = yield* deliver(actions, scope, {
           body,
           idempotencyKey: 'capture-malformed',
           providerAccountRef,
-          routeBindingId,
           signature: 'v1=not-a-signature',
         });
         expect([forged, tampered, malformed].map(summaryOf)).toEqual([
@@ -590,7 +567,6 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
         const delivery = {
           body,
           providerAccountRef: binding.providerAccountRef,
-          routeBindingId: binding.bindingId,
           signature: signatureOf(body, WEBHOOK_SECRET),
         };
         // Scope fields in the relay body are not part of the contract: the request is refused before any read.
@@ -644,7 +620,6 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
           adapters,
           family: 'COMGATE',
           providerAccountRef: binding.providerAccountRef,
-          routeBindingId: binding.bindingId,
           signature: 'not-sent-by-comgate',
         } as const;
         const credentials = credentialConfig({
@@ -724,69 +699,6 @@ describe('#1157 capture-provider-notification through the Core Action runtime', 
             Option.none(),
           ]),
         );
-      }),
-    ),
-  );
-
-  it.live('#1157 #1153 capture rechecks the signed binding route before anything is stored', () =>
-    native(
-      Effect.gen(function* routeRecheck() {
-        const { actions, binding, database, scope } = yield* scenario();
-        const body = bodyOf(succeededEvent('evt_c17_capture_route'));
-        const delivery = {
-          body,
-          providerAccountRef: binding.providerAccountRef,
-          routeBindingId: binding.bindingId,
-          signature: signatureOf(body, WEBHOOK_SECRET),
-        };
-        // A relay invocation without a verified route scope is refused before any read or write.
-        const unrouted = yield* deliver(actions, scope, {
-          ...delivery,
-          idempotencyKey: 'capture-unrouted',
-          principal: principalOf(scope),
-        }).pipe(Effect.flip);
-        expect(Predicate.isTagged(unrouted, 'PaymentUnavailable')).toBe(true);
-
-        // Another merchant's binding in the same Selling Legal Entity: its signed route never reaches this binding.
-        const other = yield* createBinding(
-          database,
-          scope,
-          { _tag: 'COMGATE', merchantId: COMGATE_MERCHANT_ID },
-          COMGATE_SECRET_REF,
-        );
-        const crossed = yield* deliver(actions, scope, {
-          ...delivery,
-          idempotencyKey: 'capture-crossed',
-          routeBindingId: other.bindingId,
-        });
-        // The binding's own route at a revision it never had.
-        const stale = yield* deliver(actions, scope, {
-          ...delivery,
-          idempotencyKey: 'capture-stale-route',
-          principal: routeScopedPrincipalOf(scope, {
-            bindingId: binding.bindingId,
-            compositionRevision: COMPOSITION_R1,
-            operation: CAPTURE_ROUTE_OPERATION,
-            routeRevision: 2,
-          }),
-        });
-        // A payload naming another environment than the routed binding's.
-        const crossEnvironment = yield* deliver(actions, scope, {
-          ...delivery,
-          environment: 'LIVE',
-          idempotencyKey: 'capture-cross-environment',
-        });
-        expect([crossed, stale, crossEnvironment].map(summaryOf)).toEqual([
-          ['REJECTED', 'BINDING_UNKNOWN'],
-          ['REJECTED', 'BINDING_UNKNOWN'],
-          ['REJECTED', 'BINDING_UNKNOWN'],
-        ]);
-        expect(yield* notificationRows(database, scope.tenantId)).toHaveLength(0);
-        expect(yield* capturedMessages(database, scope.tenantId)).toHaveLength(0);
-
-        // The verified notification is still captured under its own route.
-        const own = yield* deliver(actions, scope, { ...delivery, idempotencyKey: 'capture-routed' });
-        expect(summaryOf(own)[0]).toBe('CAPTURED');
       }),
     ),
   );

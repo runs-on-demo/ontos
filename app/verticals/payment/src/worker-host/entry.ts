@@ -3,7 +3,6 @@
 import { NodeCrypto } from '@effect/platform-node';
 import { Effect, Layer } from 'effect';
 import { FetchHttpClient, HttpClient } from 'effect/http';
-import { ActionAuthorizationPreflightDatabaseLive } from '@app/core-runtime';
 import {
   ActiveApplicationCompositionConfigLive,
   defineOutboxWorkerEntry,
@@ -15,11 +14,7 @@ import { GopayOAuthTokenLive } from '../integrations/gopay/gopay-oauth-token.ts'
 import { ProviderCredentialStoreLive } from '../integrations/psp/credentials-live.ts';
 import { ProviderEvidenceStoreLive } from '../integrations/psp/evidence-store-live.ts';
 import { GatewayProviderServicesLive } from '../integrations/psp/gateway-adapters-live.ts';
-import { GatewayReconciliationInvokerLive } from '../integrations/psp/gateway-reconciliation-invoker.ts';
 import { ProviderHttpLive } from '../integrations/psp/provider-http-live.ts';
-import { ReconciliationCredentialsLive } from '../integrations/psp/reconciliation-credentials.ts';
-import { GatewayReconciliationDueSourceLive } from '../persistence/gateway-reconciliation-due.ts';
-import { GatewayReconciliationDriverLive } from '../workers/gateway-reconciliation-driver.ts';
 import { outboxWorkers } from '../workers/index.ts';
 import { paymentRegistration } from '../../vertical.registration.ts';
 import {
@@ -59,27 +54,12 @@ export const gatewayProviderServicesLive = GatewayProviderServicesLive.pipe(
 export const outboxWorkerEntry = defineOutboxWorkerEntry({
   claimOwnerPrefix: 'payment.core-outbox-worker',
   expectedDeployment: ultramodernApiMarker,
-  // The reconciliation driver fiber (#1158, phase 2 D-P5) lives exactly as long as this entry's layer scope; it
-  // shares the entry's active Application Composition and Core's database, and calls only the Shell relay.
-  layer: GatewayReconciliationDriverLive.pipe(
-    Layer.provide(
-      Layer.mergeAll(
-        GatewayReconciliationDueSourceLive,
-        ReconciliationCredentialsLive,
-        GatewayReconciliationInvokerLive,
-      ),
+  layer: Layer.merge(
+    ActiveApplicationCompositionConfigLive.pipe(
+      Layer.provide(ActiveApplicationCompositionSourceLive.pipe(Layer.provide(noStoreManualRedirectFetchLive))),
     ),
-    Layer.provideMerge(
-      Layer.merge(
-        ActiveApplicationCompositionConfigLive.pipe(
-          Layer.provide(ActiveApplicationCompositionSourceLive.pipe(Layer.provide(noStoreManualRedirectFetchLive))),
-        ),
-        outboxWorkerDefinitionLayer,
-      ),
-    ),
-    // The driver's unscoped listing transaction and its Shell relay client.
-    Layer.provide(ActionAuthorizationPreflightDatabaseLive),
-    Layer.provide(noStoreManualRedirectFetchLive),
+    outboxWorkerDefinitionLayer,
+  ).pipe(
     Layer.provideMerge(ProviderEvidenceStoreLive),
     Layer.provide(gatewayProviderServicesLive),
     Layer.provide(outboxWorkerRepositoryLive),

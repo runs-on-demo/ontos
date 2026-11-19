@@ -6,20 +6,7 @@ import {
 import type { OutboxWorkerHandlerContext, OutboxWorkerLegalEntityScope } from '@app/core-runtime/outbox/worker';
 import type { OutboxPayload } from '@app/payment/outbox/payment-core-operation-requested-v1';
 import type { PgClient } from '@effect/sql-pg';
-import {
-  Cause,
-  Crypto,
-  DateTime,
-  Deferred,
-  Effect,
-  Exit,
-  Fiber,
-  Layer,
-  Match,
-  Option,
-  Predicate,
-  Schema,
-} from 'effect';
+import { Cause, Crypto, DateTime, Effect, Exit, Layer, Option, Predicate, Schema } from 'effect';
 import { SqlError } from 'effect/sql/SqlError';
 import { TestClock } from 'effect/testing';
 import { expect, it } from 'effect-rstest';
@@ -31,22 +18,15 @@ import {
 } from '../../../../packages/core-runtime/tests/support/database.ts';
 import { PaymentRefundBasisSchema } from '../../shared/domain/payment-refund-basis.ts';
 import type { PaymentGatewayProviderFamilySchema } from '../../shared/domain/payment-vocabulary.ts';
-import {
-  GatewayProviderAccountBindingIdSchema,
-  GatewayProviderAccountRefSchema,
-} from '../../shared/domain/psp-configuration.ts';
+import { GatewayProviderAccountRefSchema } from '../../shared/domain/psp-configuration.ts';
 import {
   cancellationMaterialRequest,
   operationRequestedPayloadOf,
   refundMaterialRequest,
 } from '../../src/domain/refund-admission.ts';
-import { matchGopayRefundHistory } from '../../src/integrations/gopay/gopay-evidence.ts';
-import { GopayRefundHistoryEntrySchema } from '../../src/integrations/gopay/gopay-wire.ts';
-import type { GopayRefundHistoryEntry } from '../../src/integrations/gopay/gopay-wire.ts';
 import { GatewayBindingResolverLive } from '../../src/integrations/psp/binding-resolver-live.ts';
 import { ProviderDispatchLedgerLive } from '../../src/integrations/psp/dispatch-ledger-live.ts';
 import { ProviderEvidenceStoreLive } from '../../src/integrations/psp/evidence-store-live.ts';
-import { ProviderEvidenceStore } from '../../src/integrations/psp/evidence-store.ts';
 import { executeGatewayOperation } from '../../src/integrations/psp/gateway-operation-executor.ts';
 import { GatewayProviderAdapters } from '../../src/integrations/psp/psp-adapter.ts';
 import type { GatewayProviderAdapter } from '../../src/integrations/psp/psp-adapter.ts';
@@ -61,17 +41,9 @@ import type {
   GatewayProviderUnavailableError,
   GatewayProviderUnsupportedError,
 } from '../../src/integrations/psp/psp-errors.ts';
-import { ProviderObjectIdSchema, ProviderObjectRefSchema } from '../../src/integrations/psp/psp-request.ts';
-import type {
-  GatewayExpectedEffect,
-  GatewayPayerContact,
-  ProviderObjectRef,
-} from '../../src/integrations/psp/psp-request.ts';
-import {
-  PreparedProviderRequestSchema,
-  ProviderEvidenceSchema,
-  ProviderFindingResultSchema,
-} from '../../src/integrations/psp/psp-result.ts';
+import { ProviderObjectRefSchema } from '../../src/integrations/psp/psp-request.ts';
+import type { GatewayExpectedEffect, ProviderObjectRef } from '../../src/integrations/psp/psp-request.ts';
+import { PreparedProviderRequestSchema, ProviderFindingResultSchema } from '../../src/integrations/psp/psp-result.ts';
 import type { PreparedProviderRequest, ProviderDispatchResponse } from '../../src/integrations/psp/psp-result.ts';
 import { computePaymentMaterialHash } from '../../src/persistence/payment-aggregate-persistence.ts';
 import { configuredRefundExecutionRouteFor } from '../support/refund-execution-route.fixture.ts';
@@ -113,10 +85,9 @@ const MERCHANT_IDENTITY_DOCUMENTS = {
 
 const refOf = (encoded: typeof ProviderObjectRefSchema.Encoded) =>
   Schema.decodeUnknownSync(ProviderObjectRefSchema)(encoded);
-const GOPAY_PAYMENT_ID = '3000006529';
 const PAYMENT_REFS = {
   COMGATE: refOf({ _tag: 'COMGATE_TRANSACTION', transId: 'AB12-CD34-EF56' }),
-  GOPAY: refOf({ _tag: 'GOPAY_PAYMENT', id: GOPAY_PAYMENT_ID }),
+  GOPAY: refOf({ _tag: 'GOPAY_PAYMENT', id: '3000006529' }),
   STRIPE: refOf({ _tag: 'STRIPE_CHECKOUT_SESSION', id: 'cs_test_native_1' }),
 } satisfies Record<Family, ProviderObjectRef>;
 
@@ -128,8 +99,6 @@ interface ProviderCall {
   readonly family: Family;
   readonly kind: 'PREPARE_CANCEL' | 'PREPARE_COLLECT' | 'PREPARE_REFUND' | 'REPLAY' | 'SEND';
   readonly operationId: string;
-  /** The payer contact a COLLECT prepare received; none for every other call. */
-  readonly payerContact: Option.Option<GatewayPayerContact>;
   readonly providerTarget: Option.Option<ProviderObjectRef>;
 }
 
@@ -137,34 +106,11 @@ interface Provider {
   calls: ProviderCall[];
   /** Overrides one call kind of one family; anything else answers with a plain acknowledgement. */
   failures: Map<string, (call: ProviderCall) => Effect.Effect<never, AnyProviderFailure>>;
-  /**
-   * The GoPay refund history of the test's provider payment. A GoPay refund prepare reads its baseline from it;
-   * a GoPay refund send appends its own SUCCESS row of the refund amount.
-   */
-  gopayRefundHistory: GopayRefundHistoryEntry[];
-  /** Holds one call (`KIND:operationId`) after its answer was computed and before it returns. */
-  holds: Map<string, Effect.Effect<void>>;
 }
 
-const newProvider = (): Provider => ({ calls: [], failures: new Map(), gopayRefundHistory: [], holds: new Map() });
+const newProvider = (): Provider => ({ calls: [], failures: new Map() });
 
-const FIRST_GOPAY_REFUND_ROW_ID = 4_493_293_835;
-
-const gopayRefundRowOf = (rowId: number, amountMinor: number) =>
-  Schema.decodeUnknownSync(GopayRefundHistoryEntrySchema)({
-    amount: amountMinor,
-    currency: 'CZK',
-    date_requested: '2026-11-13',
-    id: rowId,
-    state: 'SUCCESS',
-  });
-
-const preparedOf = (
-  family: Family,
-  operationId: string,
-  kind: string,
-  gopayRefundHistory: readonly GopayRefundHistoryEntry[] = [],
-): PreparedProviderRequest => {
+const preparedOf = (family: Family, operationId: string, kind: string): PreparedProviderRequest => {
   const { idempotencyKey, orderReference } = deriveProviderCorrelation(operationId);
   const stripe = family === 'STRIPE';
   const headers = [{ name: 'content-type', value: 'application/x-www-form-urlencoded' }];
@@ -175,11 +121,6 @@ const preparedOf = (
     headers: stripe ? [...headers, { name: 'idempotency-key', value: idempotencyKey }] : headers,
     idempotencyKey: stripe ? Option.some(idempotencyKey) : Option.none(),
     orderReference,
-    // The ledger refuses a GoPay refund without its pre-dispatch refund-history baseline, and any other with one.
-    refundBaseline:
-      family === 'GOPAY' && kind === 'REFUND'
-        ? Option.some({ rowIds: gopayRefundHistory.map((row) => `${row.id}`) })
-        : Option.none(),
     replayWindowMs: stripe ? Option.some(86_400_000) : Option.none(),
     requestHash: 'a'.repeat(64),
   });
@@ -234,19 +175,12 @@ const adapterOf = (provider: Provider, family: Family): GatewayProviderAdapter =
     Effect.suspend(() => {
       provider.calls.push(call);
       const failure = provider.failures.get(`${family}:${call.kind}`);
-      const hold = provider.holds.get(`${call.kind}:${call.operationId}`) ?? Effect.void;
-      return failure === undefined ? Effect.sync(success).pipe(Effect.tap(() => hold)) : failure(call);
+      return failure === undefined ? Effect.sync(success) : failure(call);
     });
-  const call = (
-    kind: ProviderCall['kind'],
-    operationId: string,
-    providerTarget?: ProviderObjectRef,
-    payerContact: Option.Option<GatewayPayerContact> = Option.none(),
-  ) => ({
+  const call = (kind: ProviderCall['kind'], operationId: string, providerTarget?: ProviderObjectRef) => ({
     family,
     kind,
     operationId,
-    payerContact,
     providerTarget: Option.fromUndefinedOr(providerTarget),
   });
   return {
@@ -264,24 +198,20 @@ const adapterOf = (provider: Provider, family: Family): GatewayProviderAdapter =
         preparedOf(family, request.operationId, 'CANCEL'),
       ).pipe(Effect.catchTag('GatewayProviderOutcomeUnknown', (failure) => Effect.die(failure))),
     prepareCollect: (_target, request) =>
-      run(call('PREPARE_COLLECT', request.operationId, undefined, request.payerContact), () =>
-        preparedOf(family, request.operationId, 'COLLECT'),
-      ).pipe(Effect.catchTag('GatewayProviderOutcomeUnknown', (failure) => Effect.die(failure))),
+      run(call('PREPARE_COLLECT', request.operationId), () => preparedOf(family, request.operationId, 'COLLECT')).pipe(
+        Effect.catchTag('GatewayProviderOutcomeUnknown', (failure) => Effect.die(failure)),
+      ),
     prepareRefund: (_target, request) =>
       run(call('PREPARE_REFUND', request.operationId, request.providerTarget), () =>
-        preparedOf(family, request.operationId, 'REFUND', [...provider.gopayRefundHistory]),
+        preparedOf(family, request.operationId, 'REFUND'),
       ).pipe(Effect.catchTag('GatewayProviderOutcomeUnknown', (failure) => Effect.die(failure))),
     readOrderReference: () => Effect.die('The executor never reads order references'),
     replay: (_target, _request, expected) =>
       run(call('REPLAY', expected.operationId), () => acknowledgement(family, expected)),
     send: (_target, _prepared, expected) =>
-      run(call('SEND', expected.operationId), () => {
-        if (family === 'GOPAY' && Predicate.isTagged(expected, 'REFUND')) {
-          const rowId = FIRST_GOPAY_REFUND_ROW_ID + provider.gopayRefundHistory.length;
-          provider.gopayRefundHistory.push(gopayRefundRowOf(rowId, expected.amount.amountMinor));
-        }
-        return acknowledgement(family, expected);
-      }).pipe(Effect.catchTag('GatewayProviderUnsupported', (failure) => Effect.die(failure))),
+      run(call('SEND', expected.operationId), () => acknowledgement(family, expected)).pipe(
+        Effect.catchTag('GatewayProviderUnsupported', (failure) => Effect.die(failure)),
+      ),
     verifyNotification: () => Effect.die('The executor never verifies notifications'),
   };
 };
@@ -382,8 +312,6 @@ const contextOf = (scope: PaymentTestScope) =>
   );
 
 interface Harness {
-  /** Owner connection: only it can read the insert-only payer contact table. */
-  readonly admin: PgClient.PgClient;
   readonly crypto: { draws: number };
   readonly database: PaymentTestDatabase;
   readonly provider: Provider;
@@ -437,10 +365,10 @@ const failureTag = (exit: Exit.Exit<void, unknown>) =>
 // ---------------------------------------------------------------------------------------------
 
 const harnessOf = Effect.gen(function* harness() {
-  const { admin, runtime: runtimeClient } = yield* testDatabaseClients;
+  const { runtime: runtimeClient } = yield* testDatabaseClients;
   const database = yield* makeTestDatabaseFromClient(runtimeClient, paymentTestRelations);
   const scope = yield* makeTestScope;
-  return { admin, crypto: { draws: 0 }, database, provider: newProvider(), runtimeClient, scope } satisfies Harness;
+  return { crypto: { draws: 0 }, database, provider: newProvider(), runtimeClient, scope } satisfies Harness;
 });
 
 const gatewayBindingOf = (family: Family, accountRef: string) =>
@@ -552,26 +480,31 @@ const refundBasisOf = (itemRef: string) =>
     items: [{ amountMinor: 10_000, currency: 'CZK', itemRef, sourceEvidenceRef: `order:item:${itemRef}` }],
   });
 
-interface Collection {
-  readonly binding: ReturnType<typeof gatewayBindingOf>;
-  readonly payload: OutboxPayload;
-}
-
-/** One more REFUND (of item `itemRef`) of a collection that `refundFor` already confirmed. */
-const anotherRefundFor = Effect.fn('PspExecutorFixture.anotherRefund')(function* anotherRefundFor(
+/** A REFUND of a confirmed collection, with the payload A7 builds. */
+const refundFor = Effect.fn('PspExecutorFixture.refund')(function* refundFor(
   harness: Harness,
-  collection: Collection,
-  itemRef: string,
+  collection: { readonly binding: ReturnType<typeof gatewayBindingOf>; readonly payload: OutboxPayload },
 ) {
   const { database, scope } = harness;
   const { operationId: targetOperationId, paymentId } = collection.payload;
-  const [provenance, basis, refundExecutionRoute] = yield* Effect.all(
+  const [confirm, provenance, basis, refundExecutionRoute] = yield* Effect.all(
     [
       provenanceFor(scope),
-      refundBasisOf(itemRef),
+      provenanceFor(scope),
+      refundBasisOf('A'),
       configuredRefundExecutionRouteFor(database, scope, collection.binding),
     ],
     { concurrency: 1 },
+  );
+  yield* withPersistence(database, scope, (persistence) =>
+    persistence.transitionOperationOutcome({
+      causedBy: { kind: 'OBSERVATION', sourceId: 'observation:captured' },
+      expectedOutcomeRevision: 1,
+      operationId: targetOperationId,
+      paymentId,
+      provenance: confirm,
+      to: 'EFFECT_CONFIRMED',
+    }),
   );
   const created = yield* withPersistence(database, scope, (persistence) =>
     persistence.insertOperation({
@@ -580,7 +513,7 @@ const anotherRefundFor = Effect.fn('PspExecutorFixture.anotherRefund')(function*
       initialOutcome: 'PENDING',
       kind: 'REFUND',
       materialRequest: refundMaterialRequest({ amount: REFUND_AMOUNT, basis, reason: 'Returned goods' }),
-      operationKey: `refund-${itemRef}`,
+      operationKey: 'refund-A',
       paymentId,
       provenance,
       refundBasis: basis,
@@ -592,33 +525,13 @@ const anotherRefundFor = Effect.fn('PspExecutorFixture.anotherRefund')(function*
   return { ...payload, refundBasis: basis, refundExecutionRoute, targetOperationId } satisfies OutboxPayload;
 });
 
-/** A REFUND of a confirmed collection, with the payload A7 builds. */
-const refundFor = Effect.fn('PspExecutorFixture.refund')(function* refundFor(harness: Harness, collection: Collection) {
-  const { database, scope } = harness;
-  const { operationId: targetOperationId, paymentId } = collection.payload;
-  const confirm = yield* provenanceFor(scope);
-  yield* withPersistence(database, scope, (persistence) =>
-    persistence.transitionOperationOutcome({
-      causedBy: { kind: 'OBSERVATION', sourceId: 'observation:captured' },
-      expectedOutcomeRevision: 1,
-      operationId: targetOperationId,
-      paymentId,
-      provenance: confirm,
-      to: 'EFFECT_CONFIRMED',
-    }),
-  );
-  return yield* anotherRefundFor(harness, collection, 'A');
-});
-
 // ---------------------------------------------------------------------------------------------
 // Native reads
 // ---------------------------------------------------------------------------------------------
 
 interface DispatchRow extends Record<string, unknown> {
-  readonly binding_id: string;
   readonly not_sent_reason: string | null;
   readonly provider_payment_ref: string | null;
-  readonly provider_refund_baseline: readonly string[] | null;
   readonly state: string;
 }
 
@@ -627,7 +540,7 @@ const dispatchOf = (harness: Harness, operationId: string) =>
     harness.runtimeClient,
     harness.scope,
     harness.runtimeClient.unsafe<DispatchRow>(
-      `select binding_id, state, not_sent_reason, provider_payment_ref, provider_refund_baseline
+      `select state, not_sent_reason, provider_payment_ref
          from payment.psp_provider_dispatches where operation_id = $1`,
       [operationId],
     ),
@@ -659,122 +572,10 @@ const evidenceOf = (harness: Harness, paymentId: string) =>
     ),
   );
 
-/** The payer contact of a COLLECT as the collection Action stores it: an insert on the runtime role. */
-const rememberContact = (
-  harness: Harness,
-  operationId: string,
-  contact: { readonly email?: string; readonly fullName?: string; readonly phone?: string },
-) =>
-  inScope(
-    harness.runtimeClient,
-    harness.scope,
-    harness.runtimeClient.unsafe(
-      `insert into payment.psp_operation_payer_contacts (tenant_id, legal_entity_id, operation_id, full_name, email, phone)
-       values ($1, $2, $3, $4, $5, $6) on conflict do nothing`,
-      [
-        harness.scope.tenantId,
-        harness.scope.legalEntityId,
-        operationId,
-        contact.fullName ?? null,
-        contact.email ?? null,
-        contact.phone ?? null,
-      ],
-    ),
-  );
-
-interface CountRow extends Record<string, unknown> {
-  readonly count: number;
-}
-
-const storedContactCount = (harness: Harness, operationId: string) =>
-  harness.admin
-    .unsafe<CountRow>(
-      'select count(*)::integer as count from payment.psp_operation_payer_contacts where operation_id = $1',
-      [operationId],
-    )
-    .pipe(Effect.map((rows) => rows[0]?.count ?? -1));
-
-const prepareContacts = (harness: Harness) =>
-  harness.provider.calls
-    .filter((providerCall) => providerCall.kind === 'PREPARE_COLLECT')
-    .map((providerCall) => providerCall.payerContact);
-
 const callsOf = (harness: Harness, kind: ProviderCall['kind']) =>
   harness.provider.calls.filter((providerCall) => providerCall.kind === kind).length;
 
 const createdAtMs = (payload: OutboxPayload) => DateTime.toEpochMillis(DateTime.makeUnsafe(payload.requestedAt));
-
-/** What the provider's current refund history proves about `refund`, from the baseline its dispatch row holds. */
-const attributionOf = (harness: Harness, refund: OutboxPayload) =>
-  dispatchOf(harness, refund.operationId).pipe(
-    Effect.map((row) =>
-      matchGopayRefundHistory({
-        baseline: row.pipe(
-          Option.flatMap((dispatch) => Option.fromNullOr(dispatch.provider_refund_baseline)),
-          Option.map((rowIds) => rowIds.map((rowId) => ProviderObjectIdSchema.make(rowId))),
-        ),
-        expectedAmount: refund.amount,
-        history: harness.provider.gopayRefundHistory,
-      }),
-    ),
-  );
-
-/** The history row that confirms `refund`; none when the history proves anything else about it. */
-const confirmedRowOf = (harness: Harness, refund: OutboxPayload) =>
-  attributionOf(harness, refund).pipe(
-    Effect.map((attribution) =>
-      Match.value(attribution).pipe(
-        Match.tag('CONFIRMED', ({ row }) => Option.some(row.id)),
-        Match.orElse(() => Option.none()),
-      ),
-    ),
-  );
-
-/** A recovery lookup's REFUND_CONFIRMED of `refund` from its attributed history row, as the evidence store keeps it. */
-const confirmRefund = (harness: Harness, refund: OutboxPayload, rowId: number) =>
-  Effect.gen(function* confirmation() {
-    const [workerContext, store, row] = yield* Effect.all(
-      [contextOf(harness.scope), Effect.service(ProviderEvidenceStore), dispatchOf(harness, refund.operationId)],
-      { concurrency: 1 },
-    );
-    const bindingId = yield* Effect.fromOption(row).pipe(
-      Effect.flatMap((dispatch) => Schema.decodeEffect(GatewayProviderAccountBindingIdSchema)(dispatch.binding_id)),
-    );
-    const evidence = yield* Schema.decodeUnknownEffect(ProviderEvidenceSchema)({
-      discrepancy: Option.none(),
-      economicEffectKey: Option.some(`gopay-refund:${GOPAY_PAYMENT_ID}:${rowId}`),
-      factFamily: 'REFUND_EXECUTION',
-      factKind: 'REFUND_CONFIRMED',
-      observedAmount: Option.some(refund.amount),
-      observedAt: DateTime.makeUnsafe('2026-11-13T10:00:00.000Z'),
-      providerOccurredAt: Option.none(),
-      providerRefs: [PAYMENT_REFS.GOPAY],
-      reason: Option.none(),
-      sourceOccurrenceId: `gopay:RECOVERY_LOOKUP:${rowId}:${refund.operationId}:REFUND_CONFIRMED:${refund.amount.amountMinor}`,
-      sourceRevision: 0,
-    });
-    return yield* harness.database.transaction((transaction) =>
-      installOperationalScope(transaction, operationalScopeOf(harness.scope)).pipe(
-        Effect.flatMap((routineInvoker) =>
-          store.append({
-            bindingId,
-            evidence,
-            notificationId: Option.none(),
-            operationId: refund.operationId,
-            origin: 'RECOVERY_LOOKUP',
-            paymentId: refund.paymentId,
-            scope: {
-              completionPublisher: NO_COMPLETION,
-              legalEntityId: harness.scope.legalEntityId,
-              routineInvoker,
-              tenantId: harness.scope.tenantId,
-            },
-            workerContext,
-          }),
-        ),
-      ),
-    );
-  }).pipe(Effect.provide(ProviderEvidenceStoreLive));
 
 // ---------------------------------------------------------------------------------------------
 // Scenarios
@@ -940,56 +741,6 @@ it.live('#1158 Same logical refund but changed basis conflicts', () =>
   ),
 );
 
-it.live('#1158 A GoPay refund baseline read before another refund of the payment moved is never prepared', () =>
-  Effect.scoped(
-    Effect.gen(function* staleRefundBaseline() {
-      const harness = yield* harnessOf;
-      const collection = yield* collectionFor(harness, 'GOPAY');
-      expect(Exit.isSuccess(yield* deliver(harness, collection.payload))).toBe(true);
-      const first = yield* refundFor(harness, collection);
-      const second = yield* anotherRefundFor(harness, collection, 'B');
-      const [rowA, rowB] = [FIRST_GOPAY_REFUND_ROW_ID, FIRST_GOPAY_REFUND_ROW_ID + 1];
-
-      // The second refund passes the unresolved-refund check and reads its baseline (no rows yet), then waits.
-      const baselineRead = yield* Deferred.make<boolean>();
-      const resume = yield* Deferred.make<boolean>();
-      harness.provider.holds.set(
-        `PREPARE_REFUND:${second.operationId}`,
-        Deferred.succeed(baselineRead, true).pipe(Effect.andThen(Deferred.await(resume))),
-      );
-      const held = yield* deliver(harness, second).pipe(Effect.forkChild);
-      yield* Deferred.await(baselineRead);
-
-      // Meanwhile the first refund is prepared, sent and confirmed from the one row it added.
-      expect(Exit.isSuccess(yield* deliver(harness, first))).toBe(true);
-      expect(yield* confirmedRowOf(harness, first)).toEqual(Option.some(rowA));
-      yield* confirmRefund(harness, first, rowA);
-
-      // The second prepare is refused: its baseline misses the first refund's row. Nothing persisted, nothing sent.
-      harness.provider.holds.clear();
-      yield* Deferred.succeed(resume, true);
-      const stale = yield* Fiber.join(held);
-      expect(Option.isSome(deferredWake(stale))).toBe(true);
-      expect(Option.isNone(yield* dispatchOf(harness, second.operationId))).toBe(true);
-      const sends = () =>
-        harness.provider.calls
-          .filter((providerCall) => providerCall.kind === 'SEND')
-          .map((providerCall) => providerCall.operationId);
-      expect(sends()).toEqual([collection.payload.operationId, first.operationId]);
-
-      // The next delivery re-reads the baseline with the first refund's row; each refund owns its own row.
-      expect(Exit.isSuccess(yield* deliver(harness, second))).toBe(true);
-      expect(
-        (yield* dispatchOf(harness, second.operationId)).pipe(
-          Option.map((row) => [row.state, row.provider_refund_baseline]),
-        ),
-      ).toEqual(Option.some(['ACKNOWLEDGED', [`${rowA}`]]));
-      expect(sends()).toEqual([collection.payload.operationId, first.operationId, second.operationId]);
-      expect(yield* confirmedRowOf(harness, second)).toEqual(Option.some(rowB));
-    }),
-  ),
-);
-
 it.live('#1156 Unsupported provider operation yields typed unsupported, no fallback', () =>
   Effect.scoped(
     Effect.gen(function* unsupportedCancel() {
@@ -1058,71 +809,6 @@ it.live('#1156 A missing Comgate payer contact ends NOT_SENT and never dead-lett
       expect(yield* evidenceOf(harness, payload.paymentId)).toEqual([
         [payload.operationId, 'COLLECTION_NOT_EFFECTED', 'prepare_unavailable', 'PENDING_SUBMISSION', 'LOCAL_NOT_SENT'],
       ]);
-      expect(callsOf(harness, 'SEND')).toBe(0);
-      // The routine returned no payer contact, so no prepare received one.
-      expect(prepareContacts(harness).every(Option.isNone)).toBe(true);
-    }),
-  ),
-);
-
-it.live('#1154 A Comgate collect prepares with the stored payer contact, which PREPARED deletes', () =>
-  Effect.scoped(
-    Effect.gen(function* comgateContactPrepared() {
-      const harness = yield* harnessOf;
-      const { payload } = yield* collectionFor(harness, 'COMGATE');
-      yield* rememberContact(harness, payload.operationId, { email: 'payer@example.test', fullName: 'Test Payer' });
-      expect(yield* storedContactCount(harness, payload.operationId)).toBe(1);
-
-      expect(Exit.isSuccess(yield* deliver(harness, payload))).toBe(true);
-      expect(prepareContacts(harness)).toEqual([
-        Option.some({
-          email: Option.some('payer@example.test'),
-          fullName: Option.some('Test Payer'),
-          phone: Option.none(),
-        }),
-      ]);
-      expect(yield* stateOf(harness, payload.operationId)).toEqual(Option.some(['ACKNOWLEDGED', null]));
-      expect(yield* storedContactCount(harness, payload.operationId)).toBe(0);
-    }),
-  ),
-);
-
-it.live('#1153 A collect withheld for its cancellation deletes its payer contact', () =>
-  Effect.scoped(
-    Effect.gen(function* contactDeletedWhenWithheld() {
-      const harness = yield* harnessOf;
-      const collection = yield* collectionFor(harness, 'COMGATE');
-      yield* rememberContact(harness, collection.payload.operationId, {
-        email: 'payer@example.test',
-        fullName: 'Test Payer',
-      });
-      const cancel = yield* cancellationFor(harness, collection);
-      expect(Exit.isSuccess(yield* deliver(harness, cancel))).toBe(true);
-      expect(yield* stateOf(harness, collection.payload.operationId)).toEqual(
-        Option.some(['NOT_SENT', 'WITHHELD_FOR_CANCELLATION']),
-      );
-      expect(yield* storedContactCount(harness, collection.payload.operationId)).toBe(0);
-      expect(callsOf(harness, 'PREPARE_COLLECT')).toBe(0);
-    }),
-  ),
-);
-
-it.live('#1153 A collect that is never sent deletes its payer contact', () =>
-  Effect.scoped(
-    Effect.gen(function* contactDeletedWhenNotSent() {
-      const harness = yield* harnessOf;
-      const { payload } = yield* collectionFor(harness, 'COMGATE');
-      yield* rememberContact(harness, payload.operationId, { email: 'payer@example.test', fullName: 'Test Payer' });
-      harness.provider.failures.set('COMGATE:PREPARE_COLLECT', unavailable('COMGATE', 'credential_entry_malformed'));
-      expect(Option.isSome(deferredWake(yield* deliver(harness, payload)))).toBe(true);
-      // A deferred prepare keeps the contact for the next attempt.
-      expect(yield* storedContactCount(harness, payload.operationId)).toBe(1);
-
-      expect(Exit.isSuccess(yield* deliver(harness, payload, { atMs: createdAtMs(payload) + 24 * HOUR_MS }))).toBe(
-        true,
-      );
-      expect(yield* stateOf(harness, payload.operationId)).toEqual(Option.some(['NOT_SENT', 'PREPARE_UNAVAILABLE']));
-      expect(yield* storedContactCount(harness, payload.operationId)).toBe(0);
       expect(callsOf(harness, 'SEND')).toBe(0);
     }),
   ),

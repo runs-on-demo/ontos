@@ -11,7 +11,6 @@ import { PROVIDER_EVIDENCE_FACT_KINDS } from '../../shared/domain/psp-vocabulary
 import {
   CONFORMANCE_CLOCK_MS,
   CONFORMANCE_FAMILIES,
-  REFUND_OPERATION_ID,
   cancelExpected,
   collectExpected,
   refundExpected,
@@ -59,18 +58,9 @@ const adapterOf = (
 ) => harness.adapters.forFamily(conformance.family);
 
 const lookupOf = (conformance: FamilyConformance, expected: GatewayExpectedEffect): GatewayLookupRequest => ({
-  acknowledgedRefundBaseline: Option.none(),
   dispatchedAt: Option.some(DateTime.makeUnsafe(CONFORMANCE_CLOCK_MS)),
   expected,
   target: { _tag: 'PROVIDER_OBJECT', ref: conformance.paymentRef },
-});
-
-/** The recovery lookup of the conformance refund, dispatched at the conformance instant. */
-const refundCompletionLookupOf = (conformance: FamilyConformance): GatewayLookupRequest => ({
-  acknowledgedRefundBaseline: conformance.refundCompletion.acknowledgedRefundBaseline,
-  dispatchedAt: Option.some(DateTime.makeUnsafe(CONFORMANCE_CLOCK_MS)),
-  expected: refundExpected(conformance),
-  target: { _tag: 'PROVIDER_OBJECT', ref: conformance.refundCompletion.lookupRef },
 });
 
 const factKindOf = (finding: ProviderFindingResult | undefined) =>
@@ -90,6 +80,16 @@ const findingFor = (findings: readonly ProviderFindingResult[], operationId: str
   findings.find((finding) => finding.target.operationId === operationId);
 
 describe('#1159 L2 capability matrix contract', () => {
+  it('#1159 L2 the matrix names exactly the three Launch gateway families and five capabilities', () => {
+    expect(CONFORMANCE_FAMILIES.map(({ family }) => family)).toEqual(['GOPAY', 'STRIPE', 'COMGATE']);
+    expect(new Set(Object.keys(GATEWAY_LAUNCH_CAPABILITIES))).toEqual(new Set(['COMGATE', 'GOPAY', 'STRIPE']));
+    for (const row of Object.values(GATEWAY_LAUNCH_CAPABILITIES)) {
+      expect(new Set(Object.keys(row))).toEqual(
+        new Set(['CANCEL_OR_VOID', 'COLLECT', 'NOTIFICATION', 'REFUND', 'RETRIEVE']),
+      );
+    }
+  });
+
   it('#1159 L2 manual capture, saved methods, subscriptions and settlement are unreachable from the adapter contract', () => {
     // The collect request carries only the exact one-shot facts; there is no capture mode, saved method,
     // customer, recurrence or off-session field a caller could set.
@@ -110,6 +110,7 @@ for (const conformance of CONFORMANCE_FAMILIES) {
         Effect.gen(function* selected() {
           const adapter = yield* adapterOf(conformance, harness);
           expect(adapter.family).toBe(family);
+          expect(adapter.capabilities).toEqual(GATEWAY_LAUNCH_CAPABILITIES[family]);
           expect(harness.sent).toEqual([]);
         }),
       ),
@@ -306,21 +307,6 @@ for (const conformance of CONFORMANCE_FAMILIES) {
       ),
     );
 
-    it.effect(`#1159 L2 ${family} refund completion is confirmed only by the provider's own completion source`, () =>
-      caseOf(conformance, conformance.refundCompletion.confirmed, (harness) =>
-        Effect.gen(function* refundCompletion() {
-          const completion = conformance.refundCompletion;
-          yield* TestClock.setTime(completion.atMs);
-          const adapter = yield* adapterOf(conformance, harness);
-          const findings = yield* adapter.lookup(completion.target, refundCompletionLookupOf(conformance));
-          const finding = findingFor(findings, REFUND_OPERATION_ID);
-          expect(finding?.finding).toBe('EFFECT_CONFIRMED');
-          expect(factKindOf(finding)).toEqual(Option.some('REFUND_CONFIRMED'));
-          expect(harness.sent.map(({ route }) => route)).toEqual(completion.confirmedRoutes);
-        }),
-      ),
-    );
-
     it.effect(`#1159 L2 ${family} lost refund response is OUTCOME_UNKNOWN and the refund is never resent`, () =>
       caseOf(
         conformance,
@@ -435,24 +421,3 @@ for (const conformance of CONFORMANCE_FAMILIES) {
     );
   });
 }
-
-describe('#1159 L2 refund completion sources that do not exist in test mode', () => {
-  for (const conformance of CONFORMANCE_FAMILIES.filter(({ refundCompletion }) => !refundCompletion.sandboxSource)) {
-    const { family } = conformance;
-    it.effect(
-      `#1159 L2 ${family} sandbox refund completion asks nothing and stays INDETERMINATE (production statement only)`,
-      () =>
-        caseOf(conformance, conformance.refundCompletion.confirmed, (harness) =>
-          Effect.gen(function* sandboxRefundCompletion() {
-            yield* TestClock.setTime(conformance.refundCompletion.atMs);
-            const adapter = yield* adapterOf(conformance, harness);
-            const findings = yield* adapter.lookup(conformance.target, refundCompletionLookupOf(conformance));
-            expect(findings.map(({ evidence, finding }) => [finding, Option.isNone(evidence)])).toEqual([
-              ['INDETERMINATE', true],
-            ]);
-            expect(harness.sent).toEqual([]);
-          }),
-        ),
-    );
-  }
-});

@@ -1,7 +1,6 @@
-import { Option, Schema } from 'effect';
+import { Schema } from 'effect';
 
 import { PaymentGatewayAccountBindingSchema } from '../../../shared/domain/payment-execution-binding.ts';
-import type { PaymentPayerContact } from '../../../shared/domain/payment-payer-contact.ts';
 import {
   PaymentIdSchema,
   PaymentLegalEntityIdSchema,
@@ -69,24 +68,13 @@ export type GatewayExecutionTarget = typeof GatewayExecutionTargetSchema.Type;
 const contactText = (maximumLength: number) =>
   Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(maximumLength), Schema.isTrimmed());
 
-/**
- * Payer contact handed to a provider adapter for providers that require it (Comgate). Its source is
- * the caller-supplied `PaymentPayerContact` on the start-payment-collection Action (plan D-P3, N9), converted
- * by `toGatewayPayerContact` during dispatch preparation only.
- */
+/** Payer contact for providers that require it (Comgate). C16 has no owner for it yet (plan N9). */
 export const GatewayPayerContactSchema = Schema.Struct({
   email: Schema.Option(contactText(254)),
   fullName: Schema.Option(contactText(200)),
   phone: Schema.Option(contactText(40)),
 });
 export type GatewayPayerContact = typeof GatewayPayerContactSchema.Type;
-
-/** Converts the Action's payer contact into the adapter contract; absent fields become `Option.none()`. */
-export const toGatewayPayerContact = (contact: PaymentPayerContact): GatewayPayerContact => ({
-  email: Option.fromUndefinedOr(contact.email),
-  fullName: Option.fromUndefinedOr(contact.fullName),
-  phone: Option.fromUndefinedOr(contact.phone),
-});
 
 /**
  * Every input of a prepare is explicit, so preparation is a pure function of it. The executor calls
@@ -156,25 +144,10 @@ export const GatewayLookupTargetSchema = Schema.Union([
 ]);
 export type GatewayLookupTarget = typeof GatewayLookupTargetSchema.Type;
 
-/**
- * The provider refund-history rows a payment had before a refund dispatch was sent (GoPay: its history rows name
- * no request and carry date-only dates). Read through the dispatch's binding before the send and persisted with
- * the prepared request, so a later lookup can attribute the one row that is new since then.
- */
-export const GatewayRefundBaselineSchema = Schema.Struct({
-  rowIds: Schema.Array(ProviderObjectIdSchema).check(Schema.isMaxLength(1000)),
-});
-export type GatewayRefundBaseline = typeof GatewayRefundBaselineSchema.Type;
-
 export const GatewayLookupRequestSchema = Schema.Struct({
   /**
-   * The refund baseline of a REFUND dispatch the provider acknowledged with its own dispatch response
-   * (`acknowledgedRefundBaselineOf`). None for any other dispatch, including one whose response was lost: a row
-   * that is new since the baseline proves that dispatch only when the provider accepted it.
-   */
-  acknowledgedRefundBaseline: Schema.Option(GatewayRefundBaselineSchema),
-  /**
-   * The ledger `preparedAt` of the expected operation's dispatch (Comgate statement dates). None when the
+   * The ledger `preparedAt` of the expected operation's dispatch; a provider entry created before it
+   * cannot be that dispatch (GoPay refund history `date_requested >= dispatchedAt`). None when the
    * operation was never prepared.
    */
   dispatchedAt: Schema.Option(Schema.DateTimeUtc),

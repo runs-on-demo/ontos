@@ -4,6 +4,7 @@ import { PaymentReasonSchema, PaymentRevisionSchema } from '../domain/payment-id
 import {
   GatewayCredentialRevisionViewSchema,
   GatewayCredentialSecretRefSchema,
+  GatewayHttpsUrlSchema,
   GatewayMerchantIdentitySchema,
   GatewayProviderAccountBindingViewSchema,
   GatewayProviderAccountRefSchema,
@@ -15,8 +16,7 @@ import { GatewayEnvironmentSchema } from '../domain/psp-vocabulary.ts';
  * Legal Entity come from the Core-verified scope, never from this payload. The gateway family is the
  * merchant identity's own tag, so only that family's identity shape is accepted. Account identity
  * (family, environment, merchant identity, `pab_` ref) is fixed when the binding is created; a different
- * merchant account is a new binding that replaces the Current one for new Payment intents only. Payment
- * builds the binding's notification URL itself from its route key; a caller never supplies it (N11).
+ * merchant account is a new binding that replaces the Current one for new Payment intents only.
  */
 
 /** The Current binding a new binding replaces, decided against its revision. */
@@ -26,13 +26,14 @@ const ReplacedBindingSchema = Schema.Struct({
 });
 
 /**
- * Creates a binding with credential revision 1 and its notification route. When the family and environment
- * already have a Current binding, `replaces` must name it at its Current revision; it is then retired for new
- * intents in the same transaction and stays addressable for its historical operations.
+ * Creates a binding with credential revision 1. When the family and environment already have a Current
+ * binding, `replaces` must name it at its Current revision; it is then retired for new intents in the
+ * same transaction and stays addressable for its historical operations.
  */
 const CreateProviderAccountBindingSchema = Schema.TaggedStruct('CREATE', {
   environment: GatewayEnvironmentSchema,
   merchantIdentity: GatewayMerchantIdentitySchema,
+  notificationUrl: GatewayHttpsUrlSchema,
   reason: PaymentReasonSchema,
   replaces: Schema.optionalKey(ReplacedBindingSchema),
   /** Name of the credential material in the deployment secret store; never the secret itself. */
@@ -109,17 +110,3 @@ export type ProviderAccountBindingNotFoundError = Schema.Schema.Type<typeof Prov
 
 export const providerAccountBindingNotFound = (reason: string) =>
   new ProviderAccountBindingNotFound({ code: 'gateway_binding_not_found', reason });
-
-/**
- * The deployment gives Payment no valid public notification origin (`ONTOS_PAYMENT_NOTIFICATION_BASE_URL`), so
- * no binding can be created with a route a provider could reach. Nothing was written; every other Payment
- * capability is unaffected.
- */
-export const PaymentNotificationRouteUnavailable = makeBindingError('PaymentNotificationRouteUnavailable', {
-  code: Schema.Literal('payment_notification_route_unavailable'),
-  reason: Schema.String,
-});
-export type PaymentNotificationRouteUnavailableError = Schema.Schema.Type<typeof PaymentNotificationRouteUnavailable>;
-
-export const paymentNotificationRouteUnavailable = (reason: string) =>
-  new PaymentNotificationRouteUnavailable({ code: 'payment_notification_route_unavailable', reason });

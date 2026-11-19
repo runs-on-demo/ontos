@@ -24,7 +24,7 @@ export const GatewayCapabilityMatrixSchema = Schema.Struct({
 });
 export type GatewayCapabilityMatrix = typeof GatewayCapabilityMatrixSchema.Type;
 
-/** GoPay has no cancel API for a standard payment (plan N8). */
+/** GoPay has no cancel API for a standard payment (plan N8). Comgate is built but not enableable (N9). */
 export const GATEWAY_LAUNCH_CAPABILITIES: GatewayCapabilityMatrix = {
   COMGATE: {
     CANCEL_OR_VOID: 'SUPPORTED',

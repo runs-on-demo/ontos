@@ -289,10 +289,7 @@ const routeScopeOperations = (destination: InstalledContract, route: Route, fact
   });
 };
 
-/**
- * One of the two private callers of the route-scope signing wrapper; the other is the Payment binding route
- * proof (`gateway-payment-route-scope.ts`), which signs only for the Payment audience.
- */
+/** This private proof is the sole caller of the route-symbol signing wrapper. */
 export const issueSymmyRouteScopeAssertion = Effect.fn('SymmyRouteScope.issueAssertion')(function* issue(
   proof: SymmyRouteScopeProof,
   input: { readonly audience: string; readonly legalEntityId?: string; readonly principal: TrustedPrincipalContext },

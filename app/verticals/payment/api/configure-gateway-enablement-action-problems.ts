@@ -29,7 +29,13 @@ type ProblemOf<Tag extends ConfigureGatewayEnablementActionProblem['_tag']> = Ex
 type DomainProblemIdentity =
   | { readonly code: 'gateway_enablement_revision_conflict'; readonly kind: 'conflict' }
   | { readonly code: 'gateway_binding_not_current'; readonly kind: 'ineligible' }
-  | { readonly code: 'gateway_binding_not_found' | 'gateway_source_authority_missing'; readonly kind: 'notFound' }
+  | {
+      readonly code:
+        | 'gateway_binding_not_found'
+        | 'gateway_payer_contact_source_missing'
+        | 'gateway_source_authority_missing';
+      readonly kind: 'notFound';
+    }
   | { readonly code: 'payment_unavailable'; readonly kind: 'unavailable' };
 
 const problemStatus = {
@@ -50,6 +56,7 @@ const gatewayEnablementRejectedProblemByCode = {
   gateway_binding_not_current: { code: 'gateway_binding_not_current', kind: 'ineligible' },
   gateway_binding_not_found: { code: 'gateway_binding_not_found', kind: 'notFound' },
   gateway_enablement_revision_conflict: { code: 'gateway_enablement_revision_conflict', kind: 'conflict' },
+  gateway_payer_contact_source_missing: { code: 'gateway_payer_contact_source_missing', kind: 'notFound' },
   gateway_source_authority_missing: { code: 'gateway_source_authority_missing', kind: 'notFound' },
 } as const satisfies Record<
   Extract<DomainError, { readonly _tag: 'GatewayEnablementRejected' }>['code'],
@@ -76,12 +83,10 @@ export const configureGatewayEnablementActionProblem = {
     }),
   forbidden: (
     code: ProblemOf<'ConfigureGatewayEnablementActionForbiddenProblem'>['code'],
-    reasons: readonly string[] = [],
   ): ProblemOf<'ConfigureGatewayEnablementActionForbiddenProblem'> =>
     ConfigureGatewayEnablementActionForbiddenProblemSchema.make({
       code,
       detail: 'The principal is not permitted to perform this Action.',
-      reasons,
       status: problemStatus.forbidden,
       title: 'Action forbidden',
       type: 'https://ontos.dev/problems/action-forbidden',
@@ -198,8 +203,7 @@ const mapCoreProblem = (error: ActionCoreError): ConfigureGatewayEnablementActio
       ActionInvocationStateError: (failure) => configureGatewayEnablementActionProblem.conflict(failure.code),
       ActionPayloadValidationError: configureGatewayEnablementActionProblem.invalid,
       ActionPermissionCheckError: (failure) => configureGatewayEnablementActionProblem.unavailable(failure.code),
-      ActionPermissionDenied: (failure) =>
-        configureGatewayEnablementActionProblem.forbidden(failure.code, failure.reasons ?? []),
+      ActionPermissionDenied: (failure) => configureGatewayEnablementActionProblem.forbidden(failure.code),
       ActionPolicyDenied: (failure) => configureGatewayEnablementActionProblem.ineligible(failure.code),
       ActionPolicyEvaluationError: (failure) => configureGatewayEnablementActionProblem.unavailable(failure.code),
       ActionRequestHashConflict: (failure) => configureGatewayEnablementActionProblem.conflict(failure.code),

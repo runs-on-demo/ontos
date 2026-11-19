@@ -30,9 +30,7 @@ import type {
 
 /**
  * Provider-neutral adapter contract implemented once per gateway family (#1154). Preparation is
- * pure over its request and happens before the dispatch ledger commits; a GoPay refund prepare also
- * makes one read-only refund-history read (the pre-dispatch baseline, committed with the prepared
- * request). A failed read is Unavailable and nothing is sent. `send` makes exactly one provider attempt.
+ * pure and happens before the dispatch ledger commits; `send` makes exactly one provider attempt.
  *
  * Findings vs failures: a finding states what the provider proved about an operation. A capability
  * the family lacks is always `GatewayProviderUnsupported` and an unreachable provider, credential or

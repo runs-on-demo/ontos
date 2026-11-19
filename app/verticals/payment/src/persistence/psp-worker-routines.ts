@@ -4,7 +4,6 @@ import type { OutboxWorkerHandlerContext } from '@app/core-runtime/outbox/worker
 import { DateTime, Effect, Option, Schema } from 'effect';
 
 import { PaymentExecutionBindingSchema } from '../../shared/domain/payment-execution-binding.ts';
-import { PaymentPayerContactSchema } from '../../shared/domain/payment-payer-contact.ts';
 import {
   PaymentActionInvocationIdSchema,
   PaymentCustomerConfigurationIdSchema,
@@ -63,9 +62,9 @@ import type {
 /*
  * Frozen worker-side database surface of the C17 gateway adapter (#1155-#1158, plan §3.4). Workers get no
  * database executor; every read and write of the dispatch ledger, the evidence store and notification
- * processing goes through one of these SECURITY DEFINER routines (migrations `c17-psp-guards` and
- * `c17-phase2-routines`). Each routine returns one `result` jsonb document per row; its exact encoded shape
- * is the routine's result Schema and the wrapper decodes it into the typed record.
+ * processing goes through one of these SECURITY DEFINER routines (migration `c17-psp-guards`). Each routine
+ * returns one `result` jsonb document per row; its exact encoded shape is the routine's result Schema and
+ * the wrapper decodes it into the typed record.
  */
 
 const OWNER_MODULE_KEY = 'payment.core';
@@ -110,9 +109,6 @@ const PSP_ROUTINE_CONFLICT_REASONS = [
   'material_mismatch',
   'request_mismatch',
   'request_body_invalid',
-  /** A GoPay REFUND prepared without its pre-dispatch refund baseline, or any other dispatch with one. */
-  'refund_baseline_mismatch',
-  'refund_baseline_invalid',
   'credential_not_active',
   'target_not_acknowledged',
   'provider_target_not_applicable',
@@ -141,11 +137,6 @@ const PspOperationForExecutionSchema = Schema.Struct({
   materialHash: PaymentMaterialHashSchema,
   operationId: PaymentOperationIdSchema,
   outcome: PaymentOperationOutcomeSchema,
-  /**
-   * The caller-supplied payer contact of a COLLECT (plan D-P3). None when none was supplied, or once the
-   * dispatch was prepared or recorded as never sent (the routine that writes that state deletes it).
-   */
-  payerContact: Schema.OptionFromOptionalKey(PaymentPayerContactSchema),
   paymentId: PaymentIdSchema,
   /** The original governed write that admitted the operation; never rewritten by a later execution. */
   provenance: PaymentExecutionProvenanceSchema,
@@ -190,8 +181,6 @@ const PspDispatchRecordSchema = Schema.Struct({
   providerAccountRef: GatewayProviderAccountRefSchema,
   providerFamily: PaymentGatewayProviderFamilySchema,
   providerPaymentRef: Schema.optionalKey(PspProviderObjectRefTextSchema),
-  /** GoPay REFUND only: the refund-history row ids read before the send. */
-  providerRefundBaseline: Schema.optionalKey(Schema.Array(boundedText)),
   providerRefundRef: Schema.optionalKey(PspProviderObjectRefTextSchema),
   recordedAt: Schema.DateTimeUtcFromString,
   replayExpiresAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
@@ -293,8 +282,6 @@ const PspPrepareDispatchResultSchema = Schema.Union([
   Schema.TaggedStruct('WITHHELD', { record: PspDispatchRecordSchema }),
   /** A GoPay/Comgate REFUND while another refund of the same provider payment is unresolved; nothing written. */
   Schema.TaggedStruct('DEFERRED', { unresolvedRefundOperationIds: Schema.Array(PaymentOperationIdSchema) }),
-  /** A GoPay REFUND whose baseline was read before another refund of the payment was prepared; nothing written. */
-  Schema.TaggedStruct('REFUND_BASELINE_STALE', {}),
   conflict(PspDispatchRecordSchema),
 ]);
 
@@ -315,8 +302,6 @@ const PspCorrelateResultSchema = Schema.Union([
 
 const PspUnresolvedRefundsSchema = Schema.Struct({
   operationIds: Schema.Array(PaymentOperationIdSchema),
-  /** Refund dispatches of the provider payment in any state, read in the same snapshot as `operationIds`. */
-  refundDispatchCount: nonNegativeIntSchema,
   unresolved: Schema.Boolean,
 });
 
@@ -439,8 +424,6 @@ const prepareDispatchRoutine = defineScopedRoutine({
     { nullable: true, source: 'input', type: 'jsonb' },
     { nullable: true, source: 'input', type: 'integer' },
     { nullable: true, source: 'input', type: 'text' },
-    { nullable: true, source: 'input', type: 'jsonb' },
-    { nullable: true, source: 'input', type: 'integer' },
     ...origin,
   ] as const,
   resultSchema: resultRow(PspPrepareDispatchResultSchema),
@@ -624,10 +607,7 @@ const transitionNotificationRoutine = defineScopedRoutine({
   schema: ROUTINE_SCHEMA,
 });
 
-/**
- * Every scoped C17 worker routine; `verify-db-schema.mts` proves these and the two cross-Tenant maintenance
- * routines of the reconciliation driver are the only ones executable by the runtime role.
- */
+/** Every C17 worker routine; `verify-db-schema.mts` proves exactly these are executable by the runtime role. */
 export const PSP_WORKER_ROUTINES = [
   readOperationForExecutionRoutine,
   resolveExecutionTargetRoutine,
@@ -775,13 +755,6 @@ export interface PspPrepareDispatchInput extends PspDispatchIdentity {
   readonly origin: PspWorkerOrigin;
   /** The acknowledged provider payment the CANCEL or REFUND acts on; none for a COLLECT. */
   readonly providerPaymentRef: Option.Option<string>;
-  /** GoPay REFUND only: refund-history row ids read before the send (`provider_refund_baseline`). */
-  readonly refundBaseline: Option.Option<readonly string[]>;
-  /**
-   * With `refundBaseline` only: the `refundDispatchCount` of the unresolved-refund check the baseline was read
-   * after. The routine answers REFUND_BASELINE_STALE when another refund dispatch of the payment exists by now.
-   */
-  readonly refundDispatchCount: Option.Option<number>;
   /** Exact request bytes and non-secret headers, persisted only when a replay window exists. */
   readonly replayRequest: Option.Option<{
     readonly body: Uint8Array;
@@ -809,8 +782,6 @@ export const pspPrepareDispatch = (invoker: ScopedRoutineInvoker, input: PspPrep
         Option.getOrNull(input.replayRequest.pipe(Option.map(({ headers }) => headers))),
         Option.getOrNull(input.replayRequest.pipe(Option.map(({ windowMs }) => windowMs))),
         Option.getOrNull(input.providerPaymentRef),
-        Option.getOrNull(input.refundBaseline),
-        Option.getOrNull(input.refundDispatchCount),
         ...originValues(input.origin),
       ]),
     ),

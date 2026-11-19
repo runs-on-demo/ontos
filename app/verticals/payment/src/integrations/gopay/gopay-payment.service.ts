@@ -32,7 +32,6 @@ import type {
   GatewayExpectedEffect,
   GatewayLookupRequest,
   GatewayPayerContact,
-  GatewayRefundBaseline,
   GatewayRefundRequest,
   ProviderObjectId,
   ProviderObjectRef,
@@ -51,7 +50,7 @@ import {
   mapGopayLookup,
   mapGopayRefundResponse,
 } from './gopay-evidence.ts';
-import type { GopayLookupResult, GopayRefundBaseline } from './gopay-evidence.ts';
+import type { GopayLookupResult } from './gopay-evidence.ts';
 import { toGopayAmount } from './gopay-money.ts';
 import { verifyGopayNotification } from './gopay-notification.ts';
 import { GopayOAuthToken, gopayApiBaseUrl } from './gopay-oauth-token.ts';
@@ -62,10 +61,9 @@ import {
   GopayRefundResponseFromJsonSchema,
   gopayGoidOf,
   gopayProviderObjectId,
-  gopayRefundHistoryRowObjectId,
   parseGopayId,
 } from './gopay-wire.ts';
-import type { GopayCreatePaymentRequest, GopayGoid, GopayRefundHistory } from './gopay-wire.ts';
+import type { GopayCreatePaymentRequest, GopayGoid } from './gopay-wire.ts';
 
 /**
  * GoPay `GatewayProviderAdapter` (#1154, #1156, #1157, #1158; plan §4 GoPay), built on the single
@@ -75,10 +73,8 @@ import type { GopayCreatePaymentRequest, GopayGoid, GopayRefundHistory } from '.
  *   express `preauthorization` or `recurrence`; `order_number` is the operation's order reference and
  *   the return URL carries the return token as `?r=`. One mutate; a lost or unparseable response is
  *   OUTCOME_UNKNOWN and is never resent (GoPay has no idempotency key).
- * - Refund: prepare reads the payment's refund history first (the pre-dispatch baseline, persisted with the
- *   prepared request; unreadable is UNAVAILABLE and nothing is sent), then `POST /payments/payment/{id}/refund`
- *   (form `amount=<minor>`). FAILED is NOT_EFFECTED; ACCEPTED/FINISHED is REFUND_PENDING, followed by one
- *   refund-history read that confirms it only through exactly one row new since the baseline.
+ * - Refund: `POST /payments/payment/{id}/refund` (form `amount=<minor>`). FAILED is NOT_EFFECTED;
+ *   ACCEPTED/FINISHED is REFUND_PENDING, followed by one refund-history read that may confirm it.
  * - Cancel: UNSUPPORTED (`provider_cancel_unsupported`); replay: UNSUPPORTED (no idempotent resend).
  * - Lookup: by GoPay payment id only; an order-reference lookup is UNSUPPORTED (not documented).
  * - Order reference of a notified payment: the same payment read, `order_number` only for the binding GoID.
@@ -186,7 +182,6 @@ const preparedRequest = (input: {
   readonly contentType: string;
   readonly endpointRef: string;
   readonly orderReference: PreparedProviderRequest['orderReference'];
-  readonly refundBaseline: Option.Option<GatewayRefundBaseline>;
 }): PreparedProviderRequest => {
   const headers = headersOf(input.contentType);
   return {
@@ -196,8 +191,6 @@ const preparedRequest = (input: {
     headers,
     idempotencyKey: Option.none(),
     orderReference: input.orderReference,
-    // Not covered by the request hash: it is never sent, and a concurrent identical prepare stays EXISTING.
-    refundBaseline: input.refundBaseline,
     replayWindowMs: Option.none(),
     requestHash: requestHashOf(input.endpointRef, headers, input.body),
   };
@@ -314,17 +307,25 @@ const prepareCollect = Effect.fn('GopayPayment.prepareCollect')(function* prepar
     contentType: JSON_CONTENT_TYPE,
     endpointRef: GOPAY_COLLECT_ENDPOINT_REF,
     orderReference: request.correlation.orderReference,
-    refundBaseline: Option.none(),
   });
 });
 
-/** The row ids of a refund history in the persisted baseline form. */
-const baselineOf = (history: GopayRefundHistory): GatewayRefundBaseline => ({
-  rowIds: history.map((row) => gopayRefundHistoryRowObjectId(row.id)),
+const prepareRefund = Effect.fn('GopayPayment.prepareRefund')(function* prepareRefundEffect(
+  target: GatewayExecutionTarget,
+  request: GatewayRefundRequest,
+) {
+  yield* gopayTargetContext(target);
+  yield* checkCorrelation(request.operationId, request.correlation);
+  const paymentRef = yield* Effect.fromOption(gopayPaymentRefOf(request.providerTarget), () =>
+    unavailable('refund_target_invalid'),
+  );
+  return preparedRequest({
+    body: utf8ToBytes(`amount=${toGopayAmount(request.amount).amount}`),
+    contentType: FORM_CONTENT_TYPE,
+    endpointRef: `${GOPAY_COLLECT_ENDPOINT_REF}/${paymentRef}/refund`,
+    orderReference: request.correlation.orderReference,
+  });
 });
-
-const rowIdsOf = (baseline: Option.Option<GatewayRefundBaseline>): Option.Option<GopayRefundBaseline> =>
-  baseline.pipe(Option.map(({ rowIds }) => rowIds));
 
 /** The confirming REFUND finding of a refund-history lookup, if any. */
 const confirmedRefundFinding = (
@@ -365,43 +366,6 @@ const makeGopayPaymentService = Effect.gen(function* buildGopayPaymentService() 
       ),
     });
     return isAuthorizationRefusal(response.status) ? yield* refuseAuthorization(target) : response;
-  });
-
-  /**
-   * The refund history every refund dispatch of the payment is attributed against, read before the refund is
-   * prepared (#1158 durable handoff: it is persisted with the prepared request, before the send). Only a decoded
-   * 200 is a baseline; anything else is UNAVAILABLE, so a refund whose effect could never be proven is never sent.
-   */
-  const readRefundBaseline = Effect.fn('GopayPayment.readRefundBaseline')(function* readRefundBaselineEffect(
-    target: GatewayExecutionTarget,
-    context: GopayTargetContext,
-    paymentRef: ProviderObjectId,
-  ) {
-    const response = yield* authorizedRead(target, `${context.baseUrl}${GOPAY_PAYMENT_PATH}/${paymentRef}/refunds`);
-    const history = yield* Effect.fromOption(
-      response.status === 200 ? decodeRefundHistory(response.bodyText) : Option.none(),
-      () => unavailable('gopay_refund_baseline_unavailable'),
-    );
-    return baselineOf(history);
-  });
-
-  const prepareRefund = Effect.fn('GopayPayment.prepareRefund')(function* prepareRefundEffect(
-    target: GatewayExecutionTarget,
-    request: GatewayRefundRequest,
-  ) {
-    const context = yield* gopayTargetContext(target);
-    yield* checkCorrelation(request.operationId, request.correlation);
-    const paymentRef = yield* Effect.fromOption(gopayPaymentRefOf(request.providerTarget), () =>
-      unavailable('refund_target_invalid'),
-    );
-    const refundBaseline = yield* readRefundBaseline(target, context, paymentRef);
-    return preparedRequest({
-      body: utf8ToBytes(`amount=${toGopayAmount(request.amount).amount}`),
-      contentType: FORM_CONTENT_TYPE,
-      endpointRef: `${GOPAY_COLLECT_ENDPOINT_REF}/${paymentRef}/refund`,
-      orderReference: request.correlation.orderReference,
-      refundBaseline: Option.some(refundBaseline),
-    });
   });
 
   /**
@@ -479,17 +443,14 @@ const makeGopayPaymentService = Effect.gen(function* buildGopayPaymentService() 
     return mapGopayCreateResponse({ expected, observedAt, payment, target });
   });
 
-  /**
-   * One refund-history read after GoPay acknowledged the refund, against the baseline persisted before the send;
-   * a confirmation replaces REFUND_PENDING, anything else keeps it.
-   */
+  /** One refund-history read after an accepted refund; a confirmation replaces REFUND_PENDING, anything else keeps it. */
   const confirmRefund = Effect.fn('GopayPayment.confirmRefund')(
     function* confirmRefundEffect(
       target: GatewayExecutionTarget,
       context: GopayTargetContext,
       paymentRef: ProviderObjectId,
       expected: GatewayExpectedEffect & ExpectedOperation,
-      refundBaseline: Option.Option<GatewayRefundBaseline>,
+      sentAt: DateTime.Utc,
     ) {
       const result = yield* readLookupResult(target, context, paymentRef, true);
       const observedAt = yield* DateTime.now;
@@ -497,10 +458,8 @@ const makeGopayPaymentService = Effect.gen(function* buildGopayPaymentService() 
         observedAt,
         origin: RESPONSE_ORIGIN,
         paymentRef,
-        refundBaseline: rowIdsOf(refundBaseline),
         request: {
-          acknowledgedRefundBaseline: refundBaseline,
-          dispatchedAt: Option.none(),
+          dispatchedAt: Option.some(sentAt),
           expected,
           target: { _tag: 'PROVIDER_OBJECT', ref: { _tag: 'GOPAY_PAYMENT', id: paymentRef } },
         },
@@ -522,6 +481,7 @@ const makeGopayPaymentService = Effect.gen(function* buildGopayPaymentService() 
     paymentRef: ProviderObjectId,
     expected: GatewayExpectedEffect & ExpectedOperation,
   ) {
+    const sentAt = yield* DateTime.now;
     const url = `${context.baseUrl}${GOPAY_PAYMENT_PATH}/${paymentRef}/refund`;
     const response = yield* mutate(target, url, prepared, expected.operationId);
     if (isClientError(response.status)) {
@@ -542,7 +502,7 @@ const makeGopayPaymentService = Effect.gen(function* buildGopayPaymentService() 
     if (dispatched.finding.finding !== 'ACCEPTED_PENDING') {
       return dispatched;
     }
-    const confirmed = yield* confirmRefund(target, context, paymentRef, expected, prepared.refundBaseline);
+    const confirmed = yield* confirmRefund(target, context, paymentRef, expected, sentAt);
     return Option.match(confirmed, {
       onNone: () => dispatched,
       onSome: (finding): ProviderDispatchResponse => ({ _tag: 'ACKNOWLEDGED', finding, targetFinding: Option.none() }),
@@ -591,15 +551,7 @@ const makeGopayPaymentService = Effect.gen(function* buildGopayPaymentService() 
     );
     const result = yield* readLookupResult(target, context, paymentRef, withRefunds);
     const observedAt = yield* DateTime.now;
-    return mapGopayLookup({
-      observedAt,
-      origin: LOOKUP_ORIGIN,
-      paymentRef,
-      refundBaseline: rowIdsOf(request.acknowledgedRefundBaseline),
-      request,
-      result,
-      target,
-    });
+    return mapGopayLookup({ observedAt, origin: LOOKUP_ORIGIN, paymentRef, request, result, target });
   });
 
   const lookup = (target: GatewayExecutionTarget, request: GatewayLookupRequest) =>
