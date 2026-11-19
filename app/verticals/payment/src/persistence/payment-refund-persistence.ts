@@ -30,7 +30,7 @@ import {
 import type { PaymentReturnEvidence } from '../domain/refund-prior-returns.ts';
 import { paymentFundsSnapshotOf } from './payment-aggregate-persistence.ts';
 import type { PaymentAggregateRecord } from './payment-aggregate-persistence.ts';
-import { disproofCorrectionColumns, fullyDisprovenTargets } from './payment-full-disproof.ts';
+import { fullyDisprovenTargets } from './payment-full-disproof.ts';
 
 /**
  * Owner-local refund reads over the Core-installed `ScopedTransactionExecutor` (#1150/#1152). The
@@ -178,7 +178,6 @@ export const paymentRefundPersistenceForTransaction = (
               environment: row.environment,
               factFamily: decoded.factFamily,
               method: decoded.method,
-              pickupCapabilityRef: row.pickupCapabilityRef ?? undefined,
               refundRoute: row.refundRoute,
               revision: row.revision,
               sourceAuthorityId: row.sourceAuthorityId,
@@ -321,7 +320,17 @@ export const paymentRefundPersistenceForTransaction = (
             .orderBy(asc(observations.observationId))
             .pipe(Effect.mapError(returnEvidenceReadFailure)),
           transaction
-            .select(disproofCorrectionColumns)
+            .select({
+              acceptanceOutcome: observations.acceptanceOutcome,
+              amountMinor: observations.amountMinor,
+              capabilityCorrelated: observations.capabilityCorrelated,
+              correctsObservationId: observations.correctsObservationId,
+              currency: observations.currency,
+              economicEffectKey: observations.economicEffectKey,
+              factKind: observations.factKind,
+              paymentId: observations.paymentId,
+              sourceAuthorityId: observations.sourceAuthorityId,
+            })
             .from(observations)
             .where(
               and(

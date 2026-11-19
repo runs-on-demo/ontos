@@ -19,18 +19,11 @@ import type { PaymentMonetaryAmount } from '../../shared/domain/payment-money.ts
 import type { PaymentMethod } from '../../shared/domain/payment-vocabulary.ts';
 import { DeliveryCapabilityPort } from '../ports/delivery-capability-port.ts';
 import type { PaymentCodCapability } from '../ports/delivery-capability-port.ts';
-import type {
-  PaymentGatewayBindingEvidence,
-  PaymentGatewayBindingVerification,
-} from '../ports/gateway-binding-port.ts';
+import { GatewayBindingPort } from '../ports/gateway-binding-port.ts';
+import type { PaymentGatewayBindingVerification } from '../ports/gateway-binding-port.ts';
 import type { PaymentOwnerScope } from '../ports/owner-evidence-unavailable.ts';
 import { PaymentTermEvidencePort } from '../ports/payment-term-evidence-port.ts';
-import type {
-  PaymentTermOwnerCall,
-  PaymentTermEvidenceService,
-  PaymentTermPurchase,
-  PaymentTermUseEvidence,
-} from '../ports/payment-term-evidence-port.ts';
+import type { PaymentTermPurchase, PaymentTermUseEvidence } from '../ports/payment-term-evidence-port.ts';
 import { PickupCapabilityPort } from '../ports/pickup-capability-port.ts';
 import type { PaymentPickupCollectionCapability } from '../ports/pickup-capability-port.ts';
 import { isPaymentTermSnapshotRetiredAt } from './payment-term-retirement.ts';
@@ -52,9 +45,6 @@ export interface PaymentMethodApplicabilityInput {
   readonly customerConfigurationId: string;
   /** Current enablement rows of this Customer Configuration in the Selling Legal Entity (A1). */
   readonly enablements: readonly PaymentMethodEnablementState[];
-  /** Gateway binding evidence bound to the caller's own Core-scoped transaction. */
-  readonly gateways: PaymentGatewayBindingEvidence;
-  readonly ownerCall?: PaymentTermOwnerCall;
   /** The resolved term; it is returned unchanged on AVAILABLE and never replaced by method choice. */
   readonly paymentTermRef: PaymentTermRef;
   /** The exact purchase whose Current entitlement/policy the term owner decides (never the merchant configuration). */
@@ -67,6 +57,7 @@ export interface PaymentMethodApplicabilityInput {
 
 export type PaymentMethodApplicabilityRequirements =
   | DeliveryCapabilityPort
+  | GatewayBindingPort
   | PaymentTermEvidencePort
   | PickupCapabilityPort;
 
@@ -234,15 +225,14 @@ const checkTerm = Effect.fn('PaymentApplicability.checkTerm')(function* checkTer
   method: PaymentMethod,
 ) {
   const terms = yield* PaymentTermEvidencePort;
-  const request: Parameters<PaymentTermEvidenceService['verifyTermUse']>[0] = {
-    customerConfigurationId: input.customerConfigurationId,
-    method,
-    paymentTermRef: input.paymentTermRef,
-    purchase: input.purchase,
-    scope: input.scope,
-  };
   return yield* terms
-    .verifyTermUse(input.ownerCall === undefined ? request : { ...request, ownerCall: input.ownerCall })
+    .verifyTermUse({
+      customerConfigurationId: input.customerConfigurationId,
+      method,
+      paymentTermRef: input.paymentTermRef,
+      purchase: input.purchase,
+      scope: input.scope,
+    })
     .pipe(
       Effect.flatMap((evidence) =>
         DateTime.now.pipe(Effect.map((at) => interpretTermEvidence(method, input.paymentTermRef, evidence, at))),
@@ -307,7 +297,8 @@ const verifyGateway = Effect.fn('PaymentApplicability.verifyGateway')(function* 
   input: PaymentMethodApplicabilityInput,
   selectedBinding: PaymentGatewayAccountBinding,
 ) {
-  return yield* input.gateways
+  const gateways = yield* GatewayBindingPort;
+  return yield* gateways
     .verifySelectedBinding({
       binding: selectedBinding,
       customerConfigurationId: input.customerConfigurationId,

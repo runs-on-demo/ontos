@@ -5,7 +5,6 @@ import {
   PaymentEvidenceRefSchema,
   PaymentPickupCapabilityRefSchema,
   PaymentProviderAccountRefSchema,
-  PaymentSourceAuthorityIdSchema,
   PaymentSourceEnvironmentSchema,
   PaymentSourceSystemSchema,
 } from './payment-identifiers.ts';
@@ -23,29 +22,8 @@ export const PaymentGatewayAccountBindingSchema = Schema.TaggedStruct('GATEWAY_A
 });
 export type PaymentGatewayAccountBinding = typeof PaymentGatewayAccountBindingSchema.Type;
 
-const bankReceiptAuthoritySchema = Schema.Struct({
-  accountRef: PaymentProviderAccountRefSchema,
-  environment: PaymentSourceEnvironmentSchema,
-  sourceAuthorityId: PaymentSourceAuthorityIdSchema,
-  sourceSystem: PaymentSourceSystemSchema,
-});
-export type PaymentBankReceiptAuthority = typeof bankReceiptAuthoritySchema.Type;
-
-/** The first COLLECT pins its receipt authority. Older operations remain readable without that evidence. */
-export const PaymentBankAccountingReceiptBindingSchema = Schema.TaggedStruct('BANK_ACCOUNTING_RECEIPT', {
-  receiptAuthority: Schema.optionalKey(bankReceiptAuthoritySchema),
-});
-export type PaymentBankAccountingReceiptBinding = typeof PaymentBankAccountingReceiptBindingSchema.Type;
-export const isBankAccountingReceiptBinding = Schema.is(PaymentBankAccountingReceiptBindingSchema);
-
-export const sameBankReceiptAuthority = (
-  original: PaymentBankReceiptAuthority,
-  candidate: PaymentBankReceiptAuthority,
-): boolean =>
-  original.sourceAuthorityId === candidate.sourceAuthorityId &&
-  original.sourceSystem === candidate.sourceSystem &&
-  original.accountRef === candidate.accountRef &&
-  original.environment === candidate.environment;
+/** Bank transfer in advance and deferred invoice: receipt is evidenced by configured bank/accounting authority. */
+export const PaymentBankAccountingReceiptBindingSchema = Schema.TaggedStruct('BANK_ACCOUNTING_RECEIPT', {});
 
 /**
  * The carrier/shipping-service source binding the Delivery owner confirmed for the selected offer. Only
@@ -70,7 +48,6 @@ export const PaymentPickupCapabilityBindingSchema = Schema.TaggedStruct('PICKUP_
   capabilityEvidenceRef: PaymentEvidenceRefSchema,
   pickupCapabilityRef: PaymentPickupCapabilityRefSchema,
 });
-export const isPickupCapabilityBinding = Schema.is(PaymentPickupCapabilityBindingSchema);
 
 export const PaymentExecutionBindingSchema = Schema.Union([
   PaymentGatewayAccountBindingSchema,

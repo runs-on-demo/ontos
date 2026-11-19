@@ -22,6 +22,9 @@ Core DB authority coordinates publication and transaction admission with revisio
 
 - **Node:** `active-application-composition-source.node.ts` lazily reads `ONTOS_ACTIVE_APPLICATION_COMPOSITION_URL`, with optional `ONTOS_ACTIVE_APPLICATION_COMPOSITION_READ_TOKEN`. It enforces the source URL contract, bounded body/read time and a short successful-read cache capped by the snapshot's original authority deadline. Failures are not cached. Reading the same old content never extends its lease. The source constants own the timeout/cache limits.
 - **Workers:** `active-application-composition-source.workerd.ts` reads native binding `ONTOS_ACTIVE_APPLICATION_COMPOSITION`, key `active`, as defined in `active-application-composition-edge.ts`. Missing binding/key, invalid content or bounded-read failure fail closed. KV propagation is distinct from publication readback; this playbook promises no immediate global cutover SLA.
+- **Renewal:** the scheduled `active-application-composition-refresh.yml` workflow shares the environment's deployment lock and runs `active-composition:publish refresh --environment <environment>`. It re-observes the approved exact artifacts and rejects any different revision; changed artifacts require an explicit promotion. `scripts/active-application-composition.mts#ACTIVE_APPLICATION_COMPOSITION_POLICY` owns the validity window. Renewal does not select another graph or restart consumers to replace process-start JSON.
+
+Stage refresh reads `DEPLOY_TARGET` from the `stage` environment, defaulting to Zerops like deployment. It uses `stage` credentials for Zerops and `stage-edge` credentials for Cloudflare. It keeps the workflow revision already checked out by its initial checkout. The approved snapshot supplies the complete module membership, backend transports and exact artifact pins; stage does not select another source revision from deployment history. This also covers Node-only stage and target switches where a newer worker deployment did not publish a new Composition. The deployment lock, VPN and worker-mode drift checks still apply. Production retains its existing deployed-source checkout.
 
 The current policy refreshes every six hours and gives each successful observation a 24-hour validity window. A business endpoint returning HTTP 500 does not by itself prevent identity observation. Missing or changed artifact bytes, failed backend-identity observation, or a stalled identity response can prevent renewal of the complete snapshot. Without another successful authorized observation, admission expires at the original `validUntil`, including otherwise healthy operations; cached bytes and an old hash do not extend that deadline. This shared observation failure domain remains part of the bounded MIN behavior, rather than a new availability guarantee.
 
@@ -120,34 +123,31 @@ These are non-negotiable:
 ### Change-aware CI
 
 `ultramodern-workspace-gates.yml` always reports the required `Workspace gates` check for
-pull requests and merge groups. `scripts/plan-ci-changes.sh` compares the exact base and the
-checked-out head with a NUL-delimited Git diff, including both sides of renames. A pull request's
-base is the first parent of the merge commit GitHub tests, so changes that reached `main` after the
-fork point never count as its own. A merge group's base is the queue base, which the planner reaches
-through the whole history it fetches without file contents. A diff confined to root `docs/`,
-`CONTEXT-MAP.md`, `README.md` and `AGENTS.md` needs no application installation, builds or
-services. Application documentation and unknown paths do not get this exemption. Missing history,
-an empty diff, nightly runs and an explicit full request require the full suite.
-
-The lint gate checks the changed files with the pre-commit hook's formatter and type-aware linter.
-A changed formatter, linter, hook, patch, TypeScript base, lockfile, workspace or toolchain file,
-the nightly run and any run without the exact changed-path list lint every tracked file instead.
+pull requests and merge groups. `scripts/plan-ci-changes.sh` compares the exact event base
+and checked-out head with a NUL-delimited Git diff, including both sides of renames. A diff
+confined to root `docs/`, `CONTEXT-MAP.md`, `README.md` and `AGENTS.md` needs no application
+installation, builds or services. Application documentation and unknown paths do not get
+this exemption. Missing history, an empty diff, nightly runs and an explicit full request
+require the full suite.
 
 For application changes, `scripts/plan-ci-checks.mts` computes owner and transitive consumer
 impact from workspace manifests, public-contract producer metadata, topology ownership
 and runtime federation references, including the Shell's vertical consumers.
 CI and deployment share the fixed-point consumer traversal. The checked-in
-`scripts/ci-matrices.json` owns the complete source, unit and integration matrices. Every
-integration row lists the tasks it runs: package shards, root shards and whole-owner proofs. An
-affected plan keeps a package task when its package is affected, root tasks when the root package
-is, and the preproposal proofs when one of their declared proof packages is; a row with no task
-left is dropped. A task in an unknown form requires the full suite.
+`scripts/ci-matrices.json` owns the complete source, unit and integration matrices.
+Integration rows also declare runtime packages used by extra native proofs. A change to
+any declared proof package retains that row even when its ordinary test filters select
+no packages. Unknown proof packages require the full suite.
 
-An affected plan omits unrelated package tests; source checks, lint, static contracts and the
-complete Node artifact build remain required. Core, authorization, schema, public-API, package-metadata,
-workflow and unknown changes still require the complete suite. Source checks do not wait for Node
-artifact builds, and integration rows that need no built artifact start with the builds; the other
-unit and integration rows retain their same-run artifact dependency.
+Affected selection starts in **shadow mode**. Every application gate still runs, and the
+job summary records the candidate affected packages and integration shards. Set the
+`CI_AFFECTED_ENABLED` repository variable to `true` only after reviewing these plans against
+representative full runs. With that opt-in, unrelated package tests may be omitted; source
+checks, lint, static contracts and the complete Node artifact proof remain required.
+The retired Cloudflare build and proof jobs stay disabled and are not required gates. Core,
+authorization, schema, public-API, package-metadata, workflow and unknown changes still
+require the complete suite. Source checks do not wait for Node artifact builds; unit and
+integration fixtures retain their same-run artifact dependency.
 
 The final verifier requires a successful plan and exact agreement between every job result
 and its planned `success` or `skipped` state. An affected plan is not a deployment plan and
@@ -180,6 +180,8 @@ A new MicroVertical is not deployable until its delivery contract accounts for a
 Codesmith or another approved generator must update these surfaces atomically. Until the generator exists, do not add another copied Contacts block to the workflow, `zerops.yaml`, migration runner, or validator. Extend and test the generator first.
 
 Change planning must fail closed when a changed path under `apps/*`, `packages/*`, or `verticals/*` cannot be mapped to known delivery units. An unknown new vertical must never produce a no-op deploy.
+
+The stage plan diffs from the commit of the last successful `stage` deployment, not from the previous push, so a failed or cancelled deploy stays in the next plan. Planning stops when no successful deployment exists or its commit is not an ancestor of `main`; seed it once with `gh workflow run ultramodern-workspace-gates.yml --ref main -f full=true`.
 
 ### Change-impact rules
 
@@ -266,6 +268,7 @@ Stage provisioning, run by a human, never an agent:
 
 1. From a host on the Zerops VPN, with `DATABASE_ADMIN_URL` set, run `node scripts/ops/cloudflare-stage-cutover.mts database-identities`. It creates the missing sensitive `migrator` service secrets `PARTY_REGISTRY_DB_PASSWORD`, `PARTY_REGISTRY_WORKER_DB_PASSWORD` and `SHELL_GATEWAY_ISSUER_DB_PASSWORD` (never printed), then creates the three login roles with `LOGIN` and `CONNECT` only. Roles must exist first because Hyperdrive tests the connection when a config is created.
 2. Run `provision`. It creates Hyperdrive `ontos-stage-party-registry` (user `party_registry_runtime`, caching off, origin limit 10) and `ontos-stage-gateway-issuer` (user `shell_gateway_issuer`, caching off, limit 5), and writes `ULTRAMODERN_CLOUDFLARE_PARTY_REGISTRY_HYPERDRIVE_ID` and `ULTRAMODERN_CLOUDFLARE_GATEWAY_ISSUER_HYPERDRIVE_ID` into `topology/cloudflare-placement.json` `buildEnvironment` for a reviewed PR. `verify` checks user, caching and limit drift.
+3. Merge. `edge-deploy-readiness` requires both IDs, so no deploy starts before provisioning is complete.
 
 The passwords are `migrator` service secrets, referenced as `${migrator_<KEY>}`, never project variables: every service inherits project variables, which would hand every credential to every process. `scripts/tests/zerops-deployment-contract.test.mts` enforces this. Each process holds only its own URLs:
 
@@ -300,60 +303,24 @@ Every module deployment that calls another module presents its own module creden
 3. Run `core.identity.bind-managed-api-key` with that principal ID and provider key ID. It binds the key to the principal in the same tenant.
 4. Record the key as the module's `ONTOS_GATEWAY_MODULE_API_KEY_<UNIT>` secret, and add one binding for it to `ONTOS_GATEWAY_MODULE_BINDINGS`.
 
-Stage bootstrap does not issue these keys. `stage-accounts-file.ts` declares only the external workloads (`commerce.storefront-client`, `core.identity-provider`, `payment.source-ingress`, `payment.provider-notification-ingress`, `payment.provider-reconciliation`), and a test checks that list against the carriers' `accessWorkload` declarations.
+Stage bootstrap does not issue these keys. `stage-accounts-file.ts` declares only the external workloads (`commerce.storefront-client`, `core.identity-provider`, `payment.source-ingress`), and a test checks that list against the carriers' `accessWorkload` declarations.
 
 Local development sets `ONTOS_GATEWAY_MODULE_BINDINGS=[]` (`pnpm env:local:ensure`), so local module-to-module calls stay unprovisioned and fail closed.
 
-| Module (deployment)         | Module credential (sensitive, `migrator` secret)         | Other values                                                                                                                                              |
-| --------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `catalog`                   | `ONTOS_GATEWAY_MODULE_API_KEY_CATALOG`                   |                                                                                                                                                           |
-| `commerce-cart`             | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_CART`             |                                                                                                                                                           |
-| `commerce-customer-context` | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_CUSTOMER_CONTEXT` |                                                                                                                                                           |
-| `commerce-market-catalog`   | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_MARKET_CATALOG`   |                                                                                                                                                           |
-| `commerce-order`            | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_ORDER`            |                                                                                                                                                           |
-| `party-registry`            | `ONTOS_GATEWAY_MODULE_API_KEY_PARTY_REGISTRY`            |                                                                                                                                                           |
-| `payment`                   | `ONTOS_GATEWAY_MODULE_API_KEY_PAYMENT`                   | `ONTOS_PAYMENT_PROVIDER_CREDENTIALS`, `ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS` (secrets, see below); `ONTOS_PAYMENT_NOTIFICATION_BASE_URL`              |
-| `pricing`                   | `ONTOS_GATEWAY_MODULE_API_KEY_PRICING`                   | `ONTOS_PRICING_CONFIRMATION_SIGNING_SECRET` (secret); `ONTOS_PRICING_CONFIRMATION_KEY_{REF,VERSION,LINEAGE_REF}`                                          |
-| `shell-super-app`           |                                                          | `ONTOS_GATEWAY_MODULE_BINDINGS` (JSON array, one binding per module credential above); `ONTOS_PAYMENT_NOTIFICATION_RELAY_CREDENTIALS` (secret, see below) |
+| Module (deployment)         | Module credential (sensitive, `migrator` secret)         | Other values                                                                                                     |
+| --------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `catalog`                   | `ONTOS_GATEWAY_MODULE_API_KEY_CATALOG`                   |                                                                                                                  |
+| `commerce-cart`             | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_CART`             |                                                                                                                  |
+| `commerce-customer-context` | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_CUSTOMER_CONTEXT` |                                                                                                                  |
+| `commerce-market-catalog`   | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_MARKET_CATALOG`   |                                                                                                                  |
+| `commerce-order`            | `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_ORDER`            |                                                                                                                  |
+| `party-registry`            | `ONTOS_GATEWAY_MODULE_API_KEY_PARTY_REGISTRY`            |                                                                                                                  |
+| `pricing`                   | `ONTOS_GATEWAY_MODULE_API_KEY_PRICING`                   | `ONTOS_PRICING_CONFIRMATION_SIGNING_SECRET` (secret); `ONTOS_PRICING_CONFIRMATION_KEY_{REF,VERSION,LINEAGE_REF}` |
+| `shell-super-app`           |                                                          | `ONTOS_GATEWAY_MODULE_BINDINGS` (JSON array, one binding per module credential above)                            |
 
 `party-registry` is the one worker-only unit: only its Outbox Worker makes delegated module calls, so its request service receives no module credential and none of the internal API bases its worker calls (`ONTOS_PARTY_REGISTRY_API_BASE_URL`, `ONTOS_PRIVACY_API_BASE_URL`, `ONTOS_SHELL_GATEWAY_BASE_URL`). `party-registry-worker` alone holds `ONTOS_GATEWAY_MODULE_API_KEY_PARTY_REGISTRY`.
 
 Each binding is `{compositionRevision, providerKeyId, sourceAppId, sourceBuildMarker}`: the module key's Better Auth ID, the module's topology app ID, and the composition revision and build that module runs. The Shell refuses module and API-key issuance (as unavailable) while the value is absent or malformed, so a deployment with no module enrolled sets `[]`.
-
-`ONTOS_PAYMENT_PROVIDER_CREDENTIALS` is a secret JSON object keyed by the credential secret ref of a provider account binding. Each entry is `{ "family": "GOPAY", "clientId", "clientSecret" }`, `{ "family": "STRIPE", "secretKey", "webhookSigningSecret" }` or `{ "family": "COMGATE", "secret" }`; an entry with any other field is refused. The value is optional: while it is absent every payment gateway operation is unavailable and the other Payment features keep working. Payment reads it on each cache miss, so a rotation is picked up within 60 seconds.
-
-**Payment gateway relay.** Providers deliver notifications to the Shell's typed relay at `/api/payment/v1/notifications/{gopay,stripe,comgate}/<tenantId>/<routeKey>`, and the Payment reconciliation driver requests recoveries at `/api/payment/v1/reconciliation/<routeKey>/recoveries`. Three values serve them:
-
-- `ONTOS_PAYMENT_NOTIFICATION_BASE_URL` (Payment, not secret) is the public Shell origin. Payment composes each binding's notification URL from it, the provider family, the tenant and the binding's generated route key. It must be an exact `https` origin (scheme, host, optional port; one trailing slash is tolerated). While it is missing or invalid, configuring a provider binding fails with 503 `payment_notification_route_unavailable` and the rest of Payment keeps working.
-- `ONTOS_PAYMENT_NOTIFICATION_RELAY_CREDENTIALS` (Shell, secret) and `ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS` (Payment, secret; read by the Payment Outbox Worker) are each a JSON array `[{ "tenantId": "<tenant uuid>", "apiKey": "<managed API key>" }]`, one entry per tenant. The reader decodes each entry on its own and only when it needs that tenant, so a malformed entry fails only its tenant and an absent value makes the relay or the driver unavailable while the rest keeps working. A tenant needs exactly one valid entry; two entries for the same tenant mean no key. A provider notification for a tenant with no relay entry gets the same 404 as an unknown route.
-
-The driver calls the Shell at the origin of `ONTOS_SHELL_GATEWAY_BASE_URL` (on Zerops `http://shellsuperapp:3020`) and drops the `/shell-super-app-api` path. The Shell mounts `/api/payment/v1` as its own always-on prefix, next to `/shell-super-app-api`, so relay paths are served at the Shell origin. The `payment-worker` and `outbox-worker-host` services need `ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS` and `ONTOS_SHELL_GATEWAY_BASE_URL` for the driver to run. Without a valid tenant entry, that tenant is skipped and logged at most once per hour.
-
-Before a tenant uses a payment gateway, a human operator, never an agent, provisions two integration principals in that tenant and records their keys:
-
-1. Run `core.identity.create-non-human-principal` with `kind: integration` and the display name `Payment notification relay`. Bind its workloads `payment.provider-notification-ingress` and `payment.source-ingress` (on stage through the accounts file `workloads`).
-2. Run `core.identity.create-non-human-principal` with `kind: integration` and the display name `Payment reconciliation driver`. Bind its workloads `payment.provider-reconciliation` and `payment.source-ingress`.
-3. For each principal, issue a managed API key through Shell's API key service and run `core.identity.bind-managed-api-key` with the principal ID and provider key ID, as for module credentials above.
-4. Add the relay key to `ONTOS_PAYMENT_NOTIFICATION_RELAY_CREDENTIALS` and the driver key to `ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS`, each under the tenant's ID.
-
-Rotating a relay or driver key changes only that secret; notification URLs stay the same. Revoking a key or a workload binding makes that tenant's relay or driver fail closed, and the providers retry within their own limits.
-
-**Payment evidence workers.** Payment's notification and recovery Outbox Workers submit provider evidence through Payment's own public `accept-payment-observation` Action with a registered-workload assertion. Besides the usual four keys, the Payment binding in `ONTOS_GATEWAY_MODULE_BINDINGS` therefore carries one `registeredWorkloads` rule per worker; without them the Shell refuses the assertion and the evidence stays pending as reconciliation debt:
-
-```json
-{
-  "audience": "payment",
-  "declarationKey": "payment.core.observation.accept",
-  "entrypointKey": "payment.core.accept-payment-observation",
-  "jobKey": "payment.core.process-provider-notification",
-  "legalEntityScope": "required",
-  "schemaVersion": "1",
-  "workerKey": "payment.core.process-provider-notification",
-  "workloadKey": "payment.source-ingress"
-}
-```
-
-The second rule is the same with `jobKey` and `workerKey` set to `payment.core.recover-gateway-operation`. The Shell admits a request only for a live claim of that worker's delivery whose original invocation came from an active integration principal through one of Payment's `originatorActions`, in that invocation's own company. Each tenant needs exactly one active system principal bound to `payment.source-ingress`; it is the A8 executor. The Payment Outbox Worker reads `ONTOS_GATEWAY_MODULE_API_KEY` and `ONTOS_SHELL_GATEWAY_BASE_URL` like the request service. The issuer admits the `payment` audience only while Payment is in the installed composition.
 
 The bindings pin the release. The Shell accepts a module's call only while `compositionRevision` and `sourceBuildMarker` equal the current release, so every composition publish and every module redeploy changes what the bindings must say. Refresh `ONTOS_GATEWAY_MODULE_BINDINGS` in the same deploy that changes a release, before the module calls it. Until the refresh, every module-to-module call fails closed. The Worker secrets step checks the shape only: one binding per module credential, all for one composition revision. It does not compare the revision or build markers with the published release, so the operator must.
 
@@ -492,16 +459,196 @@ Use this sequence for a new or changed MicroVertical:
 
 Do not report release success before all required smoke checks pass.
 
-### Node build shards
+### Deploy target per environment
 
-The gate workflow builds the delivery units in parallel shards and uploads their git-ignored outputs.
-Every shard is a `node-artifact-build` row (its `shard` and `units` in the `build` list of
-`scripts/ci-matrices.json`) that only builds, packs and uploads. The `Deployment Bootstrap and Node
-Federation Proof` job, the owner rows (`owner-integration`, which also need the `Prepare integration
-database` producer) and the unit rows list `node-artifact-build` in `needs`, so GitHub starts them only
-once every shard has uploaded and none of them holds a runner while it waits; they then download them
-all (`scripts/unpack-unit-build-outputs.sh` fails naming any unit no shard built). A new unit joins one
-shard; `Repository Tooling Tests` fails until it does.
+One workflow deploys every GitHub deployment environment. Each environment chooses where its
+delivery units run with its `DEPLOY_TARGET` variable, and how its Outbox Workers run on Zerops with
+its required `OUTBOX_WORKER_MODE` variable (`dedicated` or `host`, see
+[Outbox Workers](./OUTBOX_WORKERS.md)). The two are independent:
+
+| Environment  | `DEPLOY_TARGET`   | What deploys                                                                                                                                                                                                  |
+| ------------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stage`      | unset or `zerops` | Fresh reviewed business members and Shell on Zerops; unchanged slots retain original receipts. Public artifacts use the existing immutable asset gateway. Migration/verifier and worker sets are independent. |
+| `stage`      | `cloudflare`      | Fresh reviewed placed members and Shell artifacts on Cloudflare; unchanged slots retain original receipts. Required infrastructure and Outbox Workers remain on Zerops.                                       |
+| `production` | unset or `zerops` | The reviewed Node release uses production configuration and its existing artifact gateway. Cloudflare backend placement remains rejected outside the reviewed stage edge environment.                         |
+
+The deployment planner always emits both plans from the same topology: the Zerops phases (`phases`,
+`units.providers` with each vertical's outbox worker, `units.shell`, `units.workers`) and the edge
+units (`units.cloudflare`). The workflow filters business builds through the complete reviewed release
+selection and keeps infrastructure/worker phases separate. Tests cover both backend targets for the
+same diffs. `zerops.yaml`, its generators and materializers remain the source for Node provider builds;
+a source package outside reviewed membership is not automatically deployed or enrolled.
+
+| Environment  | `OUTBOX_WORKER_MODE` | Outbox Workers on Zerops                                                         |
+| ------------ | -------------------- | -------------------------------------------------------------------------------- |
+| `stage`      | `host`               | Every owner's worker in the one `outbox-worker-host` process, the cheap choice.  |
+| `production` | `dedicated`          | One `<owner>-worker` service per owner, deployed and failing independently (HA). |
+
+Before the Cloudflare cut-over stage runs `dedicated`, the workers it has today; `cloudflare-stage-cutover.mts
+activate` switches it to `host` beside `DEPLOY_TARGET=cloudflare`. A preview or demo environment on
+Zerops can equally run `host`.
+
+`deploy-target` reads `DEPLOY_TARGET`, `OUTBOX_WORKER_MODE`, `ZEROPS_PROJECT_ID` and the `ZEROPS_TOKEN`
+secret from the deploying environment without creating a deployment. An invalid target or mode fails
+the run, and so does a configured environment without `OUTBOX_WORKER_MODE`: it has no default. An
+environment without its Zerops project or token deploys nothing and records nothing. `deploy-plan`
+then plans in that environment from the environment's last successful deployment. After the complete
+expected candidate is prepared, `deploy-migrations` runs the independent migration/verifier closure and
+requested SpiceDB deploy. `deploy-node-backends` deploys fresh Node business units and Shell, then
+`deploy-zerops`, the environment's one deployment record, handles workers and the Node publication in the
+original environment. Pushes to `main` deploy `stage`. Production deploys
+only on an explicit dispatch:
+
+```sh
+gh workflow run ultramodern-workspace-gates.yml --ref main -f environment=production -f full=true
+```
+
+Create `production` once, outside CI, before the first dispatch, with the operator script in
+[Create production](#create-production). Leave `DEPLOY_TARGET` unset or `zerops`, and keep
+`OUTBOX_WORKER_MODE=dedicated`, which the script records. The first production deploy has no base, so dispatch it with `full=true`.
+
+`zerops.yaml` describes stage. Before any push, `deploy-migrations` and `deploy-zerops` write a copy that sets
+`ULTRAMODERN_DEPLOYMENT_ENVIRONMENT` to the deploying environment in every build and runtime that
+names it (`pnpm zerops:materialize-environment`), and every `zcli push` reads that copy. Production
+therefore never runs stage-only behaviour. Every runtime reaches SpiceDB over TLS gRPC and pins
+`SPICEDB_CA_CERT`, which `zerops.yaml` takes from the `spicedb` service's `SPICEDB_GRPC_TLS_CERT`
+secret; there is no plaintext mode. Production's copy sets every `SPICEDB_ENDPOINT` to production's
+`SPICEDB_ENDPOINT` variable, so production's SpiceDB gRPC certificate must name that host. A
+production deploy without that variable fails before it pushes anything. The
+scheduled composition refresh has a `refresh-production` lane beside `refresh-stage`, in production's
+own environment and `zerops-production` concurrency group; it publishes nothing until production is
+configured and has deployed once.
+Each refresh lane holds its environment's deploy lock, so it is bounded to 10 minutes (about two in
+practice), and it yields to a main deploy run that is still unfinished: GitHub cancels the older pending
+job when another queues in the same concurrency group, so a refresh queued behind a deploy could cancel
+the next deploy job, and every deploy re-publishes the composition anyway.
+
+The composition publisher resolves each unit's public origin by target: the Zerops subdomain of its
+service on `zerops`, and on `cloudflare` the Worker URL its edge build is given
+(`ULTRAMODERN_PUBLIC_URL_<UNIT>` in the placement `buildEnvironment`). `deploy-zerops` does not publish
+on `cloudflare`, because a new or moved Worker is unobservable until `deploy-cloudflare` ships it;
+`publish-edge-composition` then runs `active-composition:publish publish` with the complete approved
+candidate. Scheduled refresh runs `active-composition:publish refresh` for the same approved revision.
+Both invoke `scripts/publish-active-application-composition.mts` directly under the environment's
+deploy lock: the native publisher writes KV key `active`, verifies readback, and coordinates Core DB
+authority. There is no detached synchronization writer or publication-triggered consumer restart.
+Every placed Worker binds the composition KV namespace as `ONTOS_ACTIVE_APPLICATION_COMPOSITION`
+and reads key `active` on each request, failing closed when the binding or key is missing. Node
+consumers use the lazy HTTP source described in **Current Composition transport**; troubleshoot
+source/readback and authority freshness rather than restarting processes to load a snapshot.
+
+Switching stage between targets is one variable: set `DEPLOY_TARGET` on `stage` and dispatch
+`full=true`. Its other variables and secrets never change. A stage on `cloudflare` whose edge deploy
+is not configured fails in `edge-deploy-readiness`, before anything changes on Zerops.
+
+### Edge units on Cloudflare Workers
+
+`topology/cloudflare-placement.json` lists the delivery units CI also ships as Cloudflare Workers;
+each needs a `cloudflare.workerName` in the reference topology, and its Worker configuration must be
+deployable on its own. Every vertical (UI and headless API) and the Shell are placed, so every
+Worker the Shell binds as a service is placed too. The deployment planner emits the placed,
+impacted units as `units.cloudflare` in dependency order (providers before Shell).
+
+Cloudflare backend placement runs only for configured `stage`. The Node target reuses the existing
+immutable public-asset gateway; it does not perform an additive shadow deployment of every backend.
+In the `host` Outbox Worker mode, whatever the target, `deploy-zerops` deploys the one
+`outbox-worker-host` service (`ZEROPS_OUTBOX_WORKER_HOST_SERVICE_ID`) instead of each owner's
+dedicated worker service; see [Outbox Workers](./OUTBOX_WORKERS.md). The run that deploys one mode's
+workers stops the other mode's. A switch changes no source, so each deploy first checks whether the
+other mode's workers still run or this mode's do not (`active-composition:publish worker-mode-drift`);
+when either holds, the plan deploys every worker of this mode, whatever the diff, and stops the others.
+
+`capture-application-baseline` records B before `edge-plan` partitions the complete reviewed release.
+`edge-build` builds and verifies only fresh slots on separate runners, without deployment credentials.
+After workspace gates and initial-cutover verification, `deploy-cloudflare` retains immutable named
+backend/public-asset versions **before** migrations, under the existing `zerops-stage` environment
+lock. It retrieves original retained receipts, validates complete N, and uses `prepare
+--observe-backends` to verify native backend versions as well as exact public pins before producing T.
+The public Shell ingress remains unchanged during this staging phase.
+
+`deploy-migrations` then receives original B/T and the independent migration requirements.
+`deploy-zerops` handles required workers; `publish-edge-composition` reobserves the full candidate and
+performs explicit publication. Only after that succeeds does `finalize-edge-deployment` activate the
+approved Shell ingress and record the successful edge deployment.
+
+Failed or cancelled releases preserve their immutable artifacts, original receipt set and prepared
+candidate. They do not automatically restore a historical Worker version, delete newly retained
+artifacts, or infer that an old revision can run against changed schema/queues. Same-run recovery uses
+the original prepared identity and native checks. Explicit compatible rollback follows
+[Rollback](#rollback). Source/build changes continue to be planned from the last successful edge
+deployment, so failed work is not hidden by an unrelated successful worker phase.
+
+Removing a unit from placement, or renaming its Worker, must list the old Worker in
+`retiredWorkers`. The planner compares placement with the last successful edge deployment, in full
+plans too, and refuses a change that drops a deployed Worker without retiring it. Placed units must
+also have distinct Worker names. Retirement has two phases, and CI never deletes a Worker. The
+deploy that drops a Worker leaves it running, so a rollback of the Shell or another dependent still
+finds its binding target. After the proofs pass, every successful edge deploy reports each retired
+Worker that still exists as a warning, until an operator deletes it with
+`wrangler delete --name <worker>`. `retiredWorkers` is a ledger: CI cannot see a deletion, so the
+planner keeps every entry the last edge deployment retired, and a deleted Worker's entry costs one
+read-only check per deploy.
+
+The job runs only when the repository is configured for Cloudflare: the `CLOUDFLARE_ACCOUNT_ID`
+variable, the `CLOUDFLARE_API_TOKEN` secret in the `stage-edge` environment, and a complete build
+environment (below). The `edge-deploy-readiness` job checks all three from `stage-edge` without
+creating a deployment. Missing required configuration fails a selected Cloudflare target before provider changes. A Node
+target checks the public-asset gateway separately from Cloudflare backend data bindings. Reading `stage-edge` without a deployment uses
+`environment.deployment: false`, which GitHub refuses for environments with custom deployment
+protection rules, so `stage-edge` must not have any.
+
+The non-secret configuration the Worker builds read is reviewed source, the `buildEnvironment` of
+`topology/cloudflare-placement.json`. It must hold `ULTRAMODERN_MF_DEV_ORIGIN`, the stage Shell
+origin (the placed units' API CORS allowlist), `ULTRAMODERN_PUBLIC_URL_<UNIT>` for every placed
+unit (the output verifier requires them), and the private data plane every Worker binds:
+`ULTRAMODERN_CLOUDFLARE_HYPERDRIVE_ID` (the `HYPERDRIVE` binding, from which Core's
+`#database-runtime` takes the runtime `DATABASE_URL`) and
+`ULTRAMODERN_CLOUDFLARE_SPICEDB_VPC_SERVICE_ID` (the `SPICEDB` Workers VPC binding Core's
+`#spicedb-transport` calls), and `ULTRAMODERN_CLOUDFLARE_COMPOSITION_KV_ID` (the
+`ONTOS_ACTIVE_APPLICATION_COMPOSITION` KV binding Core's `#active-application-composition-source`
+reads). A Worker build without any of them fails. It may add `MODERN_ASSET_PREFIX`.
+Only `MODERN_`, `ULTRAMODERN_` and `VERTICAL_` keys are accepted. `ULTRAMODERN_SOURCE_REVISION` and
+`ULTRAMODERN_DEPLOYMENT_ENVIRONMENT` are reserved for the run. `VERTICAL_*_WORKER_NAME` and
+`VERTICAL_*_WORKER_BINDING` are rejected: a Worker's name and service-binding name are its topology
+`cloudflare.workerName` and `workerDispatch.serviceBinding`, the names CI deploys and every caller uses. Because it is a topology document,
+changing a value replans every unit, so no Worker keeps a build of the old configuration. The job
+never reads the Zerops `stage` environment.
+Each Worker's runtime configuration is set once, outside CI, before its first deploy: secrets
+(`wrangler secret put`, for example `SPICEDB_PRESHARED_KEY` and `BETTER_AUTH_SECRET`); the
+Hyperdrive config and Workers VPC service the IDs above name are account objects.
+
+Inside the account the Workers call each other through service bindings where the topology allows
+it: a binding call goes straight to the target Worker, without a public round trip or a routable
+hostname. The Shell discovers each UI vertical's module
+contract through its `VERTICAL_<UNIT>_WORKER` binding (the reference topology's
+`workerDispatch.serviceBinding`), and Commerce calls Price Group Catalog through
+`VERTICAL_PRICE_GROUP_CATALOG_WORKER` (Core's `#unit-service-fetch`). On Node both keep their URLs.
+Calls a binding cannot carry go by URL: gateway credentials come from the Shell, which binds every
+vertical, so a vertical binding the Shell would be a deploy cycle no first seed can satisfy. Those
+URLs must be the Shell's and verticals' routable custom domains. Every OntOS Worker sets
+`global_fetch_strictly_public`, the flag under which Cloudflare lets a Worker fetch another Worker
+on the same zone.
+
+The gate workflow builds the delivery units in parallel shards: each `node-artifact-build` or
+`cloudflare-artifact-build` matrix job builds a few units for its target (`node` with `build`,
+`cloudflare` with `cloudflare:build`), one unit at a time, and uploads their git-ignored outputs. The
+`Node Backend Federation Artifact Proof` and `Cloudflare Workerd Artifact Proof` jobs each download
+every shard of their target as soon as it is built (`scripts/unpack-unit-build-outputs.sh` fails
+naming any unit no shard built) and prove the whole topology from those outputs. A new unit joins
+one shard of each target; `Repository Tooling Tests`
+fails until it does. The Cloudflare proof runs as two jobs over the same outputs: one verifies the
+Worker outputs and their SSR, the other proves the Worker topology below.
+
+The `Cloudflare Workerd Artifact Proof (topology)` job runs the built Workers together before any deploy:
+`scripts/prove-cloudflare-local-topology.sh` starts each Worker in `wrangler dev` against the job's
+PostgreSQL (as the `HYPERDRIVE` local connection string) and SpiceDB (a local gateway Worker stands
+in for the `SPICEDB` VPC service), then proves repeated database requests, a SpiceDB-authorized
+Shell read, module discovery and a vertical API over service bindings, and SSR. Run it locally
+after `pnpm cloudflare:build`, `pnpm db:migrate` and `pnpm local:initialize`. The per-unit
+`cloudflare:proof` and the verified rollback catch a Worker whose configuration is incomplete.
+The first edge deploy has no previous edge deployment, so seed it with a full run:
+`gh workflow run ultramodern-workspace-gates.yml --ref main -f full=true`. Placement adds the Worker
+delivery; it never removes a Zerops service or any GitHub environment variable or secret.
 
 ### Adding a vertical
 
@@ -650,16 +797,14 @@ list of the usage notification emails) and `STAGE_ACCESS_ENFORCE` (default `fals
   no rate-limit rule: on the Free plan a rate-limit expression cannot match a hostname, so it would
   throttle every other project in the zone. `cost-guards` also records the zone as the `stage-edge` variable
   `CLOUDFLARE_STAGE_ZONE_ID`.
-- `node scripts/ops/cloudflare-stage-cost-guard.mts check` reports the bill. Its hourly workflow is
-  removed: it was disabled on 2026-10-30 and the Cloudflare edge target it guarded is retired, so the
-  command is run by hand while that is true. It reads its settings from the shell, where the
-  `stage-edge` variables are not set, so export `CLOUDFLARE_STAGE_ZONE_ID`, `CLOUDFLARE_ACCOUNT_ID`
-  and `CLOUDFLARE_API_TOKEN` first. It sums the whole account's Workers requests and CPU time since
-  the billing cycle started, and logs each OntOS Worker's share and the other Workers' total
-  (`STAGE_BILLING_CYCLE_DAY`, 1-28, default 1). Past `STAGE_WORKERS_REQUEST_LIMIT` (default 8M) or
-  `STAGE_WORKERS_CPU_MS_LIMIT` (default 24M), it enables the kill switch and fails the run. Export
-  any of these three optional limits that `stage-edge` overrides. The kill switch only stops OntOS
-  stage traffic: if the breakdown shows other projects drive the usage, they need their own action.
+- The hourly `.github/workflows/stage-edge-cost-guard.yml` runs
+  `node scripts/ops/cloudflare-stage-cost-guard.mts check` once that variable exists. It sums the
+  whole account's Workers requests and CPU time since the billing cycle started, and logs each OntOS
+  Worker's share and the other Workers' total (`STAGE_BILLING_CYCLE_DAY`,
+  1-28, default 1). Past `STAGE_WORKERS_REQUEST_LIMIT` (default 8M) or `STAGE_WORKERS_CPU_MS_LIMIT`
+  (default 24M), it enables the kill switch and fails the run. All three are optional `stage-edge`
+  variables. The kill switch only stops OntOS stage traffic: if the breakdown shows other projects
+  drive the usage, they need their own action.
 - The Workers requests usage notification `ontos-stage-workers-requests` emails `STAGE_ACCESS_EMAILS` at
   5M requests. Cloudflare offers usage notifications to Pay-as-you-go accounts, which a Workers Paid
   account is. If the API still rejects the policy, `cost-guards` and `provision` stop there with the
@@ -695,16 +840,16 @@ To turn it off, set `STAGE_ACCESS_ENFORCE=false` and delete the three applicatio
 dashboard; `cost-guards` never deletes them.
 
 To resume after the kill switch trips, find out why, then run
-`node scripts/ops/cloudflare-stage-cutover.mts resume` (the next manual check trips it again if usage
-is still over the limit, so raise the limit variables or wait for the next cycle). To undo the
+`node scripts/ops/cloudflare-stage-cutover.mts resume` (the check trips it again within the hour if
+usage is still over the limit, so raise the limit variables or wait for the next cycle). To undo the
 guards, delete the kill switch rule and the notification in the dashboard and remove the Access
-applications.
+applications; deleting `CLOUDFLARE_STAGE_ZONE_ID` stops the hourly check.
 
 The cut-over token needs these permissions. Account: Cloudflare Tunnel Edit, Workers Scripts Edit,
 Hyperdrive Edit, Connectivity Directory Admin, Access: Apps and Policies Edit, Access: Service Tokens
 Edit, Notifications Edit, Account Analytics Read and Account Settings Read. Zone: Zone Read, DNS
-Edit, Workers Routes Edit and Zone WAF Edit. A token for the manual check needs Account Analytics Read and Zone WAF
-Edit.
+Edit, Workers Routes Edit and Zone WAF Edit. The narrower `stage-edge` token additionally needs
+Account Analytics Read and Zone WAF Edit for the hourly check.
 
 ### Zerops service retirement
 
@@ -835,7 +980,12 @@ The first command only previews; the second creates the secrets.
 `provision` does not set Zerops project variables. Before the first deploy, set on the production
 project the values stage holds at project scope, with production's own origins:
 `MODERN_PUBLIC_SITE_URL`, `ONTOS_GATEWAY_ISSUER` and `ULTRAMODERN_MF_DEV_ORIGIN`. Production also needs its own enforced authorization evidence and
-context (see [Fail-closed authorization promotion](#fail-closed-authorization-promotion)).
+context (see [Fail-closed authorization promotion](#fail-closed-authorization-promotion)). Then
+dispatch the first production deploy:
+
+```sh
+gh workflow run ultramodern-workspace-gates.yml --ref main -f environment=production -f full=true
+```
 
 ## Required smoke suite
 
@@ -910,25 +1060,27 @@ No merge strategy flag is needed: the queue rebases. Before the pull request's o
 command enables auto-merge, and the pull request joins the queue once they do. It leaves the queue if
 its merge-group run fails. Nobody bypasses the queue, so do not pass `--admin`.
 
-When an entry leaves the queue, the queue builds every entry behind it again on a new
-`gh-readonly-queue/main/pr-<number>-<base commit>` ref, and GitHub leaves the replaced entries' runs
-running. The `cancel-replaced-queue-runs` job of each new merge-group run cancels the older live
-merge-group runs of the same pull request as soon as it gets a runner. An entry that leaves without
-being rebuilt fires no event, so its run ends by itself. That job is outside `Workspace gates`; if it
-fails, the entry still merges, but its run concludes `failure`, so the push of that commit finds no
-proof and runs the gates once.
+The push that lands the commit deploys straight away. `queue-proof` looks for a successful
+`merge_group` run of the workflow on that commit; when one exists every gate job is skipped and
+`Workspace gates` passes on that proof. A commit without one (a dispatch on a commit pushed before
+the queue) runs the gates first. The deploy then runs:
 
-A merge-group run stops itself as soon as one of its early checks fails: lint, the repository tooling
-tests, the source and static contracts, the build shards, the database producer, the browser checks or
-the deployment bootstrap. Each of them has a `stop-red-queue-run-after-*` job that starts only when that
-check failed and cancels the run. `Workspace gates` still runs on the cancelled run and fails, so the
-queue removes the entry without waiting for the owner rows. Pull request runs still run every job, so
-their authors see every failure.
+```text
+deploy-target + readiness -> capture B -> reviewed selection
+  Cloudflare: edge-build -> immutable deploy + native preparation of T
+  Node:       node-release-build -> immutable public assets + preparation of T
+workspace gates + initial-cutover proof + prepared T
+  -> migration/verifier closure guarded by B/T
+  -> actual Node backend deployment and receipts (Node target)
+  -> requested worker deploy/stop
+  -> full observed T + explicit Composition publication
+  -> approved Shell ingress finalization (Cloudflare target)
+```
 
-The push that lands the commit deploys nothing. `queue-proof` looks for a successful `merge_group`
-run of the workflow on that commit; when one exists every gate job is skipped and `Workspace gates`
-passes on that proof. A commit without one (a dispatch on a commit pushed before the queue) runs the
-gates.
+Planning and fresh builds can run alongside workspace verification. Database changes wait for the
+complete prepared candidate; unchanged builds do not remove required owner verifiers. A zero-build
+release still validates the full desired membership. Report measured build/deploy counts and elapsed
+times for the actual run rather than assuming a fixed release duration.
 
 ## Pull-request and release hygiene
 

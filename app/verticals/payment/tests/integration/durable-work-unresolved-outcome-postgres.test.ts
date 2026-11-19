@@ -21,7 +21,7 @@ import {
 import { openModuleEntrypointGateway } from '../../../../packages/core-runtime/tests/support/open-module-entrypoint-gateway.ts';
 import { paymentRegistration } from '../../vertical.registration.ts';
 import { installPaymentTestCompositionAuthority } from './composition-authority-fixture.ts';
-import { failureCodeOf, makeTestScope } from './database-fixture.ts';
+import { makeTestScope } from './database-fixture.ts';
 import {
   COMPOSITION_R1,
   COMPOSITION_R2,
@@ -35,8 +35,9 @@ import type { EvidenceNativeDatabase } from './evidence-native-support.ts';
 /**
  * #1151/#1153 TECH-01: an unknown monetary effect stays Core durable work of payment.core under the
  * revision that made it unknown until the operation reaches a proven definitive outcome. Leaving
- * INDETERMINATE for another unresolved outcome (a qualified contradiction or a weak PENDING
- * observation) leaves the drain fence in place until the effect is resolved.
+ * INDETERMINATE for another unresolved outcome (a governed CONFLICT classification without outcome
+ * evidence, or a weak PENDING observation) is neither completion nor a safe checkpoint, so the drain
+ * fence must keep holding the release.
  */
 
 const native = <A, E>(effect: Effect.Effect<A, E, Crypto.Crypto | Scope.Scope>) =>
@@ -137,9 +138,9 @@ const unknownCollect = Effect.fn('DurableWorkUnresolvedOutcome.unknownCollect')(
   expect(yield* trackedWork).toEqual([COMPOSITION_R1]);
   const outcome = evidence.rows.operations(payment.paymentId).pipe(Effect.map(([row]) => row?.outcome));
   /** One GoPay callback about the original collection. */
-  const gopayReport = (factKind: 'COLLECTION_CONFIRMED' | 'COLLECTION_PENDING', amountMinor = 100_000) =>
+  const gopayReport = (factKind: 'COLLECTION_CONFIRMED' | 'COLLECTION_PENDING') =>
     evidence.accept({
-      amount: { amountMinor, currency: 'CZK' },
+      amount: { amountMinor: 100_000, currency: 'CZK' },
       factFamily: 'GATEWAY_OUTCOME',
       factKind,
       operationId: collect.operationId,
@@ -159,28 +160,17 @@ it.live(
         const { evidence, gopayReport, outcome, payment, recover, trackedWork } = yield* unknownCollect();
         yield* recover('LOOKUP_AUTHORITY_UNAVAILABLE');
         const [operationCase] = yield* evidence.rows.cases(payment.paymentId);
-        expect(
-          yield* failureCodeOf(
-            evidence.decide({
-              caseId: operationCase?.caseId ?? '',
-              decision: { _tag: 'CLASSIFY_CONFLICT' },
-              reason: 'Contradictory signals, no outcome evidence',
-            }),
-          ),
-        ).toBe('payment_reconciliation_evidence_not_qualified');
-        expect(yield* outcome).toBe('INDETERMINATE');
-        const conflicting = yield* gopayReport('COLLECTION_CONFIRMED', 99_000);
-        const caseId = conflicting.reconciliationCaseId ?? '';
-        expect(conflicting.acceptanceOutcome).toBe('CONFLICT');
+        const caseId = operationCase?.caseId ?? '';
         const classified = yield* evidence.decide({
           caseId,
           decision: { _tag: 'CLASSIFY_CONFLICT' },
-          reason: 'The provider reports a different amount',
+          reason: 'Contradictory signals, no outcome evidence',
         });
-        expect(Option.getOrUndefined(classified.outcomeChange)).toBeUndefined();
-        expect(Option.getOrUndefined(classified.decision.evidenceRef)).toBe(conflicting.observationId);
-        expect(yield* outcome).toBe('CONFLICT');
-        // The contradictory amount cannot complete the R1 work.
+        expect(Option.getOrUndefined(classified.outcomeChange)).toMatchObject({
+          fromOutcome: 'INDETERMINATE',
+          toOutcome: 'CONFLICT',
+        });
+        // A classification without outcome evidence is no completion: R1 still holds the unknown effect.
         expect(yield* trackedWork).toEqual([COMPOSITION_R1]);
 
         // Proven evidence later resolves the CONFLICT, and only then the work is released.

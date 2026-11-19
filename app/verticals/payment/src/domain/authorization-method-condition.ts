@@ -1,4 +1,3 @@
-import type { OperationalScope } from '@app/core-runtime';
 import { PaymentTermRefSchema } from '@app/payment-term-catalog-contracts/resources/payment-term';
 import { DateTime, Effect, Match, Option, Schema } from 'effect';
 
@@ -11,7 +10,7 @@ import { DeliveryCapabilityPort } from '../ports/delivery-capability-port.ts';
 import type { PaymentCodCapability } from '../ports/delivery-capability-port.ts';
 import type { PaymentOwnerEvidenceUnavailable, PaymentOwnerScope } from '../ports/owner-evidence-unavailable.ts';
 import { PaymentTermEvidencePort } from '../ports/payment-term-evidence-port.ts';
-import type { PaymentTermEvidenceService, PaymentTermUseEvidence } from '../ports/payment-term-evidence-port.ts';
+import type { PaymentTermUseEvidence } from '../ports/payment-term-evidence-port.ts';
 import { PickupCapabilityPort } from '../ports/pickup-capability-port.ts';
 import type { PaymentPickupCollectionCapability } from '../ports/pickup-capability-port.ts';
 import { MethodConditionCheck } from './authorization-currentness.ts';
@@ -40,8 +39,7 @@ export type PaymentMethodConditionSubject = Pick<
   | 'paymentTermRef'
   | 'purchasingContext'
   | 'termSemanticEvidence'
-> &
-  Partial<Pick<PaymentRecord, 'purchaseCorrelationId'>>;
+>;
 
 type MethodConditionRequirements = DeliveryCapabilityPort | PaymentTermEvidencePort | PickupCapabilityPort;
 type MethodConditionVerification = Effect.Effect<
@@ -134,30 +132,15 @@ export const pickupCondition = (pickupCapabilityRef: string, capability: Payment
 const verifyDeferredTerm = Effect.fn('PaymentAuthorization.verifyDeferredTerm')(function* verifyDeferredTerm(
   payment: PaymentMethodConditionSubject,
   scope: PaymentOwnerScope,
-  operationScope?: OperationalScope,
-  consumer?: 'ISSUE' | 'VALIDATE',
 ) {
   const terms = yield* PaymentTermEvidencePort;
-  const request: Parameters<PaymentTermEvidenceService['verifyTermUse']>[0] = {
+  const evidence = yield* terms.verifyTermUse({
     customerConfigurationId: payment.customerConfigurationId,
     method: payment.method,
     paymentTermRef: payment.paymentTermRef,
     purchase: { _tag: 'PURCHASING_CONTEXT', purchasingContext: payment.purchasingContext },
     scope,
-  };
-  const evidence = yield* terms.verifyTermUse(
-    operationScope === undefined || consumer === undefined
-      ? request
-      : {
-          ...request,
-          ownerCall: {
-            consumer,
-            operationScope,
-            payableAmount: payment.amount,
-            purchaseCorrelationId: payment.purchaseCorrelationId,
-          },
-        },
-  );
+  });
   return deferredTermCondition(payment, evidence, yield* DateTime.now);
 });
 
@@ -214,11 +197,9 @@ export const methodEnablementCondition = (
 const verifyOwnerCondition = (
   payment: PaymentMethodConditionSubject,
   scope: PaymentOwnerScope,
-  operationScope?: OperationalScope,
-  consumer?: 'ISSUE' | 'VALIDATE',
 ): MethodConditionVerification =>
   payment.method === 'DEFERRED_INVOICE'
-    ? verifyDeferredTerm(payment, scope, operationScope, consumer)
+    ? verifyDeferredTerm(payment, scope)
     : Match.value(payment.executionBinding).pipe(
         Match.tagsExhaustive({
           BANK_ACCOUNTING_RECEIPT: () => unmatchedBinding(payment),
@@ -242,10 +223,8 @@ export const verifyMethodCondition = (
   payment: PaymentMethodConditionSubject,
   enablements: readonly PaymentMethodEnablementState[],
   scope: PaymentOwnerScope,
-  operationScope?: OperationalScope,
-  consumer?: 'ISSUE' | 'VALIDATE',
 ): MethodConditionVerification =>
   Option.match(methodEnablementCondition(enablements, payment.method), {
-    onNone: () => verifyOwnerCondition(payment, scope, operationScope, consumer),
+    onNone: () => verifyOwnerCondition(payment, scope),
     onSome: Effect.succeed,
   });

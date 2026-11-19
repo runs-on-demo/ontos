@@ -99,14 +99,12 @@ describe('#1151 Payment evidence interpretation', () => {
     );
   });
 
-  it('#1151 a matching amount without a proven effect key is held', () => {
+  it('#1151 a matching amount without a proven effect key restates the outcome and never adds money', () => {
     const decision = interpretPaymentObservation(
       aggregateOf([operation('EFFECT_CONFIRMED')], [accepted('obs-1')]),
       observed({ amount: czk(100_000) }),
     );
-    expect(decision).toEqual(
-      PaymentEvidenceDecision.HOLD({ operationId: COLLECT_ID, reason: 'DISTINCT_ECONOMIC_EFFECT' }),
-    );
+    expect(PaymentEvidenceDecision.$is('NO_CHANGE')(decision)).toBe(true);
   });
 
   it('#1151 a proven different economic effect on an established collection is held, not counted once', () => {
@@ -466,7 +464,7 @@ describe('#1151 Payment evidence interpretation', () => {
     );
   });
 
-  it('#1151 corroboration requires a matching economic effect key and source binding', () => {
+  it('#1151 keyed and keyless confirmations are never proven the same money', () => {
     const keyless = aggregateOf([operation('EFFECT_CONFIRMED')], [accepted('obs-keyless')]);
     const keyed = aggregateOf(
       [operation('EFFECT_CONFIRMED')],
@@ -479,7 +477,7 @@ describe('#1151 Payment evidence interpretation', () => {
     });
     expect(interpretPaymentObservation(keyless, observed({ economicEffectKey: 'charge:2' }))).toEqual(distinct);
     expect(interpretPaymentObservation(keyed, observed({}))).toEqual(distinct);
-    expect(interpretPaymentObservation(keyless, observed({}))).toEqual(distinct);
+    expect(interpretPaymentObservation(keyless, observed({}))).toEqual(corroborates);
     expect(interpretPaymentObservation(keyed, observed({ economicEffectKey: 'charge:1' }))).toEqual(corroborates);
     // Keys are source-scoped: the same opaque key from another source binding is another receipt.
     const otherBank = {
