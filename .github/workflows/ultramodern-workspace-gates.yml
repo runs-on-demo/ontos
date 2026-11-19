@@ -46,7 +46,7 @@ jobs:
   queue-proof:
     name: Find the merge queue proof of this commit
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && inputs.force-ci-full != true
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions:
       actions: read
@@ -80,7 +80,7 @@ jobs:
   cancel-replaced-queue-runs:
     name: Cancel the runs of this pull request's replaced queue entries
     if: github.event_name == 'merge_group'
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions:
       actions: write
@@ -137,7 +137,7 @@ jobs:
     name: Stop this red merge queue run (Format and Lint)
     needs: [format-and-lint]
     if: ${{ !cancelled() && needs.format-and-lint.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: &stop-red-queue-run-permissions
       actions: write
@@ -159,7 +159,7 @@ jobs:
     name: Stop this red merge queue run (Repository Tooling Tests)
     needs: [workspace-gate]
     if: ${{ !cancelled() && needs.workspace-gate.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -168,7 +168,7 @@ jobs:
     name: Stop this red merge queue run (Source, Generation, and Deployment Contracts)
     needs: [workspace-source-contracts]
     if: ${{ !cancelled() && needs.workspace-source-contracts.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -177,7 +177,7 @@ jobs:
     name: Stop this red merge queue run (Static Contracts)
     needs: [static-contracts]
     if: ${{ !cancelled() && needs.static-contracts.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -186,7 +186,7 @@ jobs:
     name: Stop this red merge queue run (Build node artifacts)
     needs: [node-artifact-build]
     if: ${{ !cancelled() && needs.node-artifact-build.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -195,7 +195,7 @@ jobs:
     name: Stop this red merge queue run (Prepare integration database)
     needs: [service-integration]
     if: ${{ !cancelled() && needs.service-integration.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -204,7 +204,7 @@ jobs:
     name: Stop this red merge queue run (Authenticated browser checks)
     needs: [browser-integration]
     if: ${{ !cancelled() && needs.browser-integration.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -213,7 +213,7 @@ jobs:
     name: Stop this red merge queue run (Deployment Bootstrap and Node Federation Proof)
     needs: [node-topology-proof]
     if: ${{ !cancelled() && needs.node-topology-proof.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -222,7 +222,7 @@ jobs:
     name: Select required checks from changed inputs
     needs: [queue-proof]
     if: ${{ !cancelled() && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/bench/')) }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 10
     # actions: read finds the newest green push run of a branch without a merge queue.
     permissions:
@@ -317,7 +317,7 @@ jobs:
   warm-caches:
     name: Warm the gate caches on main
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/bench/'))
-    runs-on: &gate-image runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: &gate-image runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 45
     steps:
       - name: Harden Runner
@@ -1389,7 +1389,7 @@ jobs:
         node-artifact-build,
         node-topology-proof,
       ]
-    runs-on: runs-on=${{ github.run_id }}/family=m8azn.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m7a.xlarge/image=ubuntu26-full-x64/env=dev-sujoysingh
     timeout-minutes: 5
     permissions:
       contents: read
