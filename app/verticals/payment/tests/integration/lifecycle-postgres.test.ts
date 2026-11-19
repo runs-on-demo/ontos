@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { NodeCrypto } from '@effect/platform-node';
+import { trustVerifiedGatewayPrincipalContext } from '@app/core-runtime';
 import { and, eq } from 'drizzle-orm';
 import { Crypto, Deferred, Effect, Fiber, Layer, Option, Result, Schema } from 'effect';
 import type { Scope } from 'effect';
@@ -9,9 +10,11 @@ import { expect, it } from 'effect-rstest';
 import { allowOwnerAuthorizationOverlay } from '../../../../packages/core-runtime/src/access/enforcement/owner-overlay.ts';
 import { makeActionRepository } from '../../../../packages/core-runtime/src/actions/repository.ts';
 import { makeActionRuntime } from '../../../../packages/core-runtime/src/actions/runtime.ts';
+import type { ActionRuntimeOptions } from '../../../../packages/core-runtime/src/actions/runtime.ts';
 import {
   accessScopeFences,
   accessScopes,
+  applicationCompositionDurableWork,
   coreRelations,
   legalEntities,
   outboxMessages,
@@ -30,6 +33,7 @@ import {
   testDatabaseClients,
 } from '../../../../packages/core-runtime/tests/support/database.ts';
 import { openModuleEntrypointGateway } from '../../../../packages/core-runtime/tests/support/open-module-entrypoint-gateway.ts';
+import { paymentProductionOwnerPortsLive } from '../../api/payment-production-layers.ts';
 import { PaymentMethodNotApplicable } from '../../shared/domain/lifecycle-method-not-applicable.ts';
 import {
   PaymentCoverageEstablishedSchema,
@@ -42,6 +46,7 @@ import type { PaymentMethod, PaymentOperationOutcome } from '../../shared/domain
 import { createPaymentAction } from '../../src/actions/create-payment.action.ts';
 import { startPaymentCollectionAction } from '../../src/actions/start-payment-collection.action.ts';
 import { currentPaymentRead } from '../../src/api/current-payment.read.ts';
+import { PaymentTermOwnerTransport } from '../../src/integrations/payment-term-evidence.ts';
 import {
   operationOutcomeTransitions,
   paymentOperations,
@@ -51,18 +56,24 @@ import {
 import type { PaymentAggregatePersistence } from '../../src/persistence/payment-aggregate-persistence.ts';
 import { PaymentTermEvidencePort } from '../../src/ports/payment-term-evidence-port.ts';
 import type { PaymentTermPurchase } from '../../src/ports/payment-term-evidence-port.ts';
+import { PaymentPurchaseEvidencePort } from '../../src/ports/purchase-evidence-port.ts';
 import { paymentApplicabilityPersistenceForTransaction } from '../../src/persistence/payment-applicability-persistence.ts';
 import { paymentRegistration } from '../../vertical.registration.ts';
+import { immediateSnapshot } from '../support/applicability-owner-evidence.fixture.ts';
 import {
   LIFECYCLE_GATEWAY_BINDING,
   lifecycleTermSnapshot,
   makeLifecycleOwnerContractFixture,
 } from '../support/lifecycle-owner-contract.fixture.ts';
 import type { LifecycleOwnerContractState } from '../support/lifecycle-owner-contract.fixture.ts';
+import {
+  makePaymentTermOwnerComposition,
+  paymentTermFixtureDeployment,
+} from '../support/payment-term-owner-composition.fixture.ts';
 import { configuredRefundExecutionRouteFor } from '../support/refund-execution-route.fixture.ts';
 import { installPaymentTestCompositionAuthority } from './composition-authority-fixture.ts';
 import {
-  COMPOSITION_REVISION,
+  awaitQueuedLockWaiters,
   failureCodeOf,
   makeTestScope,
   newPaymentInput,
@@ -81,8 +92,22 @@ import type { PaymentTestScope } from './database-fixture.ts';
  * nothing is deleted.
  */
 
-const runNative = <A, E>(effect: Effect.Effect<A, E, Crypto.Crypto | Scope.Scope>) =>
-  Effect.scoped(effect).pipe(Effect.provide(NodeCrypto.layer));
+const COMPOSITION_R1 = '1'.repeat(64);
+const COMPOSITION_R2 = '2'.repeat(64);
+
+type TrackedComposition = Effect.Success<ReturnType<typeof installPaymentTestCompositionAuthority>>;
+
+/**
+ * Every case runs under the shared test authority of R1 with Payment's registered subscriptions: a
+ * gateway COLLECT is completion-bound executor work of the admitting revision (#1158).
+ */
+const runTracked = <A, E>(
+  body: (composition: TrackedComposition) => Effect.Effect<A, E, Crypto.Crypto | Scope.Scope>,
+) =>
+  Effect.scoped(installPaymentTestCompositionAuthority(COMPOSITION_R1).pipe(Effect.flatMap(body))).pipe(
+    Effect.provide(NodeCrypto.layer),
+  );
+const runNative = <A, E>(effect: Effect.Effect<A, E, Crypto.Crypto | Scope.Scope>) => runTracked(() => effect);
 
 const PAYMENT_CREATED = 'payment.core.payment-created.v1';
 const OPERATION_REQUESTED = 'payment.core.operation-requested.v1';
@@ -93,8 +118,6 @@ const OPERATION_REQUESTED = 'payment.core.operation-requested.v1';
  * scripted open (permissions are not the subject here; #1153 owns the access matrix). Every scope
  * uses fresh random Tenant/LE/principal identities; nothing is deleted afterwards.
  */
-const COMPOSITION_R1 = '1'.repeat(64);
-const COMPOSITION_R2 = '2'.repeat(64);
 const authenticationNamespaceId = 'test.payment-lifecycle.v1';
 
 const allowedPermission = { checkActionPermission: () => Effect.succeed('allowed' as const) };
@@ -127,6 +150,7 @@ type LifecycleNativeDatabase = Effect.Success<typeof lifecycleNativeDatabase>;
 const makeLifecycleRuntimes = Effect.fn('LifecycleNative.makeRuntimes')(function* makeLifecycleRuntimes(
   native: LifecycleNativeDatabase,
   compositionRevision: string,
+  composition: Pick<ActionRuntimeOptions, 'applicationComposition' | 'expectedDeployment'> = {},
 ) {
   const crypto = yield* Crypto.Crypto;
   const accessDecision = makeScriptedBoundAccessGate('allowed').bound;
@@ -142,6 +166,7 @@ const makeLifecycleRuntimes = Effect.fn('LifecycleNative.makeRuntimes')(function
       ownerAuthorizationOverlay: allowOwnerAuthorizationOverlay,
       ownerRegistration: paymentRegistration,
       resolveCompositionRevision: () => Effect.succeed(compositionRevision),
+      ...composition,
     },
   );
   const reads = makeReadRuntime(
@@ -369,14 +394,18 @@ const lifecycleScenario = Effect.fn('LifecycleScenario.make')(function* lifecycl
     compositionRevision?: string,
   ) =>
     Effect.gen(function* settleOutcome() {
-      const provenance = yield* provenanceFor(scope);
+      // Evidence is recorded by this scenario's R1 runtime unless a later compatible revision is named.
+      const provenance = {
+        ...(yield* provenanceFor(scope)),
+        compositionRevision: compositionRevision ?? COMPOSITION_R1,
+      };
       return yield* persist((persistence) =>
         persistence.transitionOperationOutcome({
           causedBy: { kind: 'OBSERVATION' },
           expectedOutcomeRevision,
           operationId,
           paymentId,
-          provenance: compositionRevision === undefined ? provenance : { ...provenance, compositionRevision },
+          provenance,
           to,
         }),
       );
@@ -463,6 +492,97 @@ it.live('#1148 the same intent key recovers the same Payment; a changed meaning 
           }),
         ),
       ).toBe('payment_intent_material_conflict');
+      expect(yield* paymentRows(scenario)).toHaveLength(1);
+      expect(yield* outboxPayloads(scenario.native, scenario.scope.tenantId, PAYMENT_CREATED)).toHaveLength(1);
+    }),
+  ),
+);
+
+it.live('#1148 creates bank transfer with exact Checkout facts and refuses a forged correlation or amount', () =>
+  runTracked((tracked) =>
+    Effect.gen(function* governedPurchaseCreation() {
+      const scenario = yield* lifecycleScenario();
+      yield* enableMethod(scenario.native, scenario.scope, CUSTOMER_CONFIGURATION, 'BANK_TRANSFER_ADVANCE');
+      const composition = yield* makePaymentTermOwnerComposition();
+      const { revision } = composition.composition;
+      yield* tracked.activate(revision);
+      const { actions } = yield* makeLifecycleRuntimes(scenario.native, revision, {
+        applicationComposition: { load: Effect.succeed(composition) },
+        expectedDeployment: paymentTermFixtureDeployment,
+      });
+      const storefrontId = 'storefront-intent-owner';
+      const principal = trustVerifiedGatewayPrincipalContext(
+        { ...scenario.principal, trustedStorefrontId: storefrontId },
+        revision,
+      );
+      const purchasingContext: PaymentPurchasingContext = {
+        ...purchasingContextFor(scenario.scope, 'exact-purchase'),
+        subject: { guestEvidenceRef: 'checkout-guest-fact', guestSessionRef: 'checkout-guest-session', kind: 'GUEST' },
+      };
+      const payableAmount = { amountMinor: 100_000, currency: 'CZK' } as const;
+      const payload = scenario.intent({
+        payableAmount,
+        purchasingContext,
+        selection: { method: 'BANK_TRANSFER_ADVANCE' },
+      });
+      let resolvedTerms = 0;
+      const transport = Layer.succeed(PaymentTermOwnerTransport, {
+        acquire: () =>
+          Effect.succeed({
+            apiBaseUrl: 'https://gateway.test/commerce-customer-context/',
+            authorization: 'Bearer fixture-ccc',
+            compositionRevision: revision,
+            expiresAt: 1_800_000_000,
+          }),
+        executeGuest: (request) => {
+          resolvedTerms += 1;
+          return Effect.succeed({
+            _tag: 'EXPLICIT_CHOICE',
+            customerPaymentTermsRevision: null,
+            definition: immediateSnapshot(payload.paymentTermRef),
+            policyRevision: 'policy-1',
+            policySource: 'storefront',
+            purchasingContextRevision: request.purchasingContext.contextRevision,
+            resolvedAt: request.at,
+          });
+        },
+        executeProfile: () => Effect.die('A Guest purchase cannot use the profile term route'),
+      });
+      const checkout = Layer.succeed(PaymentPurchaseEvidencePort, {
+        readCurrent: () =>
+          Effect.succeed({
+            ...scenario.scope,
+            customerConfigurationId: payload.customerConfigurationId,
+            evidenceRef: 'fixture-checkout-purchase',
+            payableAmount,
+            paymentTermRef: payload.paymentTermRef,
+            purchaseCorrelationId: payload.purchaseCorrelationId,
+            purchasingContext,
+            storefrontId,
+          }),
+      });
+      const create = (input: typeof payload) =>
+        actions.runAction({
+          payload: input,
+          principal,
+          registration: createPaymentAction,
+          transport: { correlationId: 'payment-governed-create', idempotencyKey: randomUUID() },
+        });
+      const owners = paymentProductionOwnerPortsLive.pipe(Layer.provide(Layer.mergeAll(checkout, transport)));
+      const missing = yield* create(payload).pipe(Effect.provide(paymentProductionOwnerPortsLive), Effect.flip);
+      expect(missing).toMatchObject({ outcome: 'UNAVAILABLE_TO_VERIFY' });
+      const foreignCorrelation = { ...payload, purchaseCorrelationId: 'forged-purchase' };
+      const wrongAmount = { ...payload, payableAmount: { ...payload.payableAmount, amountMinor: 1 } };
+      for (const forged of [foreignCorrelation, wrongAmount]) {
+        const failure = yield* create(forged).pipe(Effect.provide(owners), Effect.flip);
+        expect(failure).toMatchObject({ outcome: 'UNAVAILABLE_TO_VERIFY' });
+      }
+      expect(resolvedTerms).toBe(0);
+      expect(yield* paymentRows(scenario)).toHaveLength(0);
+      const created = yield* create(payload).pipe(Effect.provide(owners));
+      expect(created.payment.amount).toEqual(payload.payableAmount);
+      expect(created.payment.purchaseCorrelationId).toBe(payload.purchaseCorrelationId);
+      expect(resolvedTerms).toBe(1);
       expect(yield* paymentRows(scenario)).toHaveLength(1);
       expect(yield* outboxPayloads(scenario.native, scenario.scope.tenantId, PAYMENT_CREATED)).toHaveLength(1);
     }),
@@ -596,7 +716,6 @@ it.live(
   () =>
     runNative(
       Effect.gen(function* changingAmount() {
-        yield* installPaymentTestCompositionAuthority(COMPOSITION_REVISION);
         const scenario = yield* lifecycleScenario();
         const purchaseCorrelationId = `purchase-${randomUUID()}`;
         const original = yield* scenario.create(
@@ -713,33 +832,11 @@ it.live('#1148 a proven unreturned predecessor collection blocks a successor; a 
 );
 
 /**
- * Polls until at least two sessions are (transitively) blocked behind the holder backend; the second
- * racer may queue behind the first rather than the holder itself.
+ * Waits until both racers are (transitively) blocked behind the holder backend; the second racer may
+ * queue behind the first rather than behind the holder itself.
  */
-const awaitBlockedBehind = (adminClient: LifecycleNativeDatabase['adminClient'], holderPid: number) => {
-  const waiters = adminClient
-    .unsafe<{ readonly waiting: number }>(
-      `with recursive blocked(pid) as (
-         select activity.pid from pg_catalog.pg_stat_activity activity
-         where $1 = any(pg_catalog.pg_blocking_pids(activity.pid))
-         union
-         select activity.pid from pg_catalog.pg_stat_activity activity
-         join blocked on blocked.pid = any(pg_catalog.pg_blocking_pids(activity.pid))
-       )
-       select count(*)::integer as waiting from blocked`,
-      [holderPid],
-    )
-    .pipe(Effect.map((rows) => rows[0]?.waiting ?? 0));
-  const awaitBothBlocked = (remaining: number): Effect.Effect<number, Effect.Error<typeof waiters>> =>
-    waiters.pipe(
-      Effect.flatMap((waiting) =>
-        waiting >= 2 || remaining === 0
-          ? Effect.succeed(waiting)
-          : Effect.suspend(() => awaitBothBlocked(remaining - 1)),
-      ),
-    );
-  return awaitBothBlocked(2000);
-};
+const awaitBothBlockedBehind = (adminClient: LifecycleNativeDatabase['adminClient'], holderPid: number) =>
+  awaitQueuedLockWaiters(adminClient, { expected: 2, holderPid });
 
 /**
  * Races two Actions behind an external holder of the given Payment row locks: both queue behind it
@@ -770,7 +867,7 @@ const raceBehindPaymentLocks = Effect.fn('LifecycleConcurrencyTest.raceBehindPay
   const holderPid = yield* Deferred.await(locked);
   const first = yield* Effect.result(racers[0]).pipe(Effect.forkChild);
   const second = yield* Effect.result(racers[1]).pipe(Effect.forkChild);
-  const blockedCount = yield* awaitBlockedBehind(adminClient, holderPid).pipe(
+  const blockedCount = yield* awaitBothBlockedBehind(adminClient, holderPid).pipe(
     Effect.ensuring(Deferred.succeed(release, true)),
   );
   yield* Fiber.join(holder);
@@ -810,7 +907,7 @@ const raceOnNewIntentKey = Effect.fn('LifecycleConcurrencyTest.raceOnNewIntentKe
   const holderPid = yield* Deferred.await(locked);
   const first = yield* Effect.result(racers[0]).pipe(Effect.forkChild);
   const second = yield* Effect.result(racers[1]).pipe(Effect.forkChild);
-  const blockedCount = yield* awaitBlockedBehind(scenario.native.adminClient, holderPid).pipe(
+  const blockedCount = yield* awaitBothBlockedBehind(scenario.native.adminClient, holderPid).pipe(
     Effect.ensuring(Deferred.succeed(release, true)),
   );
   const holderFailure = yield* Fiber.join(holder);
@@ -915,7 +1012,6 @@ it.live(
   () =>
     runNative(
       Effect.gen(function* samePurchaseUnresolved() {
-        yield* installPaymentTestCompositionAuthority(COMPOSITION_REVISION);
         const scenario = yield* lifecycleScenario();
         yield* enableMethod(scenario.native, scenario.scope, CUSTOMER_CONFIGURATION, 'BANK_TRANSFER_ADVANCE');
         const purchaseCorrelationId = `purchase-${randomUUID()}`;
@@ -1192,46 +1288,72 @@ const collectRows = (scenario: Scenario, paymentId: string) =>
       ),
     );
 
-it.live('#1149 start-payment-collection emits operation-requested with the original binding and true provenance', () =>
-  runNative(
-    Effect.gen(function* collectionRequested() {
-      const scenario = yield* lifecycleScenario();
-      const { paymentId, request } = yield* paymentWithCollection(scenario);
-      const started = yield* scenario.collect(request('collect-1'));
+it.live(
+  '#1149 #1158 Gateway collection dispatch is tracked durable work: operation-requested keeps the original binding and true provenance',
+  () =>
+    runNative(
+      Effect.gen(function* collectionRequested() {
+        const scenario = yield* lifecycleScenario();
+        const { paymentId, request } = yield* paymentWithCollection(scenario);
+        const started = yield* scenario.collect(request('collect-1'));
 
-      expect(started.replayed).toBe(false);
-      expect(started.operation).toMatchObject({
-        binding: LIFECYCLE_GATEWAY_BINDING,
-        kind: 'COLLECT',
-        outcome: 'PENDING',
-        provenance: { actorPrincipalId: scenario.scope.principalId, compositionRevision: COMPOSITION_R1 },
-      });
-      const [event] = yield* outboxPayloads(scenario.native, scenario.scope.tenantId, OPERATION_REQUESTED);
-      expect(event).toMatchObject({
-        amount: { amountMinor: 100_000, currency: 'CZK' },
-        binding: LIFECYCLE_GATEWAY_BINDING,
-        kind: 'COLLECT',
-        method: 'ONLINE_GATEWAY',
-        operationId: started.operation.operationId,
-        paymentId,
-        provenance: {
-          actionInvocationId: started.operation.provenance.actionInvocationId,
-          compositionRevision: COMPOSITION_R1,
-        },
-      });
-      const current = yield* scenario.read(paymentId);
-      expect(current.unresolved.unresolvedOperationIds).toStrictEqual([started.operation.operationId]);
-      expect(current.coverage).toStrictEqual(
-        PaymentCoverageNotCollectedSchema.make({ liveCollectOperationId: Option.some(started.operation.operationId) }),
-      );
-    }),
-  ),
+        expect(started.replayed).toBe(false);
+        expect(started.operation).toMatchObject({
+          binding: LIFECYCLE_GATEWAY_BINDING,
+          kind: 'COLLECT',
+          outcome: 'PENDING',
+          provenance: { actorPrincipalId: scenario.scope.principalId, compositionRevision: COMPOSITION_R1 },
+        });
+        const [event] = yield* outboxPayloads(scenario.native, scenario.scope.tenantId, OPERATION_REQUESTED);
+        // #1158 Gateway collection dispatch is tracked durable work of the admitting revision R1.
+        const [dispatch, ...others] = yield* scenario.native.coreAdmin
+          .select({
+            completionConsumer: outboxMessages.completionConsumerModuleKey,
+            completionRevision: outboxMessages.completionOriginalRevision,
+            outboxMessageId: outboxMessages.outboxMessageId,
+          })
+          .from(outboxMessages)
+          .where(
+            and(eq(outboxMessages.tenantId, scenario.scope.tenantId), eq(outboxMessages.topic, OPERATION_REQUESTED)),
+          );
+        expect(others).toHaveLength(0);
+        expect(dispatch).toMatchObject({ completionConsumer: 'payment.core', completionRevision: COMPOSITION_R1 });
+        const dispatchWork = yield* scenario.native.coreAdmin
+          .select({ originalRevision: applicationCompositionDurableWork.originalRevision })
+          .from(applicationCompositionDurableWork)
+          .where(
+            and(
+              eq(applicationCompositionDurableWork.ownerModuleKey, 'payment.core'),
+              eq(applicationCompositionDurableWork.workId, `outbox:${dispatch?.outboxMessageId}:payment.core`),
+            ),
+          );
+        expect(dispatchWork).toStrictEqual([{ originalRevision: COMPOSITION_R1 }]);
+        expect(event).toMatchObject({
+          amount: { amountMinor: 100_000, currency: 'CZK' },
+          binding: LIFECYCLE_GATEWAY_BINDING,
+          kind: 'COLLECT',
+          method: 'ONLINE_GATEWAY',
+          operationId: started.operation.operationId,
+          paymentId,
+          provenance: {
+            actionInvocationId: started.operation.provenance.actionInvocationId,
+            compositionRevision: COMPOSITION_R1,
+          },
+        });
+        const current = yield* scenario.read(paymentId);
+        expect(current.unresolved.unresolvedOperationIds).toStrictEqual([started.operation.operationId]);
+        expect(current.coverage).toStrictEqual(
+          PaymentCoverageNotCollectedSchema.make({
+            liveCollectOperationId: Option.some(started.operation.operationId),
+          }),
+        );
+      }),
+    ),
 );
 
 it.live('#1148 Retrying a collection: an INDETERMINATE COLLECT replayed by a new invocation keeps its identity', () =>
   runNative(
     Effect.gen(function* retryIndeterminate() {
-      yield* installPaymentTestCompositionAuthority(COMPOSITION_REVISION);
       const scenario = yield* lifecycleScenario();
       const { paymentId, request } = yield* paymentWithCollection(scenario);
       const original = yield* scenario.collect(request('collect-retry'));
@@ -1462,26 +1584,28 @@ it.live("#1148 foreign Tenant or Selling Legal Entity cannot collect, read or re
   ),
 );
 
-it.live('#1148 a disabled or foreign gateway account/environment refuses a new COLLECT without failover', () =>
+it.live('#1148 #1155 a COLLECT after gateway disablement or account replacement keeps the original binding', () =>
   runNative(
     Effect.gen(function* noFailover() {
       const scenario = yield* lifecycleScenario();
       const { paymentId, request } = yield* paymentWithCollection(scenario);
-      // C17 now enables only a different account/environment; the Payment keeps its original binding.
-      yield* scenario.owners.update((state) => ({
-        ...state,
-        enabledBindings: [
-          { ...LIFECYCLE_GATEWAY_BINDING, environment: 'sandbox', providerAccountRef: 'gopay-account-other' },
-        ],
-      }));
-      expect(yield* failureCodeOf(scenario.collect(request('collect-after-disable')))).toBe(
-        'payment_binding_not_enabled',
-      );
+      // A C17 outage fails closed; nothing is started.
       yield* scenario.owners.update((state) => ({ ...state, gatewayAvailable: false }));
       expect(yield* failureCodeOf(scenario.collect(request('collect-during-outage')))).toBe(
         'payment_owner_evidence_unavailable',
       );
       expect(yield* collectRows(scenario, paymentId)).toHaveLength(0);
+      // C17 now offers only a different account/environment to new intents; this existing Payment keeps its own.
+      yield* scenario.owners.update((state) => ({
+        ...state,
+        enabledBindings: [
+          { ...LIFECYCLE_GATEWAY_BINDING, environment: 'sandbox', providerAccountRef: 'gopay-account-other' },
+        ],
+        gatewayAvailable: true,
+      }));
+      const started = yield* scenario.collect(request('collect-after-replacement'));
+      expect(started.operation.binding).toStrictEqual(LIFECYCLE_GATEWAY_BINDING);
+      expect(yield* collectRows(scenario, paymentId)).toHaveLength(1);
       const current = yield* scenario.read(paymentId);
       expect(current.payment.executionBinding).toStrictEqual(LIFECYCLE_GATEWAY_BINDING);
     }),

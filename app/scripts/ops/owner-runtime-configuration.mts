@@ -10,7 +10,7 @@ import { Array as EffectArray, Option, Order, Schema } from 'effect';
  */
 
 /** How the stage cut-over checks a per-environment value before writing it to a Worker. */
-export const OperatorValueFormatSchema = Schema.Literals(['module-bindings', 'reference']);
+export const OperatorValueFormatSchema = Schema.Literals(['reference']);
 export type OperatorValueFormat = typeof OperatorValueFormatSchema.Type;
 
 /** A per-environment value that is not secret, such as a key reference or the Shell's module bindings. */
@@ -58,8 +58,6 @@ export interface OwnerRuntimeConfiguration {
 export const SHELL_GATEWAY_BASE_URL_VARIABLE = 'ONTOS_SHELL_GATEWAY_BASE_URL';
 /** The module credential every module deployment reads, whichever operator value supplies it. */
 export const GATEWAY_MODULE_API_KEY_VARIABLE = 'ONTOS_GATEWAY_MODULE_API_KEY';
-/** The Shell's JSON array binding each module credential to one module deployment. Not secret. */
-export const GATEWAY_MODULE_BINDINGS_VARIABLE = 'ONTOS_GATEWAY_MODULE_BINDINGS';
 
 /** The operator-held variable of one unit's module credential, e.g. `ONTOS_GATEWAY_MODULE_API_KEY_COMMERCE_ORDER`. */
 export const moduleCredentialVariable = (unitId: string): string =>
@@ -72,6 +70,7 @@ const ORDER_UNIT = 'commerce-order';
 const PRICING_UNIT = 'pricing';
 const MARKET_CATALOG_UNIT = 'commerce-market-catalog';
 const CATALOG_UNIT = 'catalog';
+const PAYMENT_UNIT = 'payment';
 const PARTY_REGISTRY_UNIT = 'party-registry';
 const PRIVACY_UNIT = 'privacy';
 const SYMMY_INTEGRATION_UNIT = 'symmy-integration';
@@ -80,15 +79,18 @@ const SYMMY_INTEGRATION_UNIT = 'symmy-integration';
 const byUrl = (unitId: string, variable: string): OwnerApiDependency => ({ edge: 'custom-domain', unitId, variable });
 /** An owner API only Zerops reaches by URL. */
 const zeropsOnly = (unitId: string, variable: string): OwnerApiDependency => ({ edge: 'none', unitId, variable });
-const moduleBindings = (variable: string): OperatorValue => ({ format: 'module-bindings', variable });
 const reference = (variable: string): OperatorValue => ({ format: 'reference', variable });
 
 const shellGateway = byUrl('shell-super-app', SHELL_GATEWAY_BASE_URL_VARIABLE);
 const cartApi = byUrl(CART_UNIT, 'ONTOS_COMMERCE_CART_API_BASE_URL');
 const customerContextApi = byUrl(CUSTOMER_CONTEXT_UNIT, 'ONTOS_COMMERCE_CUSTOMER_CONTEXT_API_BASE_URL');
 
-/** The Shell's operator values: the module bindings every module credential is checked against. */
-export const SHELL_OPERATOR_VALUES: readonly OperatorValue[] = [moduleBindings(GATEWAY_MODULE_BINDINGS_VARIABLE)];
+/**
+ * Secrets only the Shell reads. `ONTOS_PAYMENT_NOTIFICATION_RELAY_CREDENTIALS` is a JSON array
+ * `[{ "tenantId": <uuid>, "apiKey": <managed API key> }]` of each Tenant's payment notification relay
+ * integration principal; the Shell decodes it per entry and only when a provider notification arrives.
+ */
+export const SHELL_CREDENTIAL_VARIABLES: readonly string[] = ['ONTOS_PAYMENT_NOTIFICATION_RELAY_CREDENTIALS'];
 
 /**
  * Every module deployment that calls another module through `acquireDelegatedGatewayContext`, each with
@@ -171,6 +173,17 @@ export const OWNER_RUNTIME_CONFIGURATIONS: readonly OwnerRuntimeConfiguration[] 
     moduleCredentialVariable: moduleCredentialVariable(ORDER_UNIT),
     operatorValues: [],
     unitId: ORDER_UNIT,
+  },
+  {
+    apiDependencies: [shellGateway],
+    // ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS is the reconciliation driver's `[{ tenantId, apiKey }]` JSON
+    // array, read lazily per entry by the Payment Outbox Worker only.
+    credentialVariables: ['ONTOS_PAYMENT_PROVIDER_CREDENTIALS', 'ONTOS_PAYMENT_RECONCILIATION_CREDENTIALS'],
+    moduleCredentialHolders: SERVICE_AND_WORKER,
+    moduleCredentialVariable: moduleCredentialVariable(PAYMENT_UNIT),
+    // The public Shell origin Payment composes provider notification URLs from.
+    operatorValues: [reference('ONTOS_PAYMENT_NOTIFICATION_BASE_URL')],
+    unitId: PAYMENT_UNIT,
   },
   {
     apiDependencies: [shellGateway],
