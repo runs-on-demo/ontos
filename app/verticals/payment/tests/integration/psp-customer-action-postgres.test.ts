@@ -261,6 +261,9 @@ const preparedFor = (identity: ProviderDispatchIdentity, family: Family) => {
       : [{ name: 'content-type', value: 'application/json' }],
     idempotencyKey: stripe ? Option.some(idempotencyKey) : Option.none(),
     orderReference,
+    // The ledger refuses a GoPay refund without its pre-dispatch refund-history baseline, and any other with one.
+    refundBaseline:
+      family === 'GOPAY' && identity.operationKind === 'REFUND' ? Option.some({ rowIds: [] }) : Option.none(),
     replayWindowMs: stripe ? Option.some(86_400_000) : Option.none(),
     requestHash: 'a'.repeat(64),
   });
@@ -285,7 +288,14 @@ const prepareThroughLedger = (
     const prepared = yield* preparedFor(fixture.collect, family);
     const returnToken = Option.some(yield* returnTokenFor(returnTokenSeed));
     return yield* inWorker(runtime, fixture.scope, ({ ledger, scope, workerContext }) =>
-      ledger.prepare({ identity: fixture.collect, prepared, returnToken, scope, workerContext }),
+      ledger.prepare({
+        identity: fixture.collect,
+        prepared,
+        refundDispatchCount: Option.none(),
+        returnToken,
+        scope,
+        workerContext,
+      }),
     );
   });
 

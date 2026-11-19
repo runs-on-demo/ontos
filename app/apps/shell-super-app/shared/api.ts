@@ -1,9 +1,13 @@
+import { PaymentReconciliationGroup } from '@app/payment/payment-gateway-relay';
 import { GatewayContextApiGroup } from '@app/shared-contracts';
 import { SYMMY_FIXTURE_ROUTES, SYMMY_ROUTES } from '@app/shared-contracts/symmy';
-import { HttpApi, HttpApiEndpoint, HttpApiGroup, Schema } from '@modern-js/bff-effect/effect-client';
+import { HttpApi, HttpApiEndpoint, HttpApiGroup } from '@modern-js/bff-effect/effect-client';
 import { OpenApi } from 'effect/http-api';
 import {
-  SymmyFixtureReadSchema,
+  SymmyCustomersReadQuerySchema,
+  SymmyPriceListsReadQuerySchema,
+  SymmyProductsReadQuerySchema,
+  SymmyRegionsReadQuerySchema,
   SymmySchemaError,
   symmyCodeParams,
   symmyFixtureSubmitOptions,
@@ -13,28 +17,40 @@ import {
   symmyWriteOptions,
 } from '../api/symmy/contract.ts';
 import { SymmyDefectBoundary } from '../api/symmy/defect-boundary.ts';
-import {
-  SymmyInternalCustomersProjectionSchema,
-  SymmyInternalPriceListsProjectionSchema,
-  SymmyInternalProductsProjectionSchema,
-} from '../api/symmy/read-projection-contracts.ts';
-import { SymmyInternalRegionsProjectionSchema } from '../api/symmy/regions-projection-contract.ts';
+import { PaymentNotificationBoundary } from '../api/payment-gateway/notification-boundary.ts';
+import { PaymentNotificationsGroup } from '../api/payment-gateway/notification-contract.ts';
+import { PaymentReconciliationBoundary } from '../api/payment-gateway/reconciliation-boundary.ts';
+import { SymmyCustomersResponseSchema } from '../api/symmy/customers-public-contract.ts';
+import { SymmyCustomersBatchRequestSchema } from '../api/symmy/customers-batch-request-contract.ts';
+import { SymmyPriceListsBatchRequestSchema } from '../api/symmy/price-lists-batch-upsert-request-contract.ts';
+import { SymmyPriceListPricesBatchRequestSchema } from '../api/symmy/price-lists-prices-batch-request-contract.ts';
+import { SymmyPriceListsResponseSchema } from '../api/symmy/price-lists-public-contract.ts';
+import { SymmyProductsBatchRequestSchema } from '../api/symmy/products-batch-request-contract.ts';
+import { SymmyProductsSuccessSchema } from '../api/symmy/products-public-contract.ts';
+import { SymmyRegionsSuccessSchema } from '../api/symmy/regions-public-contract.ts';
+import { SymmyStockBatchResponseSchema } from '../api/symmy/stock-batch-public-contract.ts';
+import { SymmyStockBatchRequestSchema } from '../api/symmy/stock-batch-request-contract.ts';
 import { ShellAuthenticationApi as ShellBrowserApi } from './browser-api.ts';
 
+// Every request, response and error shape below is a Schema.* value declared in `../api/symmy/*contract.ts`;
+// this module only wires those schemas to the Symmy routes.
 const nativeSymmyPath = (path: `/${string}`): `/${string}` =>
   `/${path.slice(1).replace('{code}', ':code').replace('{id}', ':id')}`;
 
 const adminCustomersEndpoint = HttpApiEndpoint.get('adminCustomers', SYMMY_ROUTES.adminCustomers.path, {
   ...symmyReadOptions,
-  success: Schema.Union([SymmyFixtureReadSchema, SymmyInternalCustomersProjectionSchema]),
+  query: SymmyCustomersReadQuerySchema,
+  success: SymmyCustomersResponseSchema,
 });
 const adminProductsEndpoint = HttpApiEndpoint.get('adminProducts', SYMMY_ROUTES.adminProducts.path, {
   ...symmyReadOptions,
-  success: Schema.Union([SymmyFixtureReadSchema, SymmyInternalProductsProjectionSchema]),
+  query: SymmyProductsReadQuerySchema,
+  success: SymmyProductsSuccessSchema,
 });
 const adminRegionsEndpoint = HttpApiEndpoint.get('adminRegions', SYMMY_ROUTES.adminRegions.path, {
   ...symmyReadOptions,
-  success: Schema.Union([SymmyFixtureReadSchema, SymmyInternalRegionsProjectionSchema]),
+  query: SymmyRegionsReadQuerySchema,
+  success: SymmyRegionsSuccessSchema,
 });
 const customerGroupCustomersBatchEndpoint = HttpApiEndpoint.post(
   'customerGroupCustomersBatch',
@@ -46,39 +62,35 @@ const customerGroupsBatchEndpoint = HttpApiEndpoint.post(
   SYMMY_ROUTES.customerGroupsBatch.path,
   symmyWriteOptions,
 );
-const customersBatchEndpoint = HttpApiEndpoint.post(
-  'customersBatch',
-  SYMMY_ROUTES.customersBatch.path,
-  symmySubmitOptions,
-);
-const inventoryStockBatchEndpoint = HttpApiEndpoint.post(
-  'inventoryStockBatch',
-  SYMMY_ROUTES.inventoryStockBatch.path,
-  symmyWriteOptions,
-);
+const customersBatchEndpoint = HttpApiEndpoint.post('customersBatch', SYMMY_ROUTES.customersBatch.path, {
+  ...symmySubmitOptions,
+  payload: SymmyCustomersBatchRequestSchema,
+});
+const inventoryStockBatchEndpoint = HttpApiEndpoint.post('inventoryStockBatch', SYMMY_ROUTES.inventoryStockBatch.path, {
+  ...symmyWriteOptions,
+  payload: SymmyStockBatchRequestSchema,
+  success: SymmyStockBatchResponseSchema,
+});
 const jobEndpoint = HttpApiEndpoint.get('job', nativeSymmyPath(SYMMY_ROUTES.job.path), symmyJobOptions);
 const priceListPricesBatchEndpoint = HttpApiEndpoint.post(
   'priceListPricesBatch',
-  nativeSymmyPath(SYMMY_ROUTES.priceListPricesBatch.path),
-  {
-    ...symmySubmitOptions,
-    params: symmyCodeParams,
-  },
+  SYMMY_ROUTES.priceListPricesBatch.path,
+  { ...symmySubmitOptions, payload: SymmyPriceListPricesBatchRequestSchema },
 );
 const priceListsEndpoint = HttpApiEndpoint.get('priceLists', SYMMY_ROUTES.priceLists.path, {
   ...symmyReadOptions,
-  success: Schema.Union([SymmyFixtureReadSchema, SymmyInternalPriceListsProjectionSchema]),
+  query: SymmyPriceListsReadQuerySchema,
+  success: SymmyPriceListsResponseSchema,
 });
 const priceListsBatchUpsertEndpoint = HttpApiEndpoint.post(
   'priceListsBatchUpsert',
   SYMMY_ROUTES.priceListsBatchUpsert.path,
-  symmySubmitOptions,
+  { ...symmySubmitOptions, payload: SymmyPriceListsBatchRequestSchema },
 );
-const productsBatchEndpoint = HttpApiEndpoint.post(
-  'productsBatch',
-  SYMMY_ROUTES.productsBatch.path,
-  symmySubmitOptions,
-);
+const productsBatchEndpoint = HttpApiEndpoint.post('productsBatch', SYMMY_ROUTES.productsBatch.path, {
+  ...symmySubmitOptions,
+  payload: SymmyProductsBatchRequestSchema,
+});
 
 const assortmentRulesFixtureBatchEndpoint = HttpApiEndpoint.post(
   'assortmentRulesFixtureBatch',
@@ -162,4 +174,8 @@ export const ShellAuthenticationApi = HttpApi.make('shellAuthenticationApi')
   .add(ShellBrowserApi.groups.accessAdminChanges)
   .add(ShellBrowserApi.groups.accessAdminApprovals)
   .add(ShellBrowserApi.groups.accessAdminExplain)
-  .add(SymmyIngressGroup);
+  .add(SymmyIngressGroup)
+  // Payment gateway relay (#1157): typed PSP notification and reconciliation driver ingress.
+  .add(PaymentNotificationsGroup.middleware(PaymentNotificationBoundary))
+  // The reconciliation driver is not part of Shell's callable OpenAPI surface.
+  .add(PaymentReconciliationGroup.annotate(OpenApi.Exclude, true).middleware(PaymentReconciliationBoundary));

@@ -7,6 +7,7 @@ import { Cause, Crypto, DateTime, Effect, Exit, Layer, Option, Predicate, Schema
 import { TestClock } from 'effect/testing';
 import { describe, expect, it } from 'effect-rstest';
 
+import type { PaymentPayerContact } from '../../shared/domain/payment-payer-contact.ts';
 import type { PaymentGatewayProviderFamilySchema } from '../../shared/domain/payment-vocabulary.ts';
 import type { ProviderNotSentReason } from '../../shared/domain/psp-vocabulary.ts';
 import { GatewayBindingResolver } from '../../src/integrations/psp/binding-resolver.ts';
@@ -37,8 +38,17 @@ import type {
   GatewayProviderUnavailableError,
   GatewayProviderUnsupportedError,
 } from '../../src/integrations/psp/psp-errors.ts';
-import { GatewayExecutionTargetSchema, ProviderObjectRefSchema } from '../../src/integrations/psp/psp-request.ts';
-import type { GatewayExecutionTarget, ProviderObjectRef } from '../../src/integrations/psp/psp-request.ts';
+import {
+  GatewayExecutionTargetSchema,
+  GatewayRefundBaselineSchema,
+  ProviderObjectRefSchema,
+} from '../../src/integrations/psp/psp-request.ts';
+import type {
+  GatewayExecutionTarget,
+  GatewayPayerContact,
+  GatewayRefundBaseline,
+  ProviderObjectRef,
+} from '../../src/integrations/psp/psp-request.ts';
 import { PreparedProviderRequestSchema, ProviderFindingResultSchema } from '../../src/integrations/psp/psp-result.ts';
 import type { PreparedProviderRequest, ProviderDispatchResponse } from '../../src/integrations/psp/psp-result.ts';
 
@@ -102,6 +112,8 @@ interface OperationSpec {
   readonly materialHash?: string;
   readonly operationId: string;
   readonly outcome?: string;
+  /** The payer contact row `psp_read_operation_for_execution` returns for this operation. */
+  readonly payerContact?: PaymentPayerContact;
   readonly targetOperationId?: string;
 }
 
@@ -164,7 +176,11 @@ interface ProviderCall {
   readonly family: Family;
   readonly kind: 'LOOKUP' | 'PREPARE_CANCEL' | 'PREPARE_COLLECT' | 'PREPARE_REFUND' | 'REPLAY' | 'SEND';
   readonly operationId: string;
+  /** The payer contact a COLLECT prepare received. */
+  readonly payerContact?: Option.Option<GatewayPayerContact>;
   readonly providerTarget?: ProviderObjectRef;
+  /** The refund baseline a SEND received with its prepared request. */
+  readonly refundBaseline?: Option.Option<GatewayRefundBaseline>;
 }
 
 type AnyProviderFailure =
@@ -217,8 +233,10 @@ const operationRow = (world: World, spec: OperationSpec & { cancelOperationExist
       compositionRevision: 'd'.repeat(64),
     },
   };
+  const contacted = spec.payerContact === undefined ? result : { ...result, payerContact: spec.payerContact };
   return {
-    result: spec.targetOperationId === undefined ? result : { ...result, targetOperationId: spec.targetOperationId },
+    result:
+      spec.targetOperationId === undefined ? contacted : { ...contacted, targetOperationId: spec.targetOperationId },
   };
 };
 
@@ -286,6 +304,10 @@ const resolverOf = (world: World) =>
     resolveForNotification: () => Effect.die('The executor never resolves notifications'),
   });
 
+const GOPAY_REFUND_BASELINE: GatewayRefundBaseline = Schema.decodeUnknownSync(GatewayRefundBaselineSchema)({
+  rowIds: ['4493293835'],
+});
+
 const preparedOf = (family: Family, operationId: string, kind: string): PreparedProviderRequest => {
   const { idempotencyKey, orderReference } = deriveProviderCorrelation(operationId);
   const stripe = family === 'STRIPE';
@@ -296,6 +318,8 @@ const preparedOf = (family: Family, operationId: string, kind: string): Prepared
     headers: [{ name: 'content-type', value: 'application/x-www-form-urlencoded' }],
     idempotencyKey: stripe ? Option.some(idempotencyKey) : Option.none(),
     orderReference,
+    // A GoPay refund prepare reads the payment's refund history first (here: one earlier refund row).
+    refundBaseline: family === 'GOPAY' && kind === 'REFUND' ? Option.some(GOPAY_REFUND_BASELINE) : Option.none(),
     replayWindowMs: stripe ? Option.some(86_400_000) : Option.none(),
     requestHash: `${operationId.slice(-1).repeat(63)}0`,
   });
@@ -409,8 +433,9 @@ const adapterOf = (world: World, family: Family): GatewayProviderAdapter => {
         () => preparedOf(family, request.operationId, 'CANCEL'),
       ).pipe(Effect.catchTag('GatewayProviderOutcomeUnknown', (failure) => Effect.die(failure))),
     prepareCollect: (_target, request) =>
-      run({ family, kind: 'PREPARE_COLLECT', operationId: request.operationId }, () =>
-        preparedOf(family, request.operationId, 'COLLECT'),
+      run(
+        { family, kind: 'PREPARE_COLLECT', operationId: request.operationId, payerContact: request.payerContact },
+        () => preparedOf(family, request.operationId, 'COLLECT'),
       ).pipe(Effect.catchTag('GatewayProviderOutcomeUnknown', (failure) => Effect.die(failure))),
     prepareRefund: (_target, request) =>
       run(
@@ -422,8 +447,11 @@ const adapterOf = (world: World, family: Family): GatewayProviderAdapter => {
       run({ family, kind: 'REPLAY', operationId: expected.operationId }, () => request).pipe(
         Effect.andThen(respond({ family, kind: 'REPLAY', operationId: expected.operationId })),
       ),
-    send: (_target, _prepared, expected) =>
-      run({ family, kind: 'SEND', operationId: expected.operationId }, () => expected).pipe(
+    send: (_target, prepared, expected) =>
+      run(
+        { family, kind: 'SEND', operationId: expected.operationId, refundBaseline: prepared.refundBaseline },
+        () => expected,
+      ).pipe(
         Effect.andThen(respond({ family, kind: 'SEND', operationId: expected.operationId })),
         Effect.catchTag('GatewayProviderUnsupported', (failure) => Effect.die(failure)),
       ),
@@ -459,6 +487,7 @@ const recordOf = (
     providerFamily: identity.target.binding.providerFamily,
     providerPaymentRef: Option.none(),
     providerRefundRef: Option.none(),
+    refundBaseline: Option.none(),
     replayExpiresAt: Option.none(),
     replayStartsAt: Option.none(),
     requestBody: Option.none(),
@@ -503,11 +532,14 @@ const unresolvedRefundOf = (paymentRef: ProviderObjectRef) => (row: ProviderDisp
   Option.exists(row.providerPaymentRef, (ref) => sameRef(ref, paymentRef)) &&
   (row.state === 'PREPARED' || row.state === 'OUTCOME_UNKNOWN' || row.state === 'ACKNOWLEDGED');
 
+const refundDispatchesOf = (world: World, paymentRef: ProviderObjectRef) =>
+  [...world.dispatches.values()].filter(
+    (row) => row.operationKind === 'REFUND' && Option.exists(row.providerPaymentRef, (ref) => sameRef(ref, paymentRef)),
+  ).length;
+
 const ledgerOf = (world: World): ProviderDispatchLedgerContract => ({
   correlateUnknown: () => Effect.die('unused'),
-  hasUnresolvedRefund: ({ providerPaymentRef }) =>
-    Effect.sync(() => [...world.dispatches.values()].some(unresolvedRefundOf(providerPaymentRef))),
-  prepare: ({ identity, prepared, returnToken }) =>
+  prepare: ({ identity, prepared, refundDispatchCount, returnToken }) =>
     Effect.gen(function* prepareFake() {
       const now = yield* DateTime.now;
       const existing = world.dispatches.get(identity.operationId);
@@ -517,12 +549,25 @@ const ledgerOf = (world: World): ProviderDispatchLedgerContract => ({
           : { _tag: 'CONFLICT' as const, existing };
       }
       const targetRef = identity.targetOperationId.pipe(Option.flatMap((target) => paymentRefOf(world, target)));
+      // As psp_prepare_dispatch: a GoPay baseline goes with the count it was read under; a changed count is stale.
+      if (Option.isSome(prepared.refundBaseline) !== Option.isSome(refundDispatchCount)) {
+        return yield* Effect.die('a GoPay refund baseline travels with its refund dispatch count, nothing else does');
+      }
+      if (
+        Option.exists(
+          Option.all([refundDispatchCount, targetRef]),
+          ([count, ref]) => count !== refundDispatchesOf(world, ref),
+        )
+      ) {
+        return { _tag: 'REFUND_BASELINE_STALE' as const };
+      }
       const replay = Option.isSome(prepared.replayWindowMs);
       const record = recordOf(identity, 'PREPARED', {
         endpointRef: Option.some(prepared.endpointRef),
         idempotencyKeyHash: prepared.idempotencyKey.pipe(Option.map(idempotencyKeyHashOf)),
         preparedAt: Option.some(now),
         providerPaymentRef: targetRef,
+        refundBaseline: prepared.refundBaseline,
         replayExpiresAt: replay ? Option.some(DateTime.add(now, { milliseconds: 86_400_000 })) : Option.none(),
         replayStartsAt: replay ? Option.some(now) : Option.none(),
         requestBody: replay ? Option.some(prepared.body) : Option.none(),
@@ -554,6 +599,11 @@ const ledgerOf = (world: World): ProviderDispatchLedgerContract => ({
   recordRejected: ({ operationId }) => update(world, operationId, { state: 'REJECTED_BEFORE_EFFECT' }),
   recordTargetUnresolved: ({ operationId }) => update(world, operationId, { state: 'TARGET_UNRESOLVED' }),
   recordUnsupported: ({ identity }) => recordUnsent(world, identity, 'UNSUPPORTED', Option.none()),
+  refundSerialization: ({ providerPaymentRef }) =>
+    Effect.sync(() => ({
+      refundDispatchCount: refundDispatchesOf(world, providerPaymentRef),
+      unresolved: [...world.dispatches.values()].some(unresolvedRefundOf(providerPaymentRef)),
+    })),
   registerCancel: ({ cancel }) =>
     Effect.sync(() => {
       const existing = world.dispatches.get(cancel.operationId);
@@ -640,6 +690,9 @@ const sends = (world: World, kind: ProviderCall['kind'] = 'SEND') =>
 const factsOf = (world: World) => world.evidence.map((stored) => [stored.operationId, stored.evidence.factKind]);
 
 const at = (millisAfterRequest: number) => TestClock.setTime(DateTime.toEpochMillis(REQUESTED_AT) + millisAfterRequest);
+
+const prepareContacts = (world: World) =>
+  world.calls.filter((call) => call.kind === 'PREPARE_COLLECT').map((call) => call.payerContact);
 
 const collectSpec = (family: Family): OperationSpec => ({ family, kind: 'COLLECT', operationId: COLLECT_ID });
 const cancelSpec = (family: Family): OperationSpec => ({
@@ -881,6 +934,35 @@ describe('#1156 #1158 Gateway operation executor', () => {
     }),
   );
 
+  it.effect('#1158 A GoPay refund commits its pre-dispatch refund baseline with the request before the send', () =>
+    Effect.gen(function* gopayRefundBaseline() {
+      yield* at(0);
+      const refund: OperationSpec = {
+        family: 'GOPAY',
+        kind: 'REFUND',
+        operationId: REFUND_ID,
+        targetOperationId: COLLECT_ID,
+      };
+      const world = withOperations(newWorld(), collectSpec('GOPAY'), refund);
+      expect(Exit.isSuccess(yield* deliver(world, collectSpec('GOPAY')))).toBe(true);
+      // The prepare commit is the durable handoff: a crash while the request is in flight finds the baseline
+      // already committed on the row, and the request that left carried exactly that baseline.
+      world.failures.set('GOPAY:SEND', () => Effect.die('process crashed after the request left'));
+      expect(Exit.isFailure(yield* deliver(world, refund))).toBe(true);
+      expect(world.dispatches.get(REFUND_ID)?.refundBaseline).toEqual(Option.some(GOPAY_REFUND_BASELINE));
+      expect(world.calls.filter((call) => call.operationId === REFUND_ID)).toEqual([
+        { family: 'GOPAY', kind: 'PREPARE_REFUND', operationId: REFUND_ID, providerTarget: PAYMENT_REFS.GOPAY },
+        { family: 'GOPAY', kind: 'SEND', operationId: REFUND_ID, refundBaseline: Option.some(GOPAY_REFUND_BASELINE) },
+      ]);
+      // Redelivery never prepares (so never re-reads a baseline) and never resends.
+      world.failures.delete('GOPAY:SEND');
+      expect(Exit.isSuccess(yield* deliver(world, refund))).toBe(true);
+      expect(sends(world, 'PREPARE_REFUND')).toBe(1);
+      expect(world.calls.filter((call) => call.kind === 'SEND' && call.operationId === REFUND_ID)).toHaveLength(1);
+      expect(world.dispatches.get(REFUND_ID)?.state).toBe('OUTCOME_UNKNOWN');
+    }),
+  );
+
   it.effect('#1158 A Stripe refund names the PaymentIntent its confirmed checkout session paid', () =>
     Effect.gen(function* stripeRefundTarget() {
       yield* at(0);
@@ -1007,6 +1089,36 @@ describe('#1156 #1158 Gateway operation executor', () => {
       expect(world.dispatches.get(COLLECT_ID)?.notSentReason).toEqual(Option.some('PREPARE_UNAVAILABLE'));
       expect(factsOf(world)).toEqual([[COLLECT_ID, 'COLLECTION_NOT_EFFECTED']]);
       expect(sends(world)).toBe(0);
+      // The routine returned no contact row, so every prepare received none.
+      expect(prepareContacts(world)).toEqual([Option.none(), Option.none(), Option.none(), Option.none()]);
+    }),
+  );
+
+  it.effect('#1154 A Comgate collect prepares with the payer contact the routine returns', () =>
+    Effect.gen(function* comgateContactFromRoutine() {
+      yield* at(0);
+      const contact = { email: 'payer@example.test', fullName: 'Test Payer', phone: '+420700000000' };
+      const world = withOperations(newWorld(), { ...collectSpec('COMGATE'), payerContact: contact });
+      expect(Exit.isSuccess(yield* deliver(world, collectSpec('COMGATE')))).toBe(true);
+      expect(prepareContacts(world)).toEqual([
+        Option.some({
+          email: Option.some(contact.email),
+          fullName: Option.some(contact.fullName),
+          phone: Option.some(contact.phone),
+        }),
+      ]);
+      expect(stateOf(world, COLLECT_ID)).toBe('ACKNOWLEDGED');
+    }),
+  );
+
+  it.effect('#1153 H1094-01=A A GoPay or Stripe collect prepares without a payer contact', () =>
+    Effect.gen(function* contactPerFamily() {
+      yield* at(0);
+      for (const family of ['GOPAY', 'STRIPE'] as const) {
+        const world = withOperations(newWorld(), collectSpec(family));
+        expect(Exit.isSuccess(yield* deliver(world, collectSpec(family)))).toBe(true);
+        expect(prepareContacts(world)).toEqual([Option.none()]);
+      }
     }),
   );
 
