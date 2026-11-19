@@ -45,8 +45,8 @@ const initialRef = reference('party-match-decision', '33333333-3333-4333-8333-33
 const reviewedRef = reference('party-match-decision', '44444444-4444-4444-8444-444444444444');
 const partyRef = reference('party', '55555555-5555-4555-8555-555555555555');
 const candidate = {
+  displayName: 'Unit-only reviewed human customer',
   evidenceRefs: ['unit-attestation'],
-  firstName: 'Unit-only reviewed human customer',
   officialIdentifiers: [],
   partyType: 'PERSON',
   provenance: { method: 'DIRECT_INTERACTION', source: 'unit-only' },
@@ -235,7 +235,7 @@ it.effect('refuses MATCHED_EXISTING with the actual typed outcome and reason', (
 it.effect('refuses a different case candidate before review', () =>
   Effect.gen(function* wrongCandidate() {
     rs.mocked(executeDuplicateCandidateDetailWithAuthorization).mockReturnValue(
-      Effect.succeed({ ...detail, candidate: { ...detail.candidate, firstName: 'Another subject' } }),
+      Effect.succeed({ ...detail, candidate: { ...detail.candidate, displayName: 'Another subject' } }),
     );
     const failure = yield* setup().pipe(
       Effect.flip,
@@ -312,6 +312,7 @@ it.effect('keeps review execution authority in manager setup and out of service 
     expect(nativeKeys).not.toContain('party.registry.resolve-duplicate-candidate-create');
     expect(source).toContain("const partySetupActionKeys = ['party.registry.resolve-duplicate-candidate-create']");
     expect(source).toContain('actionKeys: [...nativeActionKeys, ...identitySetupActionKeys, ...partySetupActionKeys]');
+    expect(source).toContain('actionKeys: nativeActionKeys');
     expect(source).toContain('authorize: (legalEntity) => signBuyer(partyAudience, legalEntity, false)');
   }),
 );
@@ -449,7 +450,7 @@ for (const field of ['counterpartyProvenance', 'customerEvidence']) {
   );
 }
 
-it.effect('grants module credentials no Core permission between onboarding and profile creation', () =>
+it.effect('grants only the actual onboarded Counterparty to the CCC reader before profile creation', () =>
   Effect.gen(function* nativeCounterpartyReaderSetup() {
     const source = yield* Effect.tryPromise(() =>
       readFile(new URL('../support/preproposal-basis-native.ts', import.meta.url), 'utf-8'),
@@ -461,15 +462,21 @@ it.effect('grants module credentials no Core permission between onboarding and p
       "    const profileCredential = yield* authorize('operator', contextAudience);",
       onboardStart,
     );
-    const profileCreate = source.indexOf('    const profile = yield* requireExecutionResult(', profileCredential);
-    // A module call is admitted by its declared actor and the buyer's subject, so no service principal is granted.
-    const window = source.slice(onboardStart, profileCredential);
+    const profileCreate = source.indexOf(
+      '    const profile = yield* executeCreateCounterpartyPurchasingProfileWithAuthorization(',
+      profileCredential,
+    );
+    // CCC's preproposal identity is the Pricing issuer, so both service identities read the onboarded Counterparty.
+    const grant =
+      "    yield* core.grantResourceAccess(counterparty.counterpartyRef, identities.cccReader.principalId, 'reader');\n" +
+      "    yield* core.grantResourceAccess(counterparty.counterpartyRef, identities.pricingIssuer.principalId, 'reader');";
+    const grantPosition = source.indexOf(grant);
     expect(onboardStart).toBeGreaterThanOrEqual(0);
-    expect(profileCredential).toBeGreaterThan(onboardStart);
+    expect(grantPosition).toBeGreaterThan(onboardStart);
+    expect(profileCredential).toBeGreaterThan(grantPosition);
     expect(profileCreate).toBeGreaterThan(profileCredential);
-    expect(window).not.toContain('identities.cccReader.principalId');
-    expect(window).not.toContain('identities.pricingIssuer.principalId');
-    expect(window.match(/core\.grantResourceAccess\(/gu)).toBeNull();
+    expect(source.slice(onboardStart, profileCredential).trimEnd().endsWith(grant.trim())).toBe(true);
+    expect(source.slice(onboardStart, profileCredential).match(/core\.grantResourceAccess\(/gu)).toHaveLength(2);
   }),
 );
 
