@@ -175,11 +175,13 @@ it.effect(
         'pricing',
         'privacy',
         'storefront-registry',
+        'symmy-integration',
         'tax',
         'projects',
         'commerce-cart',
         'commerce-order',
         'payment',
+        'promotion',
       ]);
       // Controller metadata is asserted at its actual source inventory, rather than its former inline location.
       expect(
@@ -205,7 +207,9 @@ it.effect(
         'pricing',
         'privacy',
         'projects',
+        'promotion',
         'storefront_registry',
+        'symmy_integration',
         'tax',
         'trust',
       ]);
@@ -253,11 +257,25 @@ it.effect(
           verifierPaths: ['verticals/pricing/scripts/verify-db-schema.mts'],
         },
         {
+          journalName: '__drizzle_migrations_promotion',
+          ownerId: 'promotion',
+          runtimeIdentityIds: ['shared_runtime'],
+          schemas: ['promotion'],
+          verifierPaths: ['verticals/promotion/scripts/verify-db-schema.mts'],
+        },
+        {
           journalName: '__drizzle_migrations_storefront_registry',
           ownerId: 'storefront-registry',
           runtimeIdentityIds: ['shared_runtime'],
           schemas: ['storefront_registry'],
           verifierPaths: ['verticals/storefront-registry/scripts/verify-db-schema.mts'],
+        },
+        {
+          journalName: '__drizzle_migrations_symmy_integration',
+          ownerId: 'symmy-integration',
+          runtimeIdentityIds: ['shared_runtime'],
+          schemas: ['symmy_integration'],
+          verifierPaths: ['verticals/symmy-integration/scripts/verify-db-schema.mts'],
         },
       ]) {
         const matching = inventory.filter(({ ownerId }) => ownerId === expected.ownerId);
@@ -274,6 +292,9 @@ it.effect(
             (requirement) => requirement.migrationName === '20261020063004_dedicated-identity-core-policies',
           )?.identityIds,
       ).toEqual(['shared_runtime', 'party_registry_request', 'party_registry_worker']);
+      expect(inventory.find((owner) => owner.ownerId === 'promotion')?.prerequisites).toEqual([
+        { migrate: true, ownerId: coreOwner, verify: true },
+      ]);
       const coreStreams = inventory.filter((owner) => owner.ownerId === coreOwner);
       expect(coreStreams).toHaveLength(1);
       for (const core of coreStreams) {

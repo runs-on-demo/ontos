@@ -17,7 +17,9 @@ import type {
 } from '@modern-js/app-tools-extensions/release-envelope/framework-output';
 import { resolveUltramodernReleaseIdentity } from '@modern-js/app-tools-extensions/release-identity';
 import type { defineEffectBff } from '@modern-js/bff-effect/effect-edge';
+import { NodeServices } from '@effect/platform-node';
 import { Cause, Effect, Predicate, Schema } from 'effect';
+import { ChildProcess } from 'effect/process';
 import { describe, afterEach, expect, it, rs } from 'effect-rstest';
 import { transform } from 'esbuild';
 
@@ -34,6 +36,7 @@ import {
 import type { MicroVerticalApiBaselineExpectation } from '@modern-js/code-tools/microvertical-api-boundary';
 import { strictEffectRuntimeTopologyViolation } from '@modern-js/code-tools/strict-effect-runtime';
 import { ReleaseUiSchema } from './release-envelope-ui.fixture.mts';
+import { collectToolingProcess } from './tooling-process-fixture.mts';
 
 const workspaceRoot = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -653,8 +656,8 @@ it.live(
         cwd: workspaceRoot,
       }),
     );
-    expect(preparationOutput).toContain('Validating Effect-enabled tsrs 0.21.0-ts7.1.0-beta');
-    expect(preparationOutput).toContain('7.1.0-beta+effect-tsgo.0.67.0');
+    expect(preparationOutput).toContain('Validating Effect-enabled tsrs 0.25.0-ts7.1.0-beta');
+    expect(preparationOutput).toContain('7.1.0-beta+effect-tsgo.0.69.0');
   }),
 );
 
@@ -2737,6 +2740,30 @@ it.live(
 );
 
 it.live(
+  'actual Promotion readiness satisfies both framework and repository composition checks',
+  Effect.fn(function* promotionReadinessConsistency() {
+    const contract = yield* Effect.promise(() =>
+      readFile(path.join(workspaceRoot, 'verticals/promotion/shared/api.ts'), 'utf-8'),
+    );
+    const runtime = yield* Effect.promise(() =>
+      readFile(path.join(workspaceRoot, 'verticals/promotion/api/index.ts'), 'utf-8'),
+    );
+    expect(yield* microVerticalApiBaselineViolation('promotion', contract)).toBe(undefined);
+    expect(hasValidGovernedHttpCompositionRoot(contract, runtime)).toBe(true);
+    const incompatibleAlias = contract
+      .replace("import { identity } from 'effect';", "import { identity as governedHttpApiIdentity } from 'effect';")
+      .replace('.pipe(identity)', '.pipe(governedHttpApiIdentity)');
+    expect(yield* microVerticalApiBaselineViolation('promotion', incompatibleAlias)).toMatch(
+      /explicitly compose its readiness foundation API/u,
+    );
+    const missingFoundation = contract.replace('.addHttpApi(promotionFoundationApi)', '');
+    expect(yield* microVerticalApiBaselineViolation('promotion', missingFoundation)).toMatch(
+      /explicitly compose its readiness foundation API/u,
+    );
+  }),
+);
+
+it.live(
   'static validation rejects a MicroVertical root contract without readiness baseline',
   Effect.fn(function* mergedScenario1() {
     const contract = yield* Effect.promise(() =>
@@ -3388,24 +3415,33 @@ globalThis.fetch = input => {
       ),
     );
     const reportPath = path.join(fixture, 'proof.json');
-    runNode(
-      [
-        '--import',
-        pathToFileURL(fetchMockPath).href,
-        path.join(generatorRoot, 'templates/workspace-scripts/proof-cloudflare-version.mjs'),
-        '--app',
-        apiOnlyId,
-        '--require-public-urls',
-        '--out',
-        reportPath,
-      ],
-      {
-        env: {
-          ULTRAMODERN_PUBLIC_URL_PAYMENT_TERM_CATALOG: publicUrl,
-          ULTRAMODERN_WORKSPACE_ROOT: workspaceRoot,
+    const result = yield* collectToolingProcess(
+      ChildProcess.make(
+        process.execPath,
+        [
+          '--import',
+          pathToFileURL(fetchMockPath).href,
+          path.join(generatorRoot, 'templates/workspace-scripts/proof-cloudflare-version.mjs'),
+          '--app',
+          apiOnlyId,
+          '--require-public-urls',
+          '--out',
+          reportPath,
+        ],
+        {
+          cwd: workspaceRoot,
+          env: {
+            ULTRAMODERN_PUBLIC_URL_PAYMENT_TERM_CATALOG: publicUrl,
+            ULTRAMODERN_WORKSPACE_ROOT: workspaceRoot,
+          },
+          extendEnv: true,
+          stderr: 'pipe',
+          stdin: 'ignore',
+          stdout: 'pipe',
         },
-      },
-    );
+      ),
+    ).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+    expect(result.status, result.stderr).toBe(0);
     const requestedSource = yield* Effect.promise(() => readFile(requestedPath, 'utf-8'));
     const requested = requestedSource.trimEnd().split('\n');
     // An API-only contract has no SSR or Module Federation route to probe: only its readiness route.
@@ -3509,27 +3545,6 @@ describe('consumer migration preserves native tooling and governed safety', () =
           partyId,
         ),
       ).toBe(false);
-      // Exercise the complete Core/Party server, client, permission and transport negative matrix.
-      const governed = spawnSync(
-        process.execPath,
-        [
-          path.join(workspaceRoot, 'node_modules/@rstest/core/bin/rstest.js'),
-          'run',
-          '--project',
-          'scripts',
-          'scripts/tests/module-entrypoint-boundaries.test.mts',
-          '--testNamePattern',
-          'governed',
-        ],
-        {
-          cwd: workspaceRoot,
-          encoding: 'utf-8',
-          env: { PATH: path.dirname(process.execPath) },
-        },
-      );
-      expect(governed.status, governed.stdout + governed.stderr).toBe(0);
-      expect(governed.stdout).toMatch(/governed servers bind/u);
-      expect(governed.stdout).toMatch(/rejects generated governed clients/u);
     }),
   );
 });
