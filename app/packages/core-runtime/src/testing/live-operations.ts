@@ -898,13 +898,13 @@ const grantFixtureContextPermissionAccess = Effect.fn('LiveOperations.grantConte
   },
 );
 
-interface FixtureConfiguredModuleState<State = 'active' | 'suspended' | 'read_only'> {
+interface FixtureConfiguredModuleState {
   readonly moduleKey: string;
-  readonly state: State;
+  readonly state: 'active' | 'suspended';
 }
-type FixtureConfiguredModuleStateSetter = <State extends FixtureConfiguredModuleState['state']>(
-  ...request: [moduleKey: string, state: State]
-) => Effect.Effect<FixtureConfiguredModuleState<State>, LiveOperationFixtureError>;
+type FixtureConfiguredModuleStateSetter = (
+  ...request: [moduleKey: string, state: 'active' | 'suspended']
+) => Effect.Effect<FixtureConfiguredModuleState, LiveOperationFixtureError>;
 
 const invalidConfiguredFixtureModuleState = (cause?: unknown) =>
   fixtureFailure('Invalid configured fixture module state mutation', cause);
@@ -913,14 +913,14 @@ const makeFixtureConfiguredModuleStateSetter = (
   adminConfiguration: Effect.Success<ReturnType<typeof parseFixtureDatabaseConfig>>,
   { moduleKeys, tenantId }: { readonly moduleKeys: ReadonlySet<string>; readonly tenantId: string },
 ): FixtureConfiguredModuleStateSetter =>
-  Effect.fn('LiveOperations.setConfiguredModuleState')(function* setConfiguredModuleState<
-    State extends FixtureConfiguredModuleState['state'],
-  >(...request: [moduleKey: string, state: State]) {
+  Effect.fn('LiveOperations.setConfiguredModuleState')(function* setConfiguredModuleState(
+    ...request: Parameters<FixtureConfiguredModuleStateSetter>
+  ) {
     const [moduleKey, state] = yield* Schema.decodeUnknownEffect(
       Schema.Tuple([ServiceFixtureModuleKeySchema, TenantModuleStateSchema]),
       { onExcessProperty: 'error' },
     )(request).pipe(Effect.mapError(invalidConfiguredFixtureModuleState));
-    if (!moduleKeys.has(moduleKey) || (state !== 'active' && state !== 'suspended' && state !== 'read_only')) {
+    if (!moduleKeys.has(moduleKey) || (state !== 'active' && state !== 'suspended')) {
       return yield* invalidConfiguredFixtureModuleState();
     }
     return yield* Effect.scoped(
@@ -945,8 +945,7 @@ const makeFixtureConfiguredModuleStateSetter = (
                   .returning({
                     moduleKey: tenantModuleStates.moduleKey,
                     tenantId: tenantModuleStates.tenantId,
-                  })
-                  .pipe(Effect.withSpan('LiveOperations.setConfiguredModuleState'));
+                  });
                 if (changed.length !== 1 || changed[0]?.tenantId !== tenantId || changed[0]?.moduleKey !== moduleKey) {
                   return yield* fixtureFailure(
                     'Configured fixture module state update did not match exactly one existing row',
@@ -969,7 +968,7 @@ const makeFixtureConfiguredModuleStateSetter = (
                 ) {
                   return yield* fixtureFailure('Configured fixture module state readback did not match the update');
                 }
-                return { moduleKey: row.moduleKey, state: request[1] };
+                return { moduleKey: row.moduleKey, state: row.state };
               },
             ),
           )
