@@ -179,9 +179,8 @@ it.live('cancels a native KV stream that arrives after timeout and handles cance
   Effect.gen(function* delayedSnapshotAcquisition() {
     const delayedProbeWorker = `
 import { env } from 'cloudflare:workers';
-import { Effect, Fiber } from 'effect';
+import { Effect } from 'effect';
 import { ActiveApplicationCompositionSourceLive } from ${JSON.stringify(sourceModule)};
-import * as TestClock from 'effect/testing/TestClock';
 import { ActiveApplicationCompositionSource } from ${JSON.stringify(sourceService)};
 
 export default {
@@ -189,47 +188,33 @@ export default {
     const binding = env.${BINDING};
     const originalGet = binding.get.bind(binding);
     let cancellationStarted = false;
-    // Until the cancelling read runs, no cancellation has rejected.
-    let cancellation = Promise.resolve();
-    let releaseStream = () => {};
-    // The KV value only arrives once the bounded read has already failed, so the late stream is
-    // ordered by the read's own completion rather than by outlasting a duration.
-    const arrival = new Promise((resolve) => {
-      releaseStream = resolve;
-    });
+    let cancellationRejected = false;
     let pendingRead = Promise.resolve(null);
     binding.get = (key, type) => {
       pendingRead = originalGet(key, type).then(async (stream) => {
         if (stream !== null) {
           const originalCancel = stream.cancel.bind(stream);
-          stream.cancel = () => {
+          stream.cancel = async () => {
             cancellationStarted = true;
-            cancellation = originalCancel().then(() => {
-              throw new Error('fixture cancellation rejection');
-            });
-            return cancellation;
+            await originalCancel();
+            cancellationRejected = true;
+            throw new Error('fixture cancellation rejection');
           };
         }
-        await arrival;
+        await new Promise((resolve) => setTimeout(resolve, 5100));
         return stream;
       });
       return pendingRead;
     };
     const result = await Effect.runPromise(
-      Effect.gen(function* timeOutRead() {
-        const fiber = yield* ActiveApplicationCompositionSource.pipe(
-          Effect.flatMap(({ load }) => load),
-          Effect.provide(ActiveApplicationCompositionSourceLive),
-          Effect.match({ onFailure: (error) => ({ failure: error.reason }), onSuccess: (snapshot) => ({ snapshot }) }),
-          Effect.forkChild,
-        );
-        yield* TestClock.adjust('5 seconds');
-        return yield* Fiber.join(fiber);
-      }).pipe(Effect.provide(TestClock.layer())),
+      ActiveApplicationCompositionSource.pipe(
+        Effect.flatMap(({ load }) => load),
+        Effect.provide(ActiveApplicationCompositionSourceLive),
+        Effect.match({ onFailure: (error) => ({ failure: error.reason }), onSuccess: (snapshot) => ({ snapshot }) }),
+      ),
     );
-    releaseStream();
     await pendingRead;
-    const cancellationRejected = await cancellation.then(() => false, () => true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
     return Response.json({ ...result, cancellationStarted, cancellationRejected });
   },
 };

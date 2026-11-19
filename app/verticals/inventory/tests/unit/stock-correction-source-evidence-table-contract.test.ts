@@ -4,7 +4,11 @@ import { describe, expect, it } from 'effect-rstest';
 import {
   inventoryStockCorrectionSourceEvidence,
   inventoryStockCorrectionSourceEvidenceCoverage,
+  inventoryStockCorrectionSourceEvidenceCoverageCompletenessContract,
   inventoryStockCorrectionSourceEvidenceCurrent,
+  inventoryStockCorrectionSourceEvidenceCurrentOrderContract,
+  inventoryStockCorrectionSourceEvidenceImmutabilityContract,
+  inventoryStockCorrectionSourceEvidenceScopeVerifierContract,
 } from '../../src/persistence/stock-correction-source-evidence-table.ts';
 
 describe('Stock Correction source evidence table contract', () => {
@@ -33,6 +37,16 @@ describe('Stock Correction source evidence table contract', () => {
       'inventory_stock_correction_source_evidence_current_evidence_fk',
     );
     expect(current.policies.map((policy) => policy.for)).toEqual(['select', 'insert', 'update', 'delete']);
+    expect(inventoryStockCorrectionSourceEvidenceScopeVerifierContract).toMatchObject({
+      businessTime: 'AT_OR_AFTER_AUTHORITY_SELECTION',
+      event: 'INSERT',
+      selectedAuthority: 'ONTOS_WMS_WITH_STOCK_CORRECTION_SUPPORTED',
+      timing: 'BEFORE',
+    });
+    expect(inventoryStockCorrectionSourceEvidenceImmutabilityContract.tables).toEqual([
+      'inventory.stock_correction_source_evidence',
+      'inventory.stock_correction_source_evidence_coverage',
+    ]);
   });
 
   it('persists evidence-bound coverage and an immutable owner-sortable current-order proof', () => {
@@ -46,6 +60,15 @@ describe('Stock Correction source evidence table contract', () => {
         'inventory_stock_correction_source_evidence_source_reference_uk',
       ]),
     );
+    expect(inventoryStockCorrectionSourceEvidenceCoverageCompletenessContract).toMatchObject({
+      mode: 'DEFERRABLE INITIALLY DEFERRED',
+      relation: 'BIJECTION',
+    });
+    expect(inventoryStockCorrectionSourceEvidenceCurrentOrderContract).toMatchObject({
+      event: 'INSERT OR UPDATE OR DELETE',
+      ordering: 'LEXICOGRAPHIC',
+      orderingEvidenceKind: 'OWNER_ORDER_KEY',
+    });
     expect(evidenceColumns).not.toContain('is_current');
     expect(evidenceColumns).not.toContain('current');
   });

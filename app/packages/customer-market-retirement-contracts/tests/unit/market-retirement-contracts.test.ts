@@ -7,7 +7,9 @@ import {
   MarketAffectedUseSourceEvidenceSchema,
   ReserveMarketRetirementPayloadSchema,
   ReserveMarketRetirementResultSchema,
+  executeMarketAffectedUseAssessment,
   executeMarketAffectedUseAssessmentWithAuthorization,
+  executeReserveMarketRetirement,
   executeReserveMarketRetirementWithAuthorization,
 } from '../../src/index.ts';
 
@@ -241,6 +243,8 @@ describe('Customer-owned Market retirement public contracts', () => {
         }),
       );
       expect(Exit.isFailure(actionExit)).toBe(true);
+      expect(executeMarketAffectedUseAssessment).toBeTypeOf('function');
+      expect(executeReserveMarketRetirement).toBeTypeOf('function');
     }),
   );
 });

@@ -5,6 +5,7 @@ import {
   AssortmentDiscoveryDisclosureContextSchema,
   AssortmentDiscoveryDisclosureCoverageSchema,
   AssortmentDiscoveryInclusionDecisionSchema,
+  AssortmentPartialDiscoveryResultSchema,
 } from '../../shared/domain/disclosure-contracts.ts';
 import {
   AssortmentSafeDiscoveryProjectionSchema,
@@ -202,5 +203,13 @@ it.effect('encodes only safe Product refs and cannot expose internal Partial met
         includedProductRefs: [productRef('product-b'), productRef('product-a')],
       }),
     ).toThrow();
+  }),
+);
+
+it.effect('keeps the internal Partial schema valid for accumulator output', () =>
+  Effect.gen(function* validatesAccumulatorOutput() {
+    const value = context();
+    const partial = yield* evaluate(value, [omit(productRef('product-c'), value)]);
+    expect(partial === undefined ? false : Schema.is(AssortmentPartialDiscoveryResultSchema)(partial)).toBe(true);
   }),
 );

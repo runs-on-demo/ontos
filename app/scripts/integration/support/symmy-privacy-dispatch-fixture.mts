@@ -15,7 +15,7 @@ import {
   buildProductOwner,
   buildProductWorker,
   encodeProductComposition,
-  nativePorts,
+  nativePort,
   productComposition,
   startProductOwner,
   startProductWorker,
@@ -49,7 +49,7 @@ const relayRules = [
 ];
 const receiptSchema = Schema.Struct({
   jobId: SymmyJobStatusResponseSchema.members[0].fields.jobId,
-  status: Schema.Literal('queued'),
+  status: Schema.Literal('admitted'),
 });
 const json = Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Json));
 
@@ -114,7 +114,14 @@ const bindKey = (
     values(${randomUUID()},${principal.tenantId},${principal.principalId},${STAFF_AUTHENTICATION_NAMESPACE_ID},'better_auth','api_key',${keyId},'active')`;
 
 export const makePrivacyDispatchNativeFixture = Effect.fn('PrivacyDispatchNative.fixture')(function* fixture() {
-  const ports = yield* nativePorts(['catalog', symmyApp, 'privacy', marketApp]);
+  const ports = new Map<string, number>();
+  for (const appId of ['catalog', symmyApp, 'privacy', marketApp]) {
+    let port = yield* nativePort;
+    while ([...ports.values()].includes(port)) {
+      port = yield* nativePort;
+    }
+    ports.set(appId, port);
+  }
   const backends = Object.fromEntries([...ports].map(([appId, port]) => [appId, `http://127.0.0.1:${port}/`]));
   const { contracts, snapshot } = yield* productComposition(backends);
   const isolated = yield* makeIsolatedNativeDatabaseFixture({
@@ -305,9 +312,10 @@ export const makePrivacyDispatchNativeFixture = Effect.fn('PrivacyDispatchNative
   });
   const client = yield* HttpClient.HttpClient;
   const submit = Effect.fn('PrivacyDispatchNative.submit')(function* submit(key: string) {
-    // The public products body: its name is the private intent the job retains until Privacy dispatches its erasure.
+    const plan = yield* planFor(key);
     const payload = {
-      products: [{ identifier: { type: 'sku', value: key }, name: privateIntentMarker, variants: [{}] }],
+      contractVersion: 'INTERNAL_C14',
+      plan: yield* Schema.encodeEffect(SymmyInternalExecutionPlanSchema)(plan),
     };
     const response = yield* client.post(`${shell.baseUrl}/api/symmy/v1/products/batch`, {
       body: yield* HttpBody.json(payload),
@@ -315,7 +323,7 @@ export const makePrivacyDispatchNativeFixture = Effect.fn('PrivacyDispatchNative
     });
     if (response.status !== 202) {
       return yield* new PrivacyDispatchNativeFailure({
-        reason: `Actual source admission refused with ${response.status}: ${yield* response.text}`,
+        reason: `Actual source admission refused with ${response.status}`,
       });
     }
     return { payload, receipt: yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknownEffect(receiptSchema))) };

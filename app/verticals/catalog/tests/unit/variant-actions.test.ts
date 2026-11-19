@@ -81,25 +81,15 @@ const context = (compositionRevision: string, overrides: Partial<TestVariantServ
   };
   return { reads, value };
 };
-/**
- * Every test here reads only the content-digest revision of one identical Application Composition
- * bundle, so the full decode/encode/digest/validate pass runs once for the whole file.
- */
-let cachedCatalogCompositionRevision: string | undefined;
-const catalogCompositionRevision = Effect.gen(function* catalogCompositionRevision() {
-  if (cachedCatalogCompositionRevision !== undefined) {
-    return cachedCatalogCompositionRevision;
-  }
-  const snapshot = yield* makeApplicationCompositionSnapshotFixture(['catalog'], ultramodernApiMarker.buildMarker);
-  cachedCatalogCompositionRevision = snapshot.composition.revision;
-  return snapshot.composition.revision;
-});
 
 describe('Variant Action handlers', () => {
   it.effect('creates only under trusted Tenant and records governed access', () =>
     Effect.gen(function* variantCreateTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         create: (input) =>
           Effect.sync(() => {
             expect(input.principalId).toBe(scope.principalId);
@@ -126,8 +116,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('rejects cross-tenant creation before persistence', () =>
     Effect.gen(function* variantCrossTenantTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {});
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {});
       const error = yield* handleCreateVariant(
         {
           classification: creationClassification('Wrong tenant', ['sheet']),
@@ -145,8 +138,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('rejects a cross-tenant parent before persistence', () =>
     Effect.gen(function* variantParentTenantTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {});
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {});
       const error = yield* handleCreateVariant(
         {
           classification: creationClassification('Wrong parent tenant', ['sheet']),
@@ -165,8 +161,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('maps concurrent identity collision to typed conflict', () =>
     Effect.gen(function* variantCollisionTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         create: () => Effect.succeed({ _tag: 'identity_conflict' }),
       });
       const error = yield* handleCreateVariant(
@@ -186,8 +185,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('retirement affects only its exact Variant and maps stale revision', () =>
     Effect.gen(function* variantRetireTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         retire: (input) =>
           Effect.sync(() => {
             expect(input.variantRef).toEqual(variantRef);
@@ -204,8 +206,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('passes semantic classification through to owner-local persistence', () =>
     Effect.gen(function* variantClassificationTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         change: (input) =>
           Effect.sync(() => {
             expect(input.classification).toBe('EVIDENCED_CORRECTION');
@@ -230,8 +235,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('decodes legacy change input but fails closed before persistence without Current Product evidence', () =>
     Effect.gen(function* legacyVariantChangeTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {});
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {});
       const error = yield* handleChangeVariant(
         {
           classification: 'EVIDENCED_RECORD_CORRECTION',
@@ -250,8 +258,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('returns the exact correction decision for durable result capture', () =>
     Effect.gen(function* variantDecisionCaptureTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         change: () => Effect.succeed({ _tag: 'changed', revision: 2, variant }),
       });
       const result = yield* handleChangeVariant(
@@ -277,8 +288,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('rejects a record correction without evidence naming the original data error', () =>
     Effect.gen(function* variantCorrectionEvidenceTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {});
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {});
       const error = yield* handleChangeVariant(
         {
           classification: 'EVIDENCED_RECORD_CORRECTION',
@@ -299,8 +313,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('fails closed when Cart cannot prove the complete open-selection impact', () =>
     Effect.gen(function* variantCorrectionSelectionTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         assessOpenSelectionImpact: () =>
           Effect.fail(
             new CatalogOpenSelectionImpactUnavailable({
@@ -328,9 +345,12 @@ describe('Variant Action handlers', () => {
 
   it.effect('preserves parent-correction intent and fails closed when current basis is unavailable', () =>
     Effect.gen(function* variantParentCorrectionTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
       const targetProductRef = { ...productRef, resourceId: '77777777-7777-4777-8777-777777777777' };
-      const run = context(compositionRevision, {
+      const run = context(compositionSnapshot.composition.revision, {
         change: (input) => {
           expect(input.classification).toBe('EVIDENCED_PARENT_CORRECTION');
           expect(input.targetProductRef).toEqual(targetProductRef);
@@ -361,8 +381,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('rejects cross-tenant parent correction before persistence', () =>
     Effect.gen(function* variantCrossTenantCorrectionTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {});
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {});
       const error = yield* handleChangeVariant(
         {
           classification: 'EVIDENCED_PARENT_CORRECTION',
@@ -381,8 +404,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('keeps retired and colliding reactivation outcomes typed', () =>
     Effect.gen(function* variantReactivationTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const retired = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const retired = context(compositionSnapshot.composition.revision, {
         change: () => Effect.succeed({ _tag: 'lifecycle_conflict' }),
       });
       const changeError = yield* handleChangeVariant(
@@ -398,7 +424,7 @@ describe('Variant Action handlers', () => {
       ).pipe(Effect.flip);
       expect(changeError).toMatchObject({ code: 'variant_action_conflict', conflict: 'LIFECYCLE' });
 
-      const collision = context(compositionRevision, {
+      const collision = context(compositionSnapshot.composition.revision, {
         reactivate: () => Effect.succeed({ _tag: 'identity_conflict' }),
       });
       const reactivateError = yield* handleReactivateVariant(
@@ -411,8 +437,11 @@ describe('Variant Action handlers', () => {
 
   it.effect('keeps an open-selection revalidation requirement distinct from a lifecycle conflict', () =>
     Effect.gen(function* variantSelectionRevalidationTest() {
-      const compositionRevision = yield* catalogCompositionRevision;
-      const run = context(compositionRevision, {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
+      const run = context(compositionSnapshot.composition.revision, {
         reactivate: () => Effect.succeed({ _tag: 'selection_revalidation_required' }),
       });
       const error = yield* handleReactivateVariant(

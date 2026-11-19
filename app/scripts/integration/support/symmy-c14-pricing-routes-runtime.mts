@@ -8,6 +8,7 @@ import {
   SymmyPriceReadProjectionConfigurationSchema,
 } from '@app/shell-super-app/testing/api-key-gateway-native';
 import {
+  SymmyInternalExecutionPlanSchema,
   SymmyRouteExecutionConfigurationSchema,
   SymmyJobRetentionPolicySchema,
   SymmyJobLifecyclePolicyRefSchema,
@@ -26,7 +27,7 @@ import {
   buildProductOwner,
   buildProductWorker,
   encodeProductComposition,
-  nativePortList,
+  nativePort,
   productComposition,
   startProductOwner,
   startProductWorker,
@@ -34,7 +35,7 @@ import {
 import {
   internalPricingRouteSource,
   internalPricingNativeSourceSystem,
-  internalPricingPriceSource,
+  decodeInternalC14PriceGroupPlan,
 } from './symmy-c14-pricing-routes-plan.mts';
 
 const workerKey = 'integration.symmy.execute-symmy-job';
@@ -46,11 +47,9 @@ const catalogRead = 'commerce.catalog.symmy-product-read';
 const marketRead = 'commerce.market-catalog.source-read';
 const groupModuleId = 'pricing.price-group-catalog';
 const groupAudience = 'price-group-catalog';
-const groupAssociationsRead = 'pricing.price-group-catalog.api.price-group-source-associations';
 const groupCreateAction = 'pricing.price-group-catalog.create-price-group';
 const groupRevisionAction = 'pricing.price-group-catalog.create-price-group-definition-revision';
 const pricingModule = 'commerce.pricing';
-const pricingAudience = 'pricing';
 const definePriceOperation = 'commerce.pricing.define-price';
 const revisePriceOperation = 'commerce.pricing.revise-price';
 const rules = [
@@ -65,7 +64,7 @@ const rules = [
   })),
   ...[definePriceOperation, revisePriceOperation].map((actionKey) => {
     const rule = {
-      audience: pricingAudience,
+      audience: 'pricing',
       declarationKey: 'commerce.pricing.price-source-result-lookup.read',
       entrypointKey: 'commerce.pricing.api.price-source-result-lookup',
       legalEntityScope: 'required' as const,
@@ -76,25 +75,9 @@ const rules = [
     return actionKey === definePriceOperation ? { ...rule, allowHistoricalDeliveryRecovery: true } : rule;
   }),
   {
-    audience: pricingAudience,
-    declarationKey: 'commerce.pricing.price.read-definition',
-    entrypointKey: 'commerce.pricing.api.price-definition',
-    legalEntityScope: 'required' as const,
-    schemaVersion: '1',
-    workloadKey: priceRead,
-  },
-  {
     audience: groupAudience,
     declarationKey: 'pricing.price-group-catalog.price-group-source-associations.read',
-    entrypointKey: groupAssociationsRead,
-    legalEntityScope: 'forbidden' as const,
-    schemaVersion: '1',
-    workloadKey: groupRead,
-  },
-  {
-    audience: groupAudience,
-    declarationKey: 'pricing.price-group-catalog.price-group-catalog-head.read',
-    entrypointKey: 'pricing.price-group-catalog.api.price-group-catalog-head',
+    entrypointKey: 'pricing.price-group-catalog.api.price-group-source-associations',
     legalEntityScope: 'forbidden' as const,
     schemaVersion: '1',
     workloadKey: groupRead,
@@ -116,7 +99,7 @@ const rules = [
     workloadKey: groupWrite,
   },
   {
-    audience: pricingAudience,
+    audience: 'pricing',
     declarationKey: 'commerce.pricing.price.define',
     entrypointKey: definePriceOperation,
     legalEntityScope: 'required' as const,
@@ -124,7 +107,7 @@ const rules = [
     workloadKey: priceWrite,
   },
   {
-    audience: pricingAudience,
+    audience: 'pricing',
     declarationKey: 'commerce.pricing.price.revise',
     entrypointKey: revisePriceOperation,
     legalEntityScope: 'required' as const,
@@ -151,22 +134,6 @@ const pricingDelegationRules = [
     workloadKey: marketRead,
   },
 ].map((rule) => ({ ...rule, jobKey: workerKey, sourceWorkloadKey: priceWrite }));
-/** One authority-only enrollment: an owner operation the route may use, never an intent. */
-const enrolled = (
-  entityKind: 'PRICE' | 'PRICE_GROUP',
-  itemKey: string,
-  sourceRecordId: string,
-  operations: Readonly<Record<string, { entrypointKey: string; moduleId: string; schemaVersion: string }>>,
-) => ({
-  effects: Object.entries(operations).map(([effectKey, operation]) => ({ effectKey, operation })),
-  itemKey,
-  source: {
-    entityKind,
-    issuerId: internalPricingRouteSource.issuerId,
-    sourceNamespace: internalPricingRouteSource.namespace,
-    sourceRecordId,
-  },
-});
 const encodeRoute = Schema.encodeEffect(Schema.fromJsonString(SymmyRouteExecutionConfigurationSchema));
 const encodePolicy = Schema.encodeEffect(Schema.fromJsonString(SymmyJobLifecyclePolicyRefSchema));
 const encodePolicies = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(SymmyJobRetentionPolicySchema)));
@@ -174,17 +141,19 @@ const encodePolicies = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Sy
 /** Starts genuine owner HTTP runtimes and separate actual credentials; no owner business rows are seeded. */
 export const makeInternalC14PricingRouteFixture = Effect.fn('InternalC14PricingRoutes.fixture')(
   function* makeFixture() {
-    const [symmyPort, groupPort, catalogPort, pricingPort, pricingTransportPort, marketPort] = yield* nativePortList(6);
-    assert.isDefined(symmyPort);
-    assert.isDefined(groupPort);
-    assert.isDefined(catalogPort);
-    assert.isDefined(pricingPort);
-    assert.isDefined(pricingTransportPort);
-    assert.isDefined(marketPort);
+    const symmyPort = yield* nativePort;
+    let groupPort = yield* nativePort;
+    while (groupPort === symmyPort) {
+      groupPort = yield* nativePort;
+    }
+    const catalogPort = yield* nativePort;
+    const pricingPort = yield* nativePort;
+    const pricingTransportPort = yield* nativePort;
     const priceBarrier = yield* installInternalC14PriceDispatchBarrier({
       port: pricingTransportPort,
       targetOrigin: `http://127.0.0.1:${pricingPort}`,
     });
+    const marketPort = yield* nativePort;
     const { contracts, snapshot } = yield* productComposition({
       catalog: `http://127.0.0.1:${catalogPort}/`,
       'commerce-market-catalog': `http://127.0.0.1:${marketPort}/`,
@@ -235,8 +204,6 @@ export const makeInternalC14PricingRouteFixture = Effect.fn('InternalC14PricingR
       )(priceReadSources),
       productionGate: true,
       relaySource: { registeredWorkloads: rules, sourceAppId: 'symmy-integration' },
-      // A price-list read composes several owner reads, each behind its own gateway assertion.
-      requestDeadlineSeconds: 60,
       snapshotJson: yield* encodeProductComposition(snapshot),
     });
     const tenantSlug = `internal-c14-pricing-${tenantId}`;
@@ -354,9 +321,8 @@ export const makeInternalC14PricingRouteFixture = Effect.fn('InternalC14PricingR
         ],
         { concurrency: 3 },
       );
-    // A public price list code is 1 to 80 characters of letters, digits, dot, underscore and hyphen.
-    const firstRecordId = 'CZ-wholesale_A.1';
-    const secondRecordId = `CZ-wholesale_${'B'.repeat(60)}`;
+    const firstRecordId = 'CZ wholesale / žluťoučký 🧾';
+    const secondRecordId = `CZ wholesale ${'B'.repeat(287)}`;
     const lifecyclePolicy = yield* Schema.decodeUnknownEffect(SymmyJobLifecyclePolicyRefSchema)({
       policyId: 'INTERNAL_C14_PRICING_RETENTION',
       revision: '1',
@@ -374,17 +340,9 @@ export const makeInternalC14PricingRouteFixture = Effect.fn('InternalC14PricingR
               },
             },
             {
-              effectKey: 'price-schedule-read',
-              operation: {
-                entrypointKey: 'commerce.pricing.api.price-schedule',
-                moduleId: pricingModule,
-                schemaVersion: '1',
-              },
-            },
-            {
               effectKey: 'group-source-read',
               operation: {
-                entrypointKey: groupAssociationsRead,
+                entrypointKey: 'pricing.price-group-catalog.api.price-group-source-associations',
                 moduleId: groupModuleId,
                 schemaVersion: '1',
               },
@@ -483,55 +441,65 @@ export const makeInternalC14PricingRouteFixture = Effect.fn('InternalC14PricingR
       ONTOS_C14_WORKER_CLAIM_OWNER: 'INTERNAL_C14_PRICING_ROUTES',
     });
     const at = DateTime.formatIso(DateTime.add(yield* DateTime.now, { seconds: 30 }));
-    // The route enrolls operations and grant refs, never a list or a price: the admission builds the plan.
+    const plan = yield* decodeInternalC14PriceGroupPlan({
+      at,
+      firstOccurrenceId: randomUUID(),
+      firstRecordId,
+      secondOccurrenceId: randomUUID(),
+      secondRecordId,
+      sourceRouteId,
+    });
+    const encoded = yield* Schema.encodeEffect(SymmyInternalExecutionPlanSchema)(plan);
     const configuredPlan = yield* Schema.decodeUnknownEffect(SymmyRouteExecutionConfigurationSchema)({
+      ...encoded,
       items: [
-        enrolled('PRICE_GROUP', 'price-list-enrollment', 'INTERNAL_C14_PRICE_LIST_ENROLLMENT', {
-          'group-create': { entrypointKey: groupCreateAction, moduleId: groupModuleId, schemaVersion: '1' },
-        }),
-        enrolled('PRICE', 'price-enrollment', 'INTERNAL_C14_PRICE_ALLOWLIST', {
-          'price-define-authority': {
-            entrypointKey: definePriceOperation,
-            moduleId: pricingModule,
-            schemaVersion: '2',
+        ...encoded.items.map((item) => ({
+          ...item,
+          effects: [
+            ...item.effects,
+            {
+              effectKey: 'group-revise-authority',
+              operation: {
+                entrypointKey: groupRevisionAction,
+                moduleId: groupModuleId,
+                schemaVersion: '1',
+              },
+            },
+          ],
+        })),
+        {
+          effects: [
+            {
+              effectKey: 'price-define-authority',
+              operation: {
+                entrypointKey: definePriceOperation,
+                moduleId: pricingModule,
+                schemaVersion: '2',
+              },
+            },
+            {
+              effectKey: 'price-revise-authority',
+              operation: {
+                entrypointKey: revisePriceOperation,
+                moduleId: pricingModule,
+                schemaVersion: '2',
+              },
+            },
+          ],
+          itemKey: 'price-authority',
+          source: {
+            entityKind: 'PRICE',
+            issuerId: internalPricingRouteSource.issuerId,
+            sourceNamespace: internalPricingRouteSource.namespace,
+            sourceRecordId: 'INTERNAL_C14_PRICE_ALLOWLIST',
           },
-        }),
+        },
       ],
-      priceSource: internalPricingPriceSource,
       pricingSourceSystem: internalPricingNativeSourceSystem,
       sourceRouteId,
     });
     yield* admin`insert into symmy_integration.job_routes(route_id,tenant_id,legal_entity_id,principal_id,active,fixture_ids,fixture_plan,mapping_version,route_key,route_revision,lifecycle_policy)
       values(${routeId},${tenantId},${legalEntityId},${integration.principalId},true,array['INTERNAL_C14'],${yield* encodeRoute(configuredPlan)}::jsonb,${internalPricingRouteSource.mappingVersion},'priceListsBatchUpsert',${internalPricingRouteSource.routeRevision},${yield* encodePolicy(lifecyclePolicy)}::jsonb)`;
-    // The prices route enrolls the owner operations it may write with, the read that authorizes a request and the
-    // grant refs of a price assertion. It names no price list: the body does, and the route accepts only lists its
-    // own source created. Its REVISE reads use the scope of the price list read route above.
-    const pricesPlan = yield* Schema.decodeUnknownEffect(SymmyRouteExecutionConfigurationSchema)({
-      items: [
-        enrolled('PRICE', 'price-enrollment', 'INTERNAL_C14_PRICE_ALLOWLIST', {
-          'group-source-associations-read': {
-            entrypointKey: groupAssociationsRead,
-            moduleId: groupModuleId,
-            schemaVersion: '1',
-          },
-          'price-define-authority': {
-            entrypointKey: definePriceOperation,
-            moduleId: pricingModule,
-            schemaVersion: '2',
-          },
-          'price-revise-authority': {
-            entrypointKey: revisePriceOperation,
-            moduleId: pricingModule,
-            schemaVersion: '2',
-          },
-        }),
-      ],
-      priceSource: internalPricingPriceSource,
-      pricingSourceSystem: internalPricingNativeSourceSystem,
-      sourceRouteId,
-    });
-    yield* admin`insert into symmy_integration.job_routes(route_id,tenant_id,legal_entity_id,principal_id,active,fixture_ids,fixture_plan,mapping_version,route_key,route_revision,lifecycle_policy)
-      values(${selectedRouteId},${tenantId},${legalEntityId},${integration.principalId},true,array['INTERNAL_C14'],${yield* encodeRoute(pricesPlan)}::jsonb,${internalPricingRouteSource.mappingVersion},'priceListPricesBatch',${internalPricingRouteSource.routeRevision},${yield* encodePolicy(lifecyclePolicy)}::jsonb)`;
     return {
       admin,
       at,
@@ -546,6 +514,7 @@ export const makeInternalC14PricingRouteFixture = Effect.fn('InternalC14PricingR
       lifecyclePolicy,
       marketPort,
       moduleKey,
+      plan,
       priceBarrier,
       pricingOwner,
       pricingPort,

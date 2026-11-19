@@ -10,6 +10,8 @@ import {
   PaymentTermAffectedUseAssessmentRequestSchema,
   PaymentTermAffectedUseAssessmentResponseSchema,
   PaymentTermAffectedUseDispositionSchema,
+  executePaymentTermAffectedUseAssessment,
+  executePaymentTermAffectedUseAssessmentWithAuthorization,
 } from '../../src/index.ts';
 
 const paymentTermRef = {
@@ -36,6 +38,8 @@ describe('Customer-owned Payment Term affected-use public contract', () => {
   it('publishes one canonical schema and generated client surface', () => {
     expect(PaymentTermAffectedUseAssessmentSchema).toBe(CanonicalPaymentTermAffectedUseAssessmentSchema);
     expect(PaymentTermAffectedUseDispositionSchema).toBe(CanonicalPaymentTermAffectedUseDispositionSchema);
+    expect(executePaymentTermAffectedUseAssessment).toBeTypeOf('function');
+    expect(executePaymentTermAffectedUseAssessmentWithAuthorization).toBeTypeOf('function');
     expect(Schema.decodeSync(PaymentTermAffectedUseAssessmentRequestSchema)(request)).toEqual(request);
   });
 

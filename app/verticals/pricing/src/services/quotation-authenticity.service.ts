@@ -42,6 +42,7 @@ const PricingQuotationOwnerAuthenticityOutcomeSchema = Schema.Union([
   PricingQuotationOwnerInvalidSchema,
   PricingQuotationOwnerUnverifiableSchema,
 ]);
+export type PricingQuotationOwnerAuthenticityOutcome = typeof PricingQuotationOwnerAuthenticityOutcomeSchema.Type;
 
 export class PricingQuotationAuthenticityProviderUnavailable extends Data.TaggedError(
   'PricingQuotationAuthenticityProviderUnavailable',

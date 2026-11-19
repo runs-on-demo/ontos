@@ -1,7 +1,9 @@
 import { NodeCrypto } from '@effect/platform-node';
+import { makeApplicationCompositionSnapshotFixture } from '@app/core-runtime/testing/module-contract';
 import type { ActionHandlerContext, DomainEventContractMap } from '@app/core-runtime';
 import { TrustedPrincipalContextSchema } from '@app/core-runtime';
 import { describe, expect, it } from 'effect-rstest';
+import { ultramodernApiMarker } from '../../shared/ultramodern-build.ts';
 import { Effect, Schema } from 'effect';
 
 import { CreatePackageDefinitionPayloadSchema } from '../../shared/actions/create-package-definition.ts';
@@ -55,9 +57,6 @@ const unavailable = () =>
     new PackagePersistenceUnavailable({ code: 'package_persistence_unavailable', reason: 'No Current basis' }),
   );
 const unexpected = () => Effect.die('Unexpected persistence call');
-// No Catalog Action handler reads ActionHandlerContext.compositionRevision, so a fixed opaque
-// revision replaces a per-test Application Composition snapshot build.
-const fixtureCompositionRevision = 'a'.repeat(64);
 type PackageDefinitionRevisedDomainEvents = typeof revisePackageDefinitionAction.descriptor.domainEvents;
 const context = <DomainEvents extends DomainEventContractMap = Readonly<Record<string, never>>>(
   compositionRevision: string,
@@ -76,6 +75,10 @@ const context = <DomainEvents extends DomainEventContractMap = Readonly<Record<s
 describe('Package Definition governed Action contracts', () => {
   it.effect('passes trusted invocation identity to owner-local persistence', () =>
     Effect.gen(function* trustedIdentity() {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
       const payload = Schema.decodeUnknownSync(CreatePackageDefinitionPayloadSchema)({
         content,
         definitionRef,
@@ -84,7 +87,7 @@ describe('Package Definition governed Action contracts', () => {
       });
       const revision = Schema.decodeUnknownSync(PackageDefinitionSelectionRevisionSchema)(expectedCurrent);
       const trustedRef = Schema.decodeUnknownSync(PackageDefinitionRefSchema)(definitionRef);
-      const run = context(fixtureCompositionRevision, {
+      const run = context(compositionSnapshot.composition.revision, {
         create: (input) =>
           Effect.sync(() => {
             expect(input.actionInvocationId).toBe('88888888-8888-4888-8888-888888888888');
@@ -152,6 +155,10 @@ describe('Package Definition governed Action contracts', () => {
 
   it.effect('requires an explained correction and records its intent without rewriting the prior revision', () =>
     Effect.gen(function* correctionIntent() {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
       const correction = Schema.decodeUnknownSync(RevisePackageDefinitionPayloadSchema)({
         changeKind: 'correction',
         content,
@@ -164,7 +171,7 @@ describe('Package Definition governed Action contracts', () => {
       const trustedRef = Schema.decodeUnknownSync(PackageDefinitionRefSchema)(definitionRef);
       const recorded: unknown[] = [];
       const run: ActionHandlerContext<PackageDefinitionRevisedDomainEvents, PackagePersistence> = {
-        ...context<PackageDefinitionRevisedDomainEvents>(fixtureCompositionRevision, {
+        ...context<PackageDefinitionRevisedDomainEvents>(compositionSnapshot.composition.revision, {
           revise: ({ payload }) => {
             expect(payload.changeKind).toBe('correction');
             expect(payload.expectedCurrent.revision).toBe(1);
@@ -186,13 +193,13 @@ describe('Package Definition governed Action contracts', () => {
       const { priorErrorExplanation: _omitted, ...missingExplanation } = correction;
       const error = yield* handleRevisePackageDefinition(
         missingExplanation,
-        context<PackageDefinitionRevisedDomainEvents>(fixtureCompositionRevision, { revise: unexpected }),
+        context<PackageDefinitionRevisedDomainEvents>(compositionSnapshot.composition.revision, { revise: unexpected }),
       ).pipe(Effect.flip);
       expect(error.code).toBe('package_definition_invalid');
       const falseCorrection = { ...correction, changeKind: 'physical_change' as const };
       const falseError = yield* handleRevisePackageDefinition(
         falseCorrection,
-        context<PackageDefinitionRevisedDomainEvents>(fixtureCompositionRevision, { revise: unexpected }),
+        context<PackageDefinitionRevisedDomainEvents>(compositionSnapshot.composition.revision, { revise: unexpected }),
       ).pipe(Effect.flip);
       expect(falseError.code).toBe('package_definition_invalid');
     }).pipe(Effect.provide(NodeCrypto.layer)),
@@ -200,6 +207,10 @@ describe('Package Definition governed Action contracts', () => {
 
   it.effect('never claims success without authoritative persistence and Current verification', () =>
     Effect.gen(function* noFalseSuccess() {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
       const create = Schema.decodeUnknownSync(CreatePackageDefinitionPayloadSchema)({
         content,
         definitionRef,
@@ -219,9 +230,9 @@ describe('Package Definition governed Action contracts', () => {
         reason,
       });
       const errors = yield* Effect.all([
-        handleCreatePackageDefinition(create, context(fixtureCompositionRevision)).pipe(Effect.flip),
-        handleRevisePackageDefinition(revise, context(fixtureCompositionRevision)).pipe(Effect.flip),
-        handleRetirePackageDefinition(retire, context(fixtureCompositionRevision)).pipe(Effect.flip),
+        handleCreatePackageDefinition(create, context(compositionSnapshot.composition.revision)).pipe(Effect.flip),
+        handleRevisePackageDefinition(revise, context(compositionSnapshot.composition.revision)).pipe(Effect.flip),
+        handleRetirePackageDefinition(retire, context(compositionSnapshot.composition.revision)).pipe(Effect.flip),
       ]);
       expect(errors.map((error) => error.code)).toEqual([
         'package_definition_unavailable',
@@ -233,6 +244,10 @@ describe('Package Definition governed Action contracts', () => {
 
   it.effect('rejects references from another Tenant before reporting infrastructure unavailability', () =>
     Effect.gen(function* rejectForeignTenant() {
+      const compositionSnapshot = yield* makeApplicationCompositionSnapshotFixture(
+        ['catalog'],
+        ultramodernApiMarker.buildMarker,
+      );
       const payload = Schema.decodeUnknownSync(CreatePackageDefinitionPayloadSchema)({
         content: { ...content, unitRef: resource('commerce.catalog.unit', unitRef.resourceId, otherTenantId) },
         definitionRef,
@@ -241,7 +256,7 @@ describe('Package Definition governed Action contracts', () => {
       });
       const error = yield* handleCreatePackageDefinition(
         payload,
-        context(fixtureCompositionRevision, { create: unexpected }),
+        context(compositionSnapshot.composition.revision, { create: unexpected }),
       ).pipe(Effect.flip);
       expect(error.code).toBe('package_definition_invalid');
     }).pipe(Effect.provide(NodeCrypto.layer)),

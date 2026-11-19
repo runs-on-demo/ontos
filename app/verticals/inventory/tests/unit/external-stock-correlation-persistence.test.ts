@@ -12,6 +12,8 @@ import {
 } from '../../src/persistence/external-stock-correlation-repository.ts';
 import {
   INVENTORY_EXTERNAL_STOCK_CORRELATION_TABLES,
+  inventoryExternalStockCorrelationImmutabilityContract,
+  inventoryExternalStockCorrelationNonoverlapContract,
   inventoryExternalStockCorrelations,
 } from '../../src/persistence/external-stock-correlation-table.ts';
 
@@ -105,24 +107,46 @@ describe('Inventory External Stock Correlation persistence', () => {
     expect(config.policies.map((policy) => policy.for)).toEqual(['select', 'insert', 'update', 'delete']);
   });
 
-  it('maps a Cause-wrapped missing Stock Item or Stock Location target to a typed domain rejection', () => {
-    const itemFailure = mapExternalStockCorrelationWriteError(
+  it('publishes migration contracts that preserve identity and reject overlapping Effective Periods', () => {
+    expect(inventoryExternalStockCorrelationImmutabilityContract).toMatchObject({
+      comparison: 'IS DISTINCT FROM',
+      deleteTriggerName: 'inventory_external_stock_correlations_no_delete_trg',
+      functionName: 'inventory.reject_external_stock_correlation_identity_mutation',
+      table: 'inventory.external_stock_correlations',
+      updateTriggerName: 'inventory_external_stock_correlations_immutable_identity_trg',
+    });
+    expect(inventoryExternalStockCorrelationNonoverlapContract).toEqual({
+      errorCondition: 'exclusion_violation',
+      event: 'INSERT OR UPDATE',
+      functionName: 'inventory.enforce_external_stock_correlation_nonoverlap',
+      period: '[effective_from, effective_to)',
+      table: 'inventory.external_stock_correlations',
+      triggerName: 'inventory_external_stock_correlations_nonoverlap_trg',
+    });
+  });
+
+  it('maps a Cause-wrapped missing Stock Item target to a typed domain rejection', () => {
+    const failure = mapExternalStockCorrelationWriteError(
       Cause.fail({
         code: '23503',
         constraint: 'inventory_external_stock_correlations_item_fk',
       }),
     );
-    const locationFailure = mapExternalStockCorrelationWriteError(
+
+    expect(Schema.is(ExternalStockCorrelationRejected)(failure)).toBe(true);
+    expect(failure).toMatchObject({ reason: 'TARGET_NOT_FOUND' });
+  });
+
+  it('maps a Cause-wrapped missing Stock Location target to a typed domain rejection', () => {
+    const failure = mapExternalStockCorrelationWriteError(
       Cause.die({
         code: '23503',
         constraint: 'inventory_external_stock_correlations_location_fk',
       }),
     );
 
-    expect(Schema.is(ExternalStockCorrelationRejected)(itemFailure)).toBe(true);
-    expect(itemFailure).toMatchObject({ reason: 'TARGET_NOT_FOUND' });
-    expect(Schema.is(ExternalStockCorrelationRejected)(locationFailure)).toBe(true);
-    expect(locationFailure).toMatchObject({ reason: 'TARGET_NOT_FOUND' });
+    expect(Schema.is(ExternalStockCorrelationRejected)(failure)).toBe(true);
+    expect(failure).toMatchObject({ reason: 'TARGET_NOT_FOUND' });
   });
 
   /* oxlint-disable sonarjs/no-nested-functions -- The typed transaction mock mirrors the Drizzle read chain; expires: 2027-03-31. */

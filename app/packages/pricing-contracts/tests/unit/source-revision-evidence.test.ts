@@ -2,6 +2,7 @@ import { Schema } from 'effect';
 import { describe, expect, it } from 'effect-rstest';
 
 import {
+  PricingFactCurrentnessEvidenceSchema,
   PricingOwnerQualifiedSetCompletenessEvidenceSchema,
   PricingSourceEvidenceResultSchema,
   PricingSourceEvidenceConflictSchema,
@@ -9,12 +10,16 @@ import {
   PricingSourceEvidenceTemporalContextSchema,
   PricingSourceEvidenceUnverifiableSchema,
   PricingSourceEvidenceVerifiedAbsentSchema,
+  PricingSourceEvidenceVerifiedPresentSchema,
 } from '../../src/domain/source-revision-evidence.ts';
 
 const decodeResult = Schema.decodeUnknownSync(PricingSourceEvidenceResultSchema, {
   onExcessProperty: 'error',
 });
 const decodeTemporal = Schema.decodeUnknownSync(PricingSourceEvidenceTemporalContextSchema, {
+  onExcessProperty: 'error',
+});
+const decodeFact = Schema.decodeUnknownSync(PricingFactCurrentnessEvidenceSchema, {
   onExcessProperty: 'error',
 });
 const decodeCompleteness = Schema.decodeUnknownSync(PricingOwnerQualifiedSetCompletenessEvidenceSchema, {
@@ -83,6 +88,23 @@ const fact = {
 };
 
 describe('Pricing source revision evidence contract', () => {
+  it('keeps Fact Currentness and complete-set proof separate under ordinary request latency', () => {
+    expect(
+      Schema.is(PricingSourceEvidenceVerifiedPresentSchema)(
+        decodeResult({
+          _tag: 'VERIFIED_PRESENT',
+          completeness,
+          currentFacts: [fact],
+          request,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('accepts a generalized ISO currency shape without declaring that currency supported at Launch', () => {
+    expect(decodeFact(fact).currencyCode).toBe('EUR');
+  });
+
   it('represents proven absence with completeness and no fabricated Current fact', () => {
     const supportOwnerScope = {
       ...ownerScope,

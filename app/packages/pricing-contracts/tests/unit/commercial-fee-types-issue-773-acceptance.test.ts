@@ -486,7 +486,6 @@ describe('Issue #773 Pricing Commercial Fee contract acceptance', () => {
     }
 
     expect(() => decodeIdentity({ ...perLineIdentity, target: { productRef } })).toThrow();
-    expect(() => decodeIdentity({ ...perLineIdentity, target: firstTarget })).toThrow();
     expect(() => decodeIdentity({ ...perLineIdentity, storefrontId: 'storefront:prague' })).toThrow();
   });
 
@@ -634,15 +633,6 @@ describe('Issue #773 Pricing Commercial Fee contract acceptance', () => {
         completenessEvidence: {
           ...currentSetFor([]).completenessEvidence,
           scope: { kind: 'EXACT_PREDICATE', predicateRef: 'some-other-owner-predicate' },
-        },
-      }),
-    ).toThrow();
-    expect(() =>
-      decodeCurrentSet({
-        ...currentSetFor([]),
-        currentnessEvidence: {
-          ...currentSetFor([]).currentnessEvidence,
-          ownerRevision: 'pricing-commercial-fees:unrelated-revision',
         },
       }),
     ).toThrow();

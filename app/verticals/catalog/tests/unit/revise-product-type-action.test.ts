@@ -55,20 +55,6 @@ const scope = {
   correlationId: 'revise-product-type-test',
 };
 
-/**
- * Every context here reads only the content-digest revision of one identical Application Composition
- * bundle, so the full decode/encode/digest/validate pass runs once for the whole file.
- */
-let cachedCatalogCompositionRevision: string | undefined;
-const catalogCompositionRevision = Effect.gen(function* catalogCompositionRevision() {
-  if (cachedCatalogCompositionRevision !== undefined) {
-    return cachedCatalogCompositionRevision;
-  }
-  const snapshot = yield* makeApplicationCompositionSnapshotFixture(['catalog'], ultramodernApiMarker.buildMarker);
-  cachedCatalogCompositionRevision = snapshot.composition.revision;
-  return snapshot.composition.revision;
-});
-
 const contextWith = (
   revise: ProductTypeRevisePersistence['revise'],
   accessed: { readonly targetResourceId: string }[] = [],
@@ -79,7 +65,7 @@ const contextWith = (
   }[] = [],
 ) =>
   Effect.gen(function* makeContextWith() {
-    const compositionRevision = yield* catalogCompositionRevision;
+    const snapshot = yield* makeApplicationCompositionSnapshotFixture(['catalog'], ultramodernApiMarker.buildMarker);
     const context: ActionHandlerContext<
       typeof reviseProductTypeAction.descriptor.domainEvents,
       ProductTypeRevisePersistence
@@ -95,7 +81,7 @@ const contextWith = (
         Effect.sync(() => {
           outbox.push({ event, message });
         }),
-      compositionRevision,
+      compositionRevision: snapshot.composition.revision,
       recordAuditEvidence: () => Effect.void,
       recordDataAccess: (evidence) =>
         Effect.sync(() => {

@@ -1207,11 +1207,17 @@ it('ships generated owner history and explicit immutable-identity hardening', ()
   expect(commitmentProtection.match(/GRANT EXECUTE ON FUNCTION/gu)).toHaveLength(1);
 });
 
-it('grants the shared runtime role usage of the Inventory schema', () => {
+it('registers the exact owner schema, journal, verifier, and runtime grants', () => {
+  const rootVerifier = readFileSync(
+    fileURLToPath(new URL('../../../../scripts/verify-application-db-schema.mts', import.meta.url)),
+    'utf-8',
+  );
   const runtimeBootstrap = readFileSync(
     fileURLToPath(new URL('../../../../scripts/postgres/runtime-role-bootstrap.mts', import.meta.url)),
     'utf-8',
   );
+  expect(rootVerifier).toContain('loadApplicationMigrationInventory');
+  expect(rootVerifier).toContain('for (const path of stream.verifierPaths)');
   expect(runtimeBootstrap).toMatch(/'catalog', 'inventory'/u);
 });
 

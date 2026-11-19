@@ -133,6 +133,11 @@ it.live('appends and isolates explicit Product Type absence decisions in Postgre
       expect(
         yield* withTenant(foreignTenantId, (transaction) => transaction.select().from(productTypeUntypedDecisions)),
       ).toEqual([]);
+      const runtimeRole = yield* runtime.execute<{ rolbypassrls: boolean; rolsuper: boolean }>(
+        sql`select rolbypassrls, rolsuper from pg_roles where rolname = current_user`,
+        'objects',
+      );
+      expect(runtimeRole).toEqual([{ rolbypassrls: false, rolsuper: false }]);
     }),
   ),
 );

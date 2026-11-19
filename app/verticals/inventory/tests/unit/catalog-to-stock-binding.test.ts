@@ -187,6 +187,7 @@ describe('Catalog-to-Stock Binding resolution', () => {
         reason: 'INTRINSIC_MEANING_MISMATCH',
         stockItemRef: incompatibleItem.stockItemRef,
       });
+      expect(incompatibleItem.exactSelectionMeaning.id).toBe('catalog-owner:different-meaning');
     }),
   );
 
@@ -205,6 +206,7 @@ describe('Catalog-to-Stock Binding resolution', () => {
 
       expect(Schema.is(CatalogToStockBindingRejected)(error)).toBe(true);
       expect(error.reason).toBe('STOCK_UNIT_MISMATCH');
+      expect(otherUnitDemand.quantity).toBe('2.50');
     }),
   );
 
@@ -375,6 +377,8 @@ describe('Catalog-to-Stock Binding lifecycle', () => {
         )
         .pipe(Effect.flip);
 
+      expect(firstSelection.configuration?.definition.revision).toBe(7);
+      expect(newerEvidence.configuration?.definition.revision).toBe(8);
       expect(resolution.stockItem.stockItemRef).toEqual(configuredItem.stockItemRef);
       expect(resolution.catalogSelection).toEqual(newerEvidence);
       expect(Schema.is(CatalogToStockBindingRejected)(duplicate)).toBe(true);
@@ -425,6 +429,8 @@ describe('Catalog-to-Stock Binding lifecycle', () => {
           transition: 'CORRECTED',
         },
       ]);
+      expect(erroneousItem.exactSelectionMeaning.id).toBe('catalog-owner:wrong-meaning');
+      expect(replacementItem.exactSelectionMeaning).toEqual(exactSelectionMeaning);
     }),
   );
 

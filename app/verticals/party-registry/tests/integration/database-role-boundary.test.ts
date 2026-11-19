@@ -6,8 +6,7 @@ import {
 } from '@app/core-runtime';
 import { addTestGatewayScopeGrantCleanup } from '@app/core-runtime/testing/gateway-scope-grant';
 import type { PgClient } from '@effect/sql-pg';
-import { Context, Effect, Layer, Predicate, Redacted } from 'effect';
-import { ProbeRollback } from '../support/probe-rollback.ts';
+import { Context, Data, Effect, Layer, Predicate, Redacted } from 'effect';
 import type { SqlError } from 'effect/sql/SqlError';
 import { NodeCrypto } from '@effect/platform-node';
 import { expect, it } from 'effect-rstest';
@@ -56,6 +55,7 @@ const isDenied = (client: Client, statement: string, parameters: readonly unknow
   );
 
 /** Carries a probe result out of a transaction that must roll back, since a denied probe aborts it. */
+class ProbeRollback<Value> extends Data.TaggedError('ProbeRollback')<{ readonly value: Value }> {}
 
 /** Runs `body` in one transaction and always rolls it back, returning the body's result. */
 const inTransaction = <Value>(client: Client, body: Effect.Effect<Value, SqlError>) =>
@@ -194,24 +194,10 @@ const openFixture = Effect.gen(function* openFixtureEffect() {
 
 const rowCount = (rows: readonly Row[]) => rows.length;
 
-/**
- * Seeding costs twelve DELETEs and the whole tenant/legal-entity/Party/Contacts/Core row set, and no
- * test below changes it: every probe runs through `inTransaction`/`inScope`, which always abort, and
- * the statements outside a rolled-back transaction are read-only selects plus the two non-owner
- * GRANT attempts that are then asserted to have conferred nothing. So the suite seeds once.
- */
-class DatabaseRoleBoundaryFixture extends Context.Service<
-  DatabaseRoleBoundaryFixture,
-  Effect.Success<typeof openFixture>
->()('@app/party-registry/tests/integration/database-role-boundary.test/DatabaseRoleBoundaryFixture') {}
-const roleBoundaryLayer = Layer.effect(DatabaseRoleBoundaryFixture, openFixture).pipe(
-  Layer.provideMerge(NodeCrypto.layer),
-);
-
-it.layer(roleBoundaryLayer, { excludeTestServices: true, timeout: 120_000 })((suite) => {
+it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
   suite.effect('confines the Party request role to the trusted tenant and legal entity', () =>
     Effect.gen(function* testEffect() {
-      const { runtime, scopeA, scopeA1 } = yield* DatabaseRoleBoundaryFixture;
+      const { runtime, scopeA, scopeA1 } = yield* openFixture;
 
       for (const table of [
         'party.parties',
@@ -319,7 +305,7 @@ it.layer(roleBoundaryLayer, { excludeTestServices: true, timeout: 120_000 })((su
 
   suite.effect('ignores unscoped, legacy-spoofed and RLS-bypass attempts', () =>
     Effect.gen(function* testEffect() {
-      const { runtime } = yield* DatabaseRoleBoundaryFixture;
+      const { runtime } = yield* openFixture;
 
       expect(yield* query(runtime, 'select party_id from party.parties')).toEqual([]);
       expect(yield* query(runtime, 'select tenant_id from core.search_index_entries')).toEqual([]);
@@ -370,7 +356,7 @@ it.layer(roleBoundaryLayer, { excludeTestServices: true, timeout: 120_000 })((su
 
   suite.effect('bounds Core writes and reads of the Party request role to its module and trusted tenant', () =>
     Effect.gen(function* testEffect() {
-      const { admin, runtime, scopeA } = yield* DatabaseRoleBoundaryFixture;
+      const { admin, runtime, scopeA } = yield* openFixture;
       const deniedInScope = (statement: string, parameters: readonly unknown[] = []) =>
         inScope(runtime, scopeA, isDenied(runtime, statement, parameters));
       const domainEventInsert = `insert into core.domain_events (tenant_id, producer_module_key, event_type, subject_module_key, subject_resource_type, subject_resource_id)
@@ -435,7 +421,7 @@ it.layer(roleBoundaryLayer, { excludeTestServices: true, timeout: 120_000 })((su
 
   suite.effect('denies caller-controlled tenant login defaults and reconnects without trusted scope', () =>
     Effect.gen(function* runtimeDefaultScope() {
-      const { runtime } = yield* DatabaseRoleBoundaryFixture;
+      const { runtime } = yield* openFixture;
       // A failed assertion also rolls back any unexpectedly accepted role change.
       for (const statement of [
         `alter role party_registry_runtime set ontos.tenant_id = '${tenantA}'`,
@@ -461,7 +447,7 @@ it.layer(roleBoundaryLayer, { excludeTestServices: true, timeout: 120_000 })((su
 
   suite.effect('denies DDL, unrelated schemas, sequences, role changes and grant propagation', () =>
     Effect.gen(function* testEffect() {
-      const { admin, adminUser, runtime, scopeA } = yield* DatabaseRoleBoundaryFixture;
+      const { admin, adminUser, runtime, scopeA } = yield* openFixture;
 
       const deniedStatements = [
         'create table party.boundary_probe (id int)',
@@ -522,7 +508,7 @@ it.layer(roleBoundaryLayer, { excludeTestServices: true, timeout: 120_000 })((su
     'keeps the worker lock-only on Core and separates it, the shared runtime and the issuer from Party',
     () =>
       Effect.gen(function* testEffect() {
-        const { issuer, scopeA, sharedRuntime, worker } = yield* DatabaseRoleBoundaryFixture;
+        const { issuer, scopeA, sharedRuntime, worker } = yield* openFixture;
 
         // The worker locks Core rows through FOR UPDATE, yet every real UPDATE fails WITH CHECK.
         expect(

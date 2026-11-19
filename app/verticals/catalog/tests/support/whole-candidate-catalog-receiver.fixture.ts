@@ -140,7 +140,7 @@ export const WholeCandidateCatalogReadOnlyBootstrapSchema = Schema.Struct({
   type: Schema.Literal(readOnlyBootstrapType),
   units: unitsSchema,
 }).annotate({ parseOptions: { onExcessProperty: 'error' } });
-const WholeCandidateCatalogPrepareSchema = Schema.Struct({
+export const WholeCandidateCatalogPrepareSchema = Schema.Struct({
   authorizations: Schema.Tuple([
     Schema.RedactedFromValue(Schema.String),
     Schema.RedactedFromValue(Schema.String),
@@ -204,7 +204,7 @@ export const WholeCandidateCatalogResponseSchema = Schema.Union([
     version: Schema.Literal(protocolVersion),
   }),
 ]);
-const WholeCandidateCatalogDescriptionSchema = Schema.Struct({
+export const WholeCandidateCatalogDescriptionSchema = Schema.Struct({
   actionKeys: Schema.Array(actionKeySchema),
   appId: Schema.Literal('catalog'),
   buildMarker: Schema.String,

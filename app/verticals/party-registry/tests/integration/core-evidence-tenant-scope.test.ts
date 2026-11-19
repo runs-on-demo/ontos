@@ -1,8 +1,7 @@
 import type { PgClient } from '@effect/sql-pg';
 import { addTestGatewayScopeGrantCleanup } from '@app/core-runtime/testing/gateway-scope-grant';
 import { NodeCrypto } from '@effect/platform-node';
-import { Context, Effect, Layer, Redacted } from 'effect';
-import { ProbeRollback } from '../support/probe-rollback.ts';
+import { Data, Effect, Redacted } from 'effect';
 import { expect, it } from 'effect-rstest';
 import type { Row } from 'effect/sql/SqlConnection';
 import type { SqlError } from 'effect/sql/SqlError';
@@ -43,6 +42,7 @@ const isDenied = (client: Client, statement: string, parameters: readonly unknow
   );
 
 /** Carries a probe result out of a transaction that must roll back, since a denied probe aborts it. */
+class ProbeRollback<Value> extends Data.TaggedError('ProbeRollback')<{ readonly value: Value }> {}
 
 /** Runs `body` in one transaction and always rolls it back, returning the body's result. */
 const inTransaction = <Value>(client: Client, body: Effect.Effect<Value, SqlError>) =>
@@ -158,25 +158,10 @@ const identityReads = (client: Client) =>
     ),
   });
 
-/**
- * Seeding re-runs eight DELETEs and then inserts a tenant, legal entity, principal, auth binding,
- * invocation and audit event for both fixture tenants. The first two tests only probe through
- * `inTransaction`/`inScope`, which always abort, so even their accepted own-tenant INSERTs leave
- * nothing behind; the third test's only durable rows live in a table the others never read and the
- * shared finalizer purges by issuer. So the suite seeds once and keeps the per-test probes.
- */
-class CoreEvidenceTenantScopeFixture extends Context.Service<
-  CoreEvidenceTenantScopeFixture,
-  Effect.Success<typeof openFixture>
->()('@app/party-registry/tests/integration/core-evidence-tenant-scope.test/CoreEvidenceTenantScopeFixture') {}
-const evidenceLayer = Layer.effect(CoreEvidenceTenantScopeFixture, openFixture).pipe(
-  Layer.provideMerge(NodeCrypto.layer),
-);
-
-it.layer(evidenceLayer, { excludeTestServices: true, timeout: 120_000 })((suite) => {
+it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
   suite.effect('confines Party Core evidence and identity reads to the trusted tenant', () =>
     Effect.gen(function* testEffect() {
-      const { runtime, scopeA } = yield* CoreEvidenceTenantScopeFixture;
+      const { runtime, scopeA } = yield* openFixture;
 
       expect(yield* inScope(runtime, scopeA, identityReads(runtime))).toEqual({
         audits: [{ id: invocationA }],
@@ -197,7 +182,7 @@ it.layer(evidenceLayer, { excludeTestServices: true, timeout: 120_000 })((suite)
 
   suite.effect('rejects Party Core evidence writes for another tenant', () =>
     Effect.gen(function* testEffect() {
-      const { runtime, scopeA } = yield* CoreEvidenceTenantScopeFixture;
+      const { runtime, scopeA } = yield* openFixture;
 
       // Own-tenant writes pass, so each denial below comes from the tenant predicate alone.
       yield* inScope(
@@ -235,7 +220,7 @@ it.layer(evidenceLayer, { excludeTestServices: true, timeout: 120_000 })((suite)
 
   suite.effect('prunes gateway assertion redemptions only through the expired-row routine', () =>
     Effect.gen(function* testEffect() {
-      const { admin, runtime } = yield* CoreEvidenceTenantScopeFixture;
+      const { admin, runtime } = yield* openFixture;
       yield* query(
         admin,
         `insert into contacts.gateway_assertion_redemptions (issuer, audience, jti, expires_at, redeemed_at) values

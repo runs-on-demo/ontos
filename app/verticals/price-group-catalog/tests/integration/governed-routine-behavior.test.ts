@@ -27,12 +27,9 @@ import { priceGroupCatalogRelations } from '../../src/database/schema.ts';
 import { handleRetirePriceGroup, retirePriceGroupAction } from '../../src/actions/retire-price-group.action.ts';
 import { priceGroupCatalogPersistenceFromRoutineInvoker } from '../../src/persistence/price-group-catalog-persistence.ts';
 
-// Both tenants are generated per run so concurrent runs against the same database cannot delete
-// each other's rows: every invocation-identity constraint in this schema is UNIQUE(tenant_id, ...),
-// so the fixed invocation identifiers below stay unique within a run's own tenants.
-const tenantId = randomUUID();
+const tenantId = 'a3400000-0000-4000-8000-000000000001';
 const compositionRevision = 'b'.repeat(64);
-const otherTenantId = randomUUID();
+const otherTenantId = 'a3400000-0000-4000-8000-000000000002';
 const principalId = 'a3400000-0000-4000-8000-000000000003';
 const createInvocationId = 'a3400000-0000-4000-8000-000000000004';
 const duplicateInvocationId = 'a3400000-0000-4000-8000-000000000005';

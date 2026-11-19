@@ -422,12 +422,8 @@ const makeOwnedPriceFeeFixture = Effect.fn('test.makeOwnedPriceFeeFixture')(func
   });
   yield* copyOwnerBookkeeping(isolated.connections);
   yield* migrateOwner(isolated.connections);
-  // Both post-migration controls only read this database's own catalog, so they run together
-  // instead of serializing a SQL round trip behind the verifier child process.
-  yield* Effect.all(
-    [verifyAppendOnlyPolicyRoleSets(isolated.connections.runtime), migrateOwner(isolated.connections, 'verify')],
-    { concurrency: 2 },
-  );
+  yield* verifyAppendOnlyPolicyRoleSets(isolated.connections.runtime);
+  yield* migrateOwner(isolated.connections, 'verify');
   return yield* makeNativeReadTestContext({
     connections: {
       admin: { connectionString: Redacted.make(isolated.connections.admin.connectionString) },
@@ -1628,13 +1624,8 @@ const fixtureDeliveryUnitIdSchema = Schema.NonEmptyString.pipe(
   Schema.decodeTo(Schema.String),
 );
 
-// Immutable, database-free artifacts: the Catalog receiver bundle, the contract that bundle
-// describes and the published composition over both owners. Producing them costs two child
-// processes whose only inputs are the resolved release identity and the fixture source, and both
-// registered cases need the identical result, so the file builds them once and shares them. No
-// database, credential or server process is shared here.
-const prepareRegisteredBulkArtifacts = Effect.fn('BulkOriginalIntent.prepareRegisteredArtifacts')(
-  function* prepareRegisteredArtifacts() {
+const makeRegisteredBulkFixture = Effect.fn('BulkOriginalIntent.makeRegisteredFixture')(
+  function* makeRegisteredBulkFixture() {
     const fs = yield* FileSystem.FileSystem;
     const appRoot = new URL('../../../../', import.meta.url).pathname;
     // Resolve the real Catalog compiler identity independently from this source-loaded Pricing owner.
@@ -1722,26 +1713,6 @@ const prepareRegisteredBulkArtifacts = Effect.fn('BulkOriginalIntent.prepareRegi
       publishedShellRuntime: { document: shellRuntimeDocument, receiverDeployment: shellRuntime.deployment },
       validityMs: 3_600_000,
     }).pipe(Effect.flatMap(validateActiveApplicationCompositionSnapshot));
-    return Object.freeze({ appRoot, artifact, composition, description });
-  },
-);
-interface PreparedRegisteredBulkArtifactsId {
-  readonly identifier: unique symbol;
-}
-const PreparedRegisteredBulkArtifacts: Context.Service<
-  PreparedRegisteredBulkArtifactsId,
-  Effect.Success<ReturnType<typeof prepareRegisteredBulkArtifacts>>
-> = Context.Service('BulkOriginalIntent.preparedRegisteredArtifacts');
-const registeredBulkArtifactsLayer = Layer.effect(
-  PreparedRegisteredBulkArtifacts,
-  prepareRegisteredBulkArtifacts(),
-).pipe(Layer.provideMerge(nativeServices));
-
-// Each case still owns its own isolated database, migrations and server processes; only the
-// compiled artifact and the composition above are shared.
-const makeRegisteredBulkFixture = Effect.fn('BulkOriginalIntent.makeRegisteredFixture')(
-  function* makeRegisteredBulkFixture() {
-    const { appRoot, artifact, composition, description } = yield* PreparedRegisteredBulkArtifacts;
     const isolated = yield* makeIsolatedNativeDatabaseFixture({
       compositionSnapshot: composition,
       mode: 'schema-only',
@@ -1749,12 +1720,8 @@ const makeRegisteredBulkFixture = Effect.fn('BulkOriginalIntent.makeRegisteredFi
     });
     yield* copyOwnerBookkeeping(isolated.connections);
     yield* migrateOwner(isolated.connections);
-    // Both post-migration controls only read this database's own catalog, so they run together
-    // instead of serializing a SQL round trip behind the verifier child process.
-    yield* Effect.all(
-      [verifyAppendOnlyPolicyRoleSets(isolated.connections.runtime), migrateOwner(isolated.connections, 'verify')],
-      { concurrency: 2 },
-    );
+    yield* verifyAppendOnlyPolicyRoleSets(isolated.connections.runtime);
+    yield* migrateOwner(isolated.connections, 'verify');
     const evidenceServices = yield* Layer.build(
       PgClient.layer({ url: Redacted.make(isolated.connections.admin.connectionString) }).pipe(
         Layer.provideMerge(Reactivity.layer),
@@ -2732,6 +2699,17 @@ const registeredPriceOriginalIntentTest = Effect.fnUntraced(function* registered
   return yield* Effect.void;
 }, Effect.scoped);
 
+it.layer(nativeServices, { excludeTestServices: true })((suite) =>
+  suite.effect(
+    'settles registered public Price K1 and recovers only its exact K2 intent with truthful audit (#1278)',
+    () =>
+      registeredPriceOriginalIntentTest().pipe(
+        Effect.provide(staffAuthenticationNamespaceRegistryLayer(['catalog', 'pricing'])),
+      ),
+    120_000,
+  ),
+);
+
 const registeredFeeOriginalIntentTest = Effect.fnUntraced(function* registeredFeeOriginalIntent() {
   const nativeClock = yield* Clock.Clock;
   const registered = yield* makeRegisteredBulkFixture();
@@ -2746,11 +2724,15 @@ const registeredFeeOriginalIntentTest = Effect.fnUntraced(function* registeredFe
   expect(snapshot.targets).toHaveLength(2);
   // All process/server/migration setup has completed before starting this bounded real chronology.
   const t0 = DateTime.makeUnsafe(yield* nativeClock.currentTimeMillis);
-  const tB = DateTime.add(t0, { seconds: 1 });
+  const tB = DateTime.add(t0, { seconds: 15 });
+  const tC = DateTime.add(t0, { seconds: 25 });
+  const tD = DateTime.add(t0, { seconds: 95 });
   const initialFrom = DateTime.formatIso(DateTime.add(t0, { seconds: -1 }));
   const initialTo = DateTime.formatIso(tB);
-  const ownerSetupStartedAt = yield* nativeClock.currentTimeMillis;
-  const preparedTargets = yield* fixture
+  const scheduledFrom = DateTime.formatIso(tC);
+  const scheduledTo = DateTime.formatIso(tD);
+  expect(initialFrom < initialTo && initialTo < scheduledFrom && scheduledFrom < scheduledTo).toBe(true);
+  const prepared = yield* fixture
     .prepareOwner(
       Effect.fn('BulkOriginalIntent.prepareRegisteredFees')(function* prepareRegisteredFees(transaction, scope) {
         const currency = yield* currencySupportPersistenceForScope(
@@ -2833,15 +2815,24 @@ const registeredFeeOriginalIntentTest = Effect.fnUntraced(function* registeredFe
               });
               return {
                 catalogTargetEvidence,
-                configuredAmount: defineOperation.payload.configuredAmount,
-                expectedScheduleRevision: before.schedule.scheduleRevision,
                 identity: {
                   snapshotId: snapshot.snapshotId,
                   target: target.target,
                   targetId: target.targetId,
                 },
-                identityKey: defineOperation.payload.identityKey,
                 intentId: `TEST:1278:registered-fee:${yield* nextId}`,
+                operation: {
+                  kind: 'REVISE_COMMERCIAL_FEE' as const,
+                  payload: {
+                    catalogTargetEvidence,
+                    configuredAmount: defineOperation.payload.configuredAmount,
+                    effectivePeriod: { effectiveFrom: scheduledFrom, effectiveTo: scheduledTo },
+                    expectedScheduleRevision: before.schedule.scheduleRevision,
+                    identityKey: defineOperation.payload.identityKey,
+                    intent: 'SCHEDULE_REVISION' as const,
+                    reason: 'Exact registered nonoverlapping Fee schedule',
+                  },
+                },
                 targetCorrelationRef: `TEST:1278:fee-target:${target.targetId}`,
               };
             }),
@@ -2851,39 +2842,6 @@ const registeredFeeOriginalIntentTest = Effect.fnUntraced(function* registeredFe
       'required',
     )
     .pipe(Effect.provideContext(registered.context));
-  // The owner setup above commits at the explicit business instant t0, so the only work that still
-  // has to land before the scheduled start is the K1 HTTP round and its evidence read. Re-base the
-  // scheduled window on the clock that setup actually left behind, and size its headroom from the
-  // measured cost of that comparable owner work instead of assuming 25 s and sleeping the rest off.
-  // [tC,tD) keeps its full 70 s span, because the observation and HTTP rounds below live inside it.
-  const afterOwnerSetup = yield* nativeClock.currentTimeMillis;
-  const settlementHeadroom = Math.max(4 * (afterOwnerSetup - ownerSetupStartedAt), 2000);
-  const earliestScheduledStart = DateTime.toEpochMillis(tB) + 1000;
-  const tC = DateTime.makeUnsafe(Math.max(afterOwnerSetup + settlementHeadroom, earliestScheduledStart));
-  const tD = DateTime.add(tC, { seconds: 70 });
-  const scheduledFrom = DateTime.formatIso(tC);
-  const scheduledTo = DateTime.formatIso(tD);
-  expect(initialFrom < initialTo && initialTo < scheduledFrom && scheduledFrom < scheduledTo).toBe(true);
-  // Only the scheduled window is re-based here; every other part of each intent is the owner
-  // evidence the setup above produced.
-  const prepared = preparedTargets.map((target) => ({
-    catalogTargetEvidence: target.catalogTargetEvidence,
-    identity: target.identity,
-    intentId: target.intentId,
-    operation: {
-      kind: 'REVISE_COMMERCIAL_FEE' as const,
-      payload: {
-        catalogTargetEvidence: target.catalogTargetEvidence,
-        configuredAmount: target.configuredAmount,
-        effectivePeriod: { effectiveFrom: scheduledFrom, effectiveTo: scheduledTo },
-        expectedScheduleRevision: target.expectedScheduleRevision,
-        identityKey: target.identityKey,
-        intent: 'SCHEDULE_REVISION' as const,
-        reason: 'Exact registered nonoverlapping Fee schedule',
-      },
-    },
-    targetCorrelationRef: target.targetCorrelationRef,
-  }));
   const input = yield* Schema.decodeUnknownEffect(ManageProductCommercialFeesBulkPayloadSchema)({
     snapshot,
     targetIntents: prepared,
@@ -3367,20 +3325,10 @@ const registeredFeeOriginalIntentTest = Effect.fnUntraced(function* registeredFe
   return yield* Effect.void;
 }, Effect.scoped);
 
-// Both registered cases share the one compiled Catalog artifact and composition this layer
-// prepares, and each still builds its own isolated database inside its own test scope.
-it.layer(registeredBulkArtifactsLayer, { excludeTestServices: true, timeout: 120_000 })((suite) => {
-  suite.effect(
-    'settles registered public Price K1 and recovers only its exact K2 intent with truthful audit (#1278)',
-    () =>
-      registeredPriceOriginalIntentTest().pipe(
-        Effect.provide(staffAuthenticationNamespaceRegistryLayer(['catalog', 'pricing'])),
-      ),
-    120_000,
-  );
+it.layer(nativeServices, { excludeTestServices: true })((suite) =>
   suite.effect(
     'recovers registered Fee scheduling at real Current time without reinterpreting it as retirement (#1278)',
     registeredFeeOriginalIntentTest,
     { timeout: 120_000 },
-  );
-});
+  ),
+);

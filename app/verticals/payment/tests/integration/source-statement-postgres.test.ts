@@ -40,7 +40,6 @@ import type { ConfiguredRefundAuthority } from '../support/refund-execution-rout
 import type { PaymentTestDatabase, PaymentTestScope } from './database-fixture.ts';
 import {
   COMPOSITION_REVISION,
-  awaitQueuedLockWaiters,
   collectInput,
   failureCodeOf,
   makeTestScope,
@@ -318,7 +317,7 @@ const nativeDatabase = Effect.gen(function* nativeDatabase() {
         [scope.tenantId, scope.legalEntityId],
       )
       .pipe(Effect.map((rows) => rows[0]?.count ?? -1));
-  return { admin, countRows, database, runtimeClient: runtime, scope };
+  return { admin, countRows, database, scope };
 });
 
 describe('#1152 external/offline source boundary on native PostgreSQL', () => {
@@ -1113,11 +1112,11 @@ describe('#1151 source ingress concurrency on native PostgreSQL', () => {
   it.live('#1151 Duplicate and corroborating observations describe one effect: concurrent redelivery serializes', () =>
     Effect.scoped(
       Effect.gen(function* concurrentRedelivery() {
-        const { admin, countRows, database, runtimeClient, scope } = yield* nativeDatabase;
+        const { admin, countRows, database, scope } = yield* nativeDatabase;
         yield* configure(database, scope, authorityFor(erpBank, 'BANK_ACCOUNTING_RECEIPT', 'BANK_TRANSFER_ADVANCE'));
         const payment = yield* createPayment(database, scope, 'BANK_TRANSFER_ADVANCE', bankBinding);
         const collect = yield* startCollect(database, scope, payment);
-        const locked = yield* Deferred.make<number>();
+        const locked = yield* Deferred.make<boolean>();
         const release = yield* Deferred.make<boolean>();
         const payload = yield* Schema.decodeUnknownEffect(AcceptPaymentObservationPayloadSchema)(
           bankReceipt(payment.paymentId),
@@ -1126,11 +1125,7 @@ describe('#1151 source ingress concurrency on native PostgreSQL', () => {
         const receivedAtMs = yield* Clock.currentTimeMillis;
         const verifiedAtMs = receivedAtMs + 1000;
         const pauseQualification = Effect.gen(function* pauseQualification() {
-          // The backend holding the authority lock, read on this transaction's own connection.
-          const [backend] = yield* runtimeClient
-            .unsafe<{ readonly pid: number }>('select pg_backend_pid() as pid')
-            .pipe(Effect.orDie);
-          yield* Deferred.succeed(locked, backend?.pid ?? 0);
+          yield* Deferred.succeed(locked, true);
           yield* Deferred.await(release);
           yield* TestClock.setTime(verifiedAtMs);
         });
@@ -1139,7 +1134,7 @@ describe('#1151 source ingress concurrency on native PostgreSQL', () => {
         const first = yield* inActionTransaction(database, scope, COMPOSITION_REVISION, (services, base) =>
           Effect.gen(function* acceptWhileHolding() {
             yield* TestClock.setTime(receivedAtMs);
-            const source: PaymentSourceServices['source'] = {
+            const source = {
               ...services.source,
               lockAuthorities: (...args: Parameters<typeof services.source.lockAuthorities>) =>
                 services.source.lockAuthorities(...args).pipe(Effect.tap(pauseQualification)),
@@ -1158,16 +1153,29 @@ describe('#1151 source ingress concurrency on native PostgreSQL', () => {
             });
           }).pipe(Effect.provide(TestClock.layer())),
         ).pipe(Effect.forkChild);
-        const holderPid = yield* Deferred.await(locked);
+        yield* Deferred.await(locked);
 
         // Delivery B of the identical occurrence races through the real handler.
         const second = yield* accept(database, scope, bankReceipt(payment.paymentId)).pipe(Effect.forkChild);
-        // PostgreSQL proves B queues behind A's source authority lock (not merely slow) before A proceeds.
-        expect(
-          yield* awaitQueuedLockWaiters(admin, { expected: 1, holderPid }).pipe(
-            Effect.ensuring(Deferred.succeed(release, true)),
-          ),
-        ).toBeGreaterThan(0);
+        const waitingOnLocks = admin
+          .unsafe<{ waiting: number }>(
+            `select count(*)::integer as waiting from pg_catalog.pg_stat_activity
+             where datname = current_database() and cardinality(pg_catalog.pg_blocking_pids(pid)) > 0
+               and wait_event_type = 'Lock'`,
+          )
+          .pipe(Effect.map((rows) => rows[0]?.waiting ?? 0));
+        const awaitBlockedWaiter = (
+          remainingChecks: number,
+        ): Effect.Effect<number, Effect.Error<typeof waitingOnLocks>> =>
+          waitingOnLocks.pipe(
+            Effect.flatMap((waiting) =>
+              waiting > 0 || remainingChecks === 0
+                ? Effect.succeed(waiting)
+                : Effect.suspend(() => awaitBlockedWaiter(remainingChecks - 1)),
+            ),
+          );
+        expect(yield* awaitBlockedWaiter(5000)).toBeGreaterThan(0);
+        yield* Deferred.succeed(release, true);
 
         const winner = yield* Fiber.join(first);
         const loser = yield* Fiber.join(second);

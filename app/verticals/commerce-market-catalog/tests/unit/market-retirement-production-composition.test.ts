@@ -926,4 +926,7 @@ describe('Market pure owner settlement and scripted transport (not Core authoriz
       }),
     );
   }
+
+  it('retains the exact original effective instant', () =>
+    expect(DateTime.formatIso(payload.effectiveAt)).toBe(effectiveAt));
 });

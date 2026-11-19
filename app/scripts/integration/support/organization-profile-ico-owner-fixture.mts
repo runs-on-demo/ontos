@@ -23,7 +23,7 @@ import {
 import {
   buildProductOwner,
   encodeProductComposition,
-  nativePorts,
+  nativePort,
   productComposition,
   startProductOwner,
   SymmyC14ProductFixtureUnavailable,
@@ -62,7 +62,14 @@ export const makeOrganizationProfileIcoOwnerFixture = Effect.fn('OrganizationPro
       input: CompanyGovernorInitialization,
     ) => Effect.Effect<TrustedPrincipalContext, SymmyC14ProductFixtureUnavailable>,
   ) {
-    const ports = yield* nativePorts(appIds);
+    const ports = new Map<string, number>();
+    for (const appId of appIds) {
+      let port = yield* nativePort;
+      while ([...ports.values()].includes(port)) {
+        port = yield* nativePort;
+      }
+      ports.set(appId, port);
+    }
     const { contracts, snapshot } = yield* productComposition(
       Object.fromEntries([...ports].map(([appId, port]) => [appId, `http://127.0.0.1:${port}/`])),
     );
