@@ -49,7 +49,7 @@ jobs:
   queue-proof:
     name: Find the run that already proved this commit
     if: ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && inputs.force-ci-full != true) || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     # contents: read fetches the pull request head a merge queue entry is checked against.
     permissions:
@@ -110,7 +110,7 @@ jobs:
   cancel-replaced-queue-runs:
     name: Cancel the runs of this pull request's replaced queue entries
     if: github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions:
       actions: write
@@ -167,7 +167,7 @@ jobs:
     name: Stop this red merge queue run (Format and Lint)
     needs: [format-and-lint]
     if: ${{ !cancelled() && needs.format-and-lint.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: &stop-red-queue-run-permissions
       actions: write
@@ -189,7 +189,7 @@ jobs:
     name: Stop this red merge queue run (Repository Tooling Tests)
     needs: [workspace-gate]
     if: ${{ !cancelled() && needs.workspace-gate.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -198,7 +198,7 @@ jobs:
     name: Stop this red merge queue run (Source, Generation, and Deployment Contracts)
     needs: [workspace-source-contracts]
     if: ${{ !cancelled() && needs.workspace-source-contracts.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -207,7 +207,7 @@ jobs:
     name: Stop this red merge queue run (Static Contracts)
     needs: [static-contracts]
     if: ${{ !cancelled() && needs.static-contracts.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -216,7 +216,7 @@ jobs:
     name: Stop this red merge queue run (Build node artifacts)
     needs: [node-artifact-build]
     if: ${{ !cancelled() && needs.node-artifact-build.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -225,7 +225,7 @@ jobs:
     name: Stop this red merge queue run (Prepare integration database)
     needs: [service-integration]
     if: ${{ !cancelled() && needs.service-integration.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -234,7 +234,7 @@ jobs:
     name: Stop this red merge queue run (Authenticated browser checks)
     needs: [browser-integration]
     if: ${{ !cancelled() && needs.browser-integration.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -243,7 +243,7 @@ jobs:
     name: Stop this red merge queue run (Deployment Bootstrap and Node Federation Proof)
     needs: [node-topology-proof]
     if: ${{ !cancelled() && needs.node-topology-proof.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -252,7 +252,7 @@ jobs:
     name: Stop this red merge queue run (Deferred authenticated browser checks)
     needs: [browser-integration-after-static]
     if: ${{ !cancelled() && needs.browser-integration-after-static.result == 'failure' && github.event_name == 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions: *stop-red-queue-run-permissions
     steps: *stop-red-queue-run-steps
@@ -261,7 +261,7 @@ jobs:
     name: Select required checks from changed inputs
     needs: [queue-proof]
     if: ${{ !cancelled() && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/bench/')) }}
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 10
     # actions: read finds the newest green push run of a branch without a merge queue.
     permissions:
@@ -375,7 +375,7 @@ jobs:
   warm-caches:
     name: Warm the gate caches on main
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/bench/'))
-    runs-on: &gate-image ubuntu-latest
+    runs-on: &gate-image runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/sticky=ontos-ws:20gb/env=dev-sujoysingh
     timeout-minutes: 45
     steps:
       - name: Harden Runner
@@ -402,6 +402,7 @@ jobs:
         run: mise exec -- pnpm typecheck
 
       - name: Save the TS-Go typecheck build
+        if: env.BENCH_STICKY != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: app/node_modules/.cache/tsgo
@@ -1073,7 +1074,7 @@ jobs:
         if: matrix.suite == 'integration'
         working-directory: app
         env:
-          ONTOS_CI_ISOLATED_WORKERS: '2'
+          ONTOS_CI_ISOLATED_WORKERS: '4'
         run: bash scripts/ci/start-integration-workers.sh
 
       # The owner rows need the database producer, so this run's archive exists when they start. The restore
@@ -1086,7 +1087,7 @@ jobs:
         working-directory: app
         env:
           GH_TOKEN: ${{ github.token }}
-          ONTOS_CI_ISOLATED_WORKERS: '2'
+          ONTOS_CI_ISOLATED_WORKERS: '4'
           INTEGRATION_DATABASE_ARCHIVE: ${{ runner.temp }}/integration-database
         run: |
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name integration-database --dir "$INTEGRATION_DATABASE_ARCHIVE"
@@ -1273,7 +1274,7 @@ jobs:
           APP_ENV_PATH: /dev/null
           SPICEDB_DATABASE_PASSWORD: spicedb
           INTEGRATION_TASKS: ${{ toJSON(matrix.tasks) }}
-          ONTOS_CI_ISOLATED_WORKERS: '2'
+          ONTOS_CI_ISOLATED_WORKERS: '4'
           INTEGRATION_LANES: ${{ matrix.lanes }}
         # Same commands as `pnpm test:integration`, with separate Rstest shards for the root and large packages.
         run: bash scripts/ci/run-integration-suites.sh
@@ -1475,7 +1476,7 @@ jobs:
           for unit in "${units[@]}"; do
             filters+=(--filter "./$unit")
           done
-          mise exec -- pnpm -r --no-sort --workspace-concurrency=2 "${filters[@]}" run build
+          mise exec -- pnpm -r --no-sort --workspace-concurrency=4 "${filters[@]}" run build
 
       # Everything the build wrote inside the shard's units is ignored by git; node_modules is the install.
       - name: Pack the shard's build outputs
@@ -1526,7 +1527,7 @@ jobs:
         node-artifact-build,
         node-topology-proof,
       ]
-    runs-on: ubuntu-latest
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.2xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 5
     permissions:
       contents: read

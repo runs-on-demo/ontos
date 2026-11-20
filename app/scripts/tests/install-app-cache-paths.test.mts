@@ -290,7 +290,7 @@ it('never saves an exact hit again and lets a caller opt out of the gates tree',
     'Restore the installed workspace',
     'Verify the restored workspace resolves',
   ]) {
-    expect(step(name).if, name).toBe(optedIn);
+    expect(step(name).if, name).toContain(optedIn);
   }
   for (const name of ['Check that the installed workspace may be published', 'Save the installed workspace']) {
     expect(step(name).if, name).toContain(optedIn);
