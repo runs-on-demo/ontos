@@ -1,0 +1,58 @@
+# Benchmark harness, not part of ontos CI. Writes the main branch's sticky disk lineage: a pull request's first
+# run restores the newest main snapshot of its lineage, so before each replayed PR the driver dispatches this on
+# main with the dependency state main had just before that PR.
+name: bench sticky seed
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit whose dependencies to install onto the disk
+        required: true
+      action-from:
+        description: Commit whose install-app action (with the sticky mount) to use
+        required: true
+      labels:
+        description: RunsOn label parts after the run id (family, image, extras, sticky)
+        required: true
+      typecheck:
+        description: Also build the TS-Go typecheck cache onto the disk
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    runs-on: runs-on=${{ github.run_id }}/${{ inputs.labels }}/env=dev-sujoysingh
+    timeout-minutes: 30
+    steps:
+      - name: Check out the commit to seed from
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Use the arm's install action
+        env:
+          ACTION_FROM: ${{ inputs.action-from }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 "https://github.com/${GITHUB_REPOSITORY}.git" "$ACTION_FROM"
+          git checkout FETCH_HEAD -- .github/actions/install-app
+
+      - name: Install the workspace onto the sticky disk
+        uses: ./.github/actions/install-app
+        with:
+          restore-typescript-build: 'true'
+
+      - name: Require the sticky disk
+        run: test "${BENCH_STICKY:-}" = true
+
+      # An older commit may not typecheck cleanly; the build it leaves is still the cache main would hold.
+      - name: Build the TS-Go typecheck cache
+        if: inputs.typecheck
+        continue-on-error: true
+        working-directory: app
+        run: mise exec -- pnpm typecheck
