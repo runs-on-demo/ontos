@@ -34,6 +34,7 @@ import {
   ReadRuntime,
   TrustedPrincipalContextSchema,
 } from '@app/core-runtime';
+import { GATEWAY_ASSERTION_TTL_SECONDS } from '@app/shared-contracts';
 import type {
   ActionCoreError,
   ActionRuntimeService,
@@ -47,7 +48,7 @@ import { ActiveApplicationCompositionSourceLive } from '@app/core-runtime/module
 import { makeApplicationCompositionSnapshotFixture } from '@app/core-runtime/testing/module-contract';
 import { NodeCrypto } from '@effect/platform-node';
 import { HttpApi, HttpApiBuilder, HttpRouter, HttpServer } from '@modern-js/bff-effect/effect-edge';
-import { ConfigProvider, Context, Crypto, Effect, Layer, Logger, Schema, Predicate, Struct } from 'effect';
+import { Clock, ConfigProvider, Context, Crypto, Effect, Layer, Logger, Schema, Predicate, Struct } from 'effect';
 import { assert, expect, it } from 'effect-rstest';
 import { FetchHttpClient } from 'effect/http';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
@@ -105,7 +106,10 @@ const archivePayload = {
 const archivedParty = Schema.decodeSync(PartySchema)({
   archivedAt: '2026-09-01T00:00:00.000Z',
   createdAt: '2026-09-01T00:00:00.000Z',
+  businessName: 'Example organization',
   displayName: 'Example organization',
+  firstName: null,
+  lastName: null,
   partyRef,
   partyType: 'ORGANIZATION' as const,
   revision: 1,
@@ -114,7 +118,7 @@ const archivedParty = Schema.decodeSync(PartySchema)({
 
 const createPayload = {
   candidate: {
-    displayName: 'Example organization',
+    businessName: 'Example organization',
     evidenceRefs: ['document:verified'],
     officialIdentifiers: [],
     partyType: 'ORGANIZATION',
@@ -132,14 +136,24 @@ const relationshipPayload = {
   validTo: null,
 } as const;
 
+const legacyContactPayload = {
+  contactPoint: { preferred: false, type: 'EMAIL', value: 'declared@example.com' },
+  partyRef,
+  privacyClassification: 'PERSONAL',
+  provenance: { authoritative: false, method: 'MANUAL_CONFIRMATION', source: 'USER_ASSERTION' },
+  validFrom: '2026-09-01T00:00:00.000Z',
+  verification: { state: 'UNVERIFIED' },
+} as const;
+
 type CommandTestPayload =
   | Readonly<Record<string, never>>
   | typeof archivePayload
+  | typeof legacyContactPayload
   | typeof createPayload
   | typeof relationshipPayload
   | Readonly<{
-      candidate: Omit<(typeof createPayload)['candidate'], 'displayName'> & {
-        readonly displayName: string;
+      candidate: Omit<(typeof createPayload)['candidate'], 'businessName'> & {
+        readonly businessName: string;
       };
     }>;
 
@@ -251,6 +265,7 @@ const makeAssertion = (
       use: 'sig',
     };
     const tokenId = yield* nextUuid;
+    const issuedAt = Math.floor((yield* Clock.currentTimeMillis) / 1000);
     const token = yield* Effect.promise(() =>
       new SignJWT({
         compositionRevision: snapshot.composition.revision,
@@ -266,13 +281,14 @@ const makeAssertion = (
         .setIssuer(options.tokenIssuer ?? issuer)
         .setAudience(audience)
         .setSubject(principal.principalId)
-        .setIssuedAt()
-        .setExpirationTime(options.expiresAt ?? '5m')
+        .setIssuedAt(issuedAt)
+        .setExpirationTime(options.expiresAt ?? issuedAt + GATEWAY_ASSERTION_TTL_SECONDS)
         .setJti(tokenId)
         .sign(privateKey),
     );
     const otherPrincipal = { ...principal, principalId: yield* nextUuid };
     const otherTokenId = yield* nextUuid;
+    const otherIssuedAt = Math.floor((yield* Clock.currentTimeMillis) / 1000);
     const otherToken = yield* Effect.promise(() =>
       new SignJWT({
         compositionRevision: snapshot.composition.revision,
@@ -288,8 +304,8 @@ const makeAssertion = (
         .setIssuer(issuer)
         .setAudience(audience)
         .setSubject(otherPrincipal.principalId)
-        .setIssuedAt()
-        .setExpirationTime('5m')
+        .setIssuedAt(otherIssuedAt)
+        .setExpirationTime(otherIssuedAt + GATEWAY_ASSERTION_TTL_SECONDS)
         .setJti(otherTokenId)
         .sign(privateKey),
     );
@@ -523,6 +539,25 @@ const engagementRequest = (path: string, payload: EngagementTestPayload, token: 
   });
 };
 
+/**
+ * The three declared refusals the archive command must keep apart on the wire. They capture nothing
+ * from a test, so they live here and one bound service reads the case under test from a slot.
+ */
+const notFoundTransition = () => Effect.succeed({ _tag: 'not_found' as const });
+const unavailableTransition = () =>
+  Effect.fail(
+    new PartyPersistenceUnavailable({
+      code: 'party_persistence_unavailable',
+      reason: 'private database diagnostic',
+    }),
+  );
+const defectTransition = () => Effect.die('private unexpected diagnostic');
+const failureCases = [
+  { status: 404, tag: 'PartyCommandNotFoundProblem', transition: notFoundTransition },
+  { status: 503, tag: 'PartyCommandUnavailableProblem', transition: unavailableTransition },
+  { status: 500, tag: 'PartyCommandInternalProblem', transition: defectTransition },
+];
+
 it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
   suite.effect(
     'every registered command is mounted and rejects missing structural input or authentication before the lifecycle',
@@ -585,6 +620,25 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
         expect(Predicate.isTagged(malformedBody, 'PartyCommandInvalidRequestProblem')).toBe(true);
         expect(harness.snapshot().invocations.length).toBe(0);
       }),
+  );
+
+  suite.effect('obsolete verification keys are rejected before an Action invocation is created', () =>
+    Effect.gen(function* rejectObsoleteVerificationKeys() {
+      const assertion = yield* makeAssertion();
+      const harness = yield* makeActionTestHarness({ ownerRegistration: partyRegistryBackendRegistration });
+      const app = yield* mountApp(harness, assertion.environment);
+      const response = yield* handle(
+        app,
+        commandRequest('add-contact-point', legacyContactPayload, assertion.token, {
+          'idempotency-key': 'obsolete-verification-key',
+        }),
+      );
+      expect(response.status).toBe(400);
+      expect(response.headers.get('content-type') ?? '').toMatch(/application\/problem\+json/u);
+      const body = yield* Effect.promise(() => response.json());
+      expect(Predicate.isTagged(body, 'PartyCommandInvalidRequestProblem')).toBe(true);
+      expect(harness.snapshot().invocations.length).toBe(0);
+    }),
   );
 
   suite.effect(
@@ -1050,9 +1104,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
       const assertion = yield* makeAssertion();
       const correlationId = 'x'.repeat(200);
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
       });
       const app = yield* mountApp(harness, assertion.environment);
       const response = yield* handle(
@@ -1156,15 +1209,12 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
   suite.effect('the endpoint-owned mapper preserves representative Core failure semantics', () =>
     Effect.gen(function* mapRepresentativeActionFailures() {
       const assertion = yield* makeAssertion();
+      const initialFailure = new ActionPayloadValidationError({
+        code: 'action_payload_invalid',
+        reason: 'invalid payload fixture',
+      });
       const cases: readonly [failure: ActionCoreError, status: number, tag: string][] = [
-        [
-          new ActionPayloadValidationError({
-            code: 'action_payload_invalid',
-            reason: 'invalid payload fixture',
-          }),
-          400,
-          'PartyCommandInvalidRequestProblem',
-        ],
+        [initialFailure, 400, 'PartyCommandInvalidRequestProblem'],
         [
           new ActionPermissionDenied({
             code: 'action_permission_denied',
@@ -1256,29 +1306,25 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
         ],
       ];
 
-      yield* forEachSequential(cases, ([failure, expectedStatus, expectedTag]) =>
+      let failure: ActionCoreError = initialFailure;
+      const harness = yield* makeActionTestHarness({ ownerRegistration: partyRegistryBackendRegistration });
+      const failingRuntime: ActionRuntimeService = {
+        resolveActionCommit: harness.runtime.resolveActionCommit,
+        runAction: () => Effect.fail(failure),
+      };
+      const app = yield* mountApp(harness, assertion.environment, undefined, nonPersistingRedemption, failingRuntime);
+      yield* forEachSequential(cases, ([nextFailure, expectedStatus, expectedTag]) =>
         Effect.gen(function* verifyActionFailureMapping() {
-          const harness = yield* makeActionTestHarness({ ownerRegistration: partyRegistryBackendRegistration });
-          const failingRuntime: ActionRuntimeService = {
-            resolveActionCommit: harness.runtime.resolveActionCommit,
-            runAction: () => Effect.fail(failure),
-          };
-          const app = yield* mountApp(
-            harness,
-            assertion.environment,
-            undefined,
-            nonPersistingRedemption,
-            failingRuntime,
-          );
+          failure = nextFailure;
           const response = yield* handle(
             app,
             commandRequest('request-search-rebuild', {}, assertion.token, {
-              'idempotency-key': `mapping-${failure.code}`,
+              'idempotency-key': `mapping-${nextFailure.code}`,
             }),
           );
-          expect(response.status, failure.code).toBe(expectedStatus);
+          expect(response.status, nextFailure.code).toBe(expectedStatus);
           const body = yield* Effect.promise(() => response.json());
-          expect(Predicate.isTagged(body, expectedTag), failure.code).toBe(true);
+          expect(Predicate.isTagged(body, expectedTag), nextFailure.code).toBe(true);
         }),
       );
     }),
@@ -1330,9 +1376,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     Effect.gen(function* persistPermissionDenial() {
       const assertion = yield* makeAssertion();
       const harness = yield* makeActionTestHarness({
+        access: 'denied',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'denied',
-        tenantPermission: 'allowed',
       });
       const app = yield* mountApp(harness, assertion.environment);
 
@@ -1354,9 +1399,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     Effect.gen(function* rollBackDomainConflict() {
       const assertion = yield* makeAssertion();
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
         services: [
           bindActionTestServices(archivePartyAction, {
             transition: () =>
@@ -1392,9 +1436,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
         resourceId: 'a4000000-0000-4000-8000-000000000002',
       };
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
         services: [
           bindActionTestServices(archivePartyAction, {
             transition: () =>
@@ -1429,13 +1472,12 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     }),
   );
 
-  suite.effect('committed request replay stays a terminal 409 and does not execute or emit twice', () =>
-    Effect.gen(function* rejectCommittedCommandReplay() {
+  suite.effect('committed request replay returns the saved reply and does not execute or emit twice', () =>
+    Effect.gen(function* replayCommittedCommand() {
       const assertion = yield* makeAssertion();
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
       });
       const app = yield* mountApp(harness, assertion.environment);
 
@@ -1456,13 +1498,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
           'idempotency-key': 'replay-test',
         }),
       );
-      expect(replay.status).toBe(409);
-      const body = yield* Effect.promise(() => replay.json());
-      expect(Predicate.isTagged(body, 'PartyCommandAlreadyCommittedProblem')).toBe(true);
-      expect(body.code).toBe('action_already_committed');
-      expect(body.invocationId).toBe(harness.snapshot().invocations[0]?.actionInvocationId);
-      expect(body.retryCommand).toBe(false);
-      expect(body.resolution).toBe('REFRESH_GOVERNED_READS');
+      expect(replay.status).toBe(200);
+      expect(yield* Effect.promise(() => replay.json())).toEqual(result);
       expect(harness.snapshot().invocations.length).toBe(1);
       expect(harness.snapshot().committed).toEqual(committed);
     }),
@@ -1473,62 +1510,41 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     () =>
       Effect.gen(function* preserveDistinctFailureStatuses() {
         const assertion = yield* makeAssertion();
-        const cases = [
-          {
-            status: 404,
-            tag: 'PartyCommandNotFoundProblem',
-            service: bindActionTestServices(archivePartyAction, {
-              transition: () => Effect.succeed({ _tag: 'not_found' as const }),
+        // `bindActionTestServices` binds the transition at construction, so one bound service reads
+        // the case under test from here instead of rebuilding the harness and web handler per case.
+        let transition: (typeof failureCases)[number]['transition'] = notFoundTransition;
+        const harness = yield* makeActionTestHarness({
+          access: 'allowed',
+          ownerRegistration: partyRegistryBackendRegistration,
+          services: [
+            bindActionTestServices(archivePartyAction, {
+              transition: () => Effect.suspend(transition),
             }),
-          },
-          {
-            status: 503,
-            tag: 'PartyCommandUnavailableProblem',
-            service: bindActionTestServices(archivePartyAction, {
-              transition: () =>
-                Effect.fail(
-                  new PartyPersistenceUnavailable({
-                    code: 'party_persistence_unavailable',
-                    reason: 'private database diagnostic',
-                  }),
-                ),
-            }),
-          },
-          {
-            status: 500,
-            tag: 'PartyCommandInternalProblem',
-            service: bindActionTestServices(archivePartyAction, {
-              transition: () => Effect.die('private unexpected diagnostic'),
-            }),
-          },
-        ];
-        yield* forEachSequential(cases, (item) =>
+          ],
+        });
+        const app = yield* mountApp(harness, assertion.environment);
+        yield* forEachSequential(failureCases, ({ status, tag, transition: caseTransition }) =>
           Effect.gen(function* verifySafeFailureResponse() {
-            const harness = yield* makeActionTestHarness({
-              ownerRegistration: partyRegistryBackendRegistration,
-              actionPermission: 'allowed',
-              tenantPermission: 'allowed',
-              services: [item.service],
-            });
-            const app = yield* mountApp(harness, assertion.environment);
+            transition = caseTransition;
 
             const response = yield* handle(
               app,
               commandRequest('archive-party', archivePayload, assertion.token, {
-                'idempotency-key': `failure-${item.status}`,
+                'idempotency-key': `failure-${status}`,
               }),
             );
-            expect(response.status).toBe(item.status);
+            expect(response.status).toBe(status);
             expect(response.headers.get('content-type') ?? '').toMatch(/application\/problem\+json/u);
             const body = yield* Effect.promise(() => response.json());
-            expect(Predicate.isTagged(body, item.tag)).toBe(true);
-            expect(body.status).toBe(item.status);
+            expect(Predicate.isTagged(body, tag)).toBe(true);
+            expect(body.status).toBe(status);
             expect((yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(body)).includes('private')).toBe(
               false,
             );
-            if (item.status === 503) {
+            if (status === 503) {
               expect(body.retryable).toBe(true);
             }
+            // Cumulative over the shared harness: every case fails, so nothing may ever commit.
             expect(harness.snapshot().committed.length).toBe(0);
           }),
         );
@@ -1539,9 +1555,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     Effect.gen(function* rejectInsufficientPartyEvidence() {
       const assertion = yield* makeAssertion();
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
         services: [
           bindActionTestServices(createPartyAction, {
             createOrMatch: () =>
@@ -1578,9 +1593,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
       const assertion = yield* makeAssertion();
       let executions = 0;
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
         services: [
           bindActionTestServices(createPartyAction, {
             createOrMatch: () =>
@@ -1614,7 +1628,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
           {
             candidate: {
               ...createPayload.candidate,
-              displayName: 'Different organization',
+              businessName: 'Different organization',
             },
           },
           assertion.token,
@@ -1652,8 +1666,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     Effect.gen(function* resolveOpenInvocationWithoutRetry() {
       const assertion = yield* makeAssertion();
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
         services: [
           bindActionTestServices(archivePartyAction, {
             transition: () =>
@@ -1663,7 +1677,6 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
               }),
           }),
         ],
-        tenantPermission: 'allowed',
       });
       const app = yield* mountApp(harness, assertion.environment);
 
@@ -1686,7 +1699,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
   );
 
   suite.effect(
-    'actual Core commit acknowledgement loss resolves and the mounted governed Read returns the original decision without rerunning the Action',
+    'actual Core commit acknowledgement loss resolves, the governed Read and a same-key resend return the original decision without rerunning the Action',
     () =>
       Effect.gen(function* recoverOriginalDecisionAfterLostCommitAcknowledgement() {
         const assertion = yield* makeAssertion();
@@ -1694,9 +1707,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
         const decisionResourceId = yield* nextUuid;
         let executions = 0;
         const harness = yield* makeActionTestHarness({
+          access: 'allowed',
           ownerRegistration: partyRegistryBackendRegistration,
-          actionPermission: 'allowed',
-          tenantPermission: 'allowed',
           commitAcknowledgement: 'indeterminate-once',
           services: [
             bindActionTestServices(createPartyAction, {
@@ -1815,11 +1827,12 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
             'idempotency-key': 'uncertain-create',
           }),
         );
-        expect(replay.status).toBe(409);
-        const replayBody = yield* Effect.promise(() => replay.json());
-        expect(Predicate.isTagged(replayBody, 'PartyCommandAlreadyCommittedProblem')).toBe(true);
-        expect(replayBody.invocationId).toBe(invocationId);
-        expect(replayBody.retryCommand).toBe(false);
+        expect(replay.status).toBe(200);
+        expect(yield* Effect.promise(() => replay.json())).toEqual({
+          decisionRef: decisions.get(invocationId)?.decisionRef,
+          outcome: 'CREATED',
+          partyRef,
+        });
         expect(executions).toBe(1);
         expect(harness.snapshot().committed).toEqual(committedSnapshot.committed);
         expect(harness.snapshot().invocations.length).toBe(1);
@@ -1848,9 +1861,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
     Effect.gen(function* acceptBrowserHeaders() {
       const assertion = yield* makeAssertion();
       const harness = yield* makeActionTestHarness({
+        access: 'allowed',
         ownerRegistration: partyRegistryBackendRegistration,
-        actionPermission: 'allowed',
-        tenantPermission: 'allowed',
       });
       const decision: typeof PartyMatchDecisionRecordSchema.Type = {
         caseRef: null,

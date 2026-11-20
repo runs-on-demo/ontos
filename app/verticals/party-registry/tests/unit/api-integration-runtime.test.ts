@@ -205,6 +205,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
                         tenantId: principal.tenantId,
                       },
                       { ...principal, correlationId: 'runtime-assembly-proof' },
+                      { hiddenTextFields: [], listAccess: { groups: [] } },
                     )
                     .pipe(Effect.orDie, Effect.andThen(Effect.die('Party search substitute completed unexpectedly')));
                 }
@@ -225,6 +226,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
                         correlationId: 'runtime-assembly-proof',
                         legalEntityId: 'a5000000-0000-4000-8000-000000000001',
                       },
+                      { hiddenTextFields: [], listAccess: { groups: [] } },
                     )
                     .pipe(
                       Effect.orDie,
@@ -342,7 +344,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
           source: 'runtime-assembly-proof',
         };
         const candidate = {
-          displayName: 'Runtime assembly proof',
+          businessName: 'Runtime assembly proof',
           evidenceRefs: ['document:verified'],
           officialIdentifiers: [],
           partyType: 'ORGANIZATION',
@@ -370,7 +372,6 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
           privacyClassification: 'PUBLIC',
           provenance: contactPointProvenance,
           validFrom: '2026-09-07T00:00:00.000Z',
-          verification: { state: 'UNVERIFIED' },
         } as const;
         const invalidContactResponseRequest = new Request('http://localhost/party-registry/actions/add-contact-point', {
           body: yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
@@ -422,7 +423,6 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
             identifier: {
               identifierType: 'ICO',
               value: '27074358',
-              verification: 'VERIFIED',
             },
             partyRef,
             provenanceMethod: 'DOCUMENT',
@@ -482,7 +482,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
           },
           '/party-registry/actions/match-party': { candidate },
           '/party-registry/actions/update-party': {
-            displayName: 'Updated runtime assembly proof',
+            businessName: 'Updated runtime assembly proof',
             expectedRevision: 1,
             partyRef,
             provenanceMethod: 'DOCUMENT',
@@ -497,9 +497,8 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
           },
           '/party-registry/actions/update-party-official-identifier': {
             change: {
-              expectedVerification: 'UNVERIFIED',
-              type: 'SET_VERIFICATION',
-              verification: 'VERIFIED',
+              type: 'END_VALIDITY',
+              validTo: '2026-10-01T00:00:00.000Z',
             },
             evidenceRefs: ['document:verified'],
             officialIdentifierRef: {
@@ -522,6 +521,7 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
             },
           },
           '/reads/party-match': { candidate },
+          '/reads/party-source-effect-receipt': { operation: 'CREATE', payload: { candidate } },
         } as const;
         for (const [index, endpoint] of endpoints.entries()) {
           const callsBefore: number = actionCalls + actionCommitCalls + readCalls;
@@ -595,10 +595,11 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
         };
         const preflight = yield* Effect.promise(() =>
           runtime.handler(
-            new Request('http://localhost/party-registry/readiness', {
+            new Request('http://localhost/party-registry/actions/create-party', {
               headers: {
-                'access-control-request-headers': 'Authorization, X-Correlation-Id, X-Ontos-Composition-Revision',
-                'access-control-request-method': 'GET',
+                'access-control-request-headers':
+                  'Authorization, X-Action-Intent, X-Correlation-Id, X-Ontos-Composition-Revision',
+                'access-control-request-method': 'POST',
                 origin: 'http://localhost:3020',
               },
               method: 'OPTIONS',
@@ -615,6 +616,9 @@ it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
         );
         expect(commaSeparatedHeader(preflight.headers.get('access-control-allow-headers'))).toContain(
           'X-Ontos-Composition-Revision',
+        );
+        expect(commaSeparatedHeader(preflight.headers.get('access-control-allow-headers'))).toContain(
+          'X-Action-Intent',
         );
         expect({
           actionCalls,
