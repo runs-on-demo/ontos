@@ -62,6 +62,10 @@ services:
     type: nodejs@24
   - hostname: commerceorderworker
     type: nodejs@24
+  - hostname: paymentworker
+    type: nodejs@24
+  - hostname: symmyintegrationworker
+    type: nodejs@24
   # Stage-only services carry hard autoscaling ceilings, so a runaway container cannot grow the bill.
   - hostname: outboxworkerhost
     type: nodejs@24
@@ -108,6 +112,12 @@ services:
     type: nodejs@24
     enableSubdomainAccess: true
   - hostname: payment
+    type: nodejs@24
+    enableSubdomainAccess: true
+  - hostname: promotion
+    type: nodejs@24
+    enableSubdomainAccess: true
+  - hostname: symmyintegration
     type: nodejs@24
     enableSubdomainAccess: true
   # </generated-vertical-provider-imports>
