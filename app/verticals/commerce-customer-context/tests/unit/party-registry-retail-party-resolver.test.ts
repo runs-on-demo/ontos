@@ -25,11 +25,13 @@ const partyRef = (resourceId: string, refTenantId = tenantId) => ({
 const response = (overrides: Partial<PartyDetailResponse> = {}) =>
   Schema.decodeUnknownSync(PartyDetailResponseSchema)({
     currentFactAssertions: [],
-    factHistory: null,
     party: {
       archivedAt: null,
+      businessName: null,
       createdAt: '2026-09-09T09:00:00.000Z',
       displayName: 'Retail Owner',
+      firstName: 'Retail',
+      lastName: 'Owner',
       partyRef: partyRef(partyId),
       partyType: 'PERSON',
       revision: 7,
