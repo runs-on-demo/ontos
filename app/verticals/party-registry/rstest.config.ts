@@ -26,13 +26,25 @@ export default defineConfig({
       output: {
         module: true,
       },
+      plugins: [
+        {
+          name: 'ontos:component-without-ssr-compilation',
+          remove: ['@modern-js/builder-plugin-ssr'],
+          setup() {
+            // Browser component tests do not compile production SSR output.
+          },
+        },
+      ],
       restoreMocks: true,
       testEnvironment: 'happy-dom',
     },
     {
       name: 'integration',
       testEnvironment: 'node',
-      setupFiles: ['./tests/integration/application-composition.setup.ts'],
+      setupFiles: [
+        '../../scripts/ci/integration-worker-setup.mts',
+        './tests/integration/application-composition.setup.ts',
+      ],
       include: ['tests/integration/**/*.test.ts'],
       exclude: [workerCycleIntegrationTest],
       testTimeout: 30_000,
@@ -42,7 +54,10 @@ export default defineConfig({
       // must never run alongside the other integration files.
       name: 'integration-worker-cycle',
       testEnvironment: 'node',
-      setupFiles: ['./tests/integration/application-composition.setup.ts'],
+      setupFiles: [
+        '../../scripts/ci/integration-worker-setup.mts',
+        './tests/integration/application-composition.setup.ts',
+      ],
       include: [workerCycleIntegrationTest],
       testTimeout: 30_000,
     },
@@ -50,6 +65,9 @@ export default defineConfig({
       name: 'unit',
       testEnvironment: 'node',
       include: ['tests/unit/**/*.test.ts'],
+      // Four times the slowest unit test without its own budget, 748 ms in gates runs 43616061381
+      // and 43844802542, instead of the silent 5000 ms Rstest default.
+      testTimeout: 2992,
       tools: { swc },
     },
   ],
