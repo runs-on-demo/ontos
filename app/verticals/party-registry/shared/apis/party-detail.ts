@@ -2,7 +2,6 @@
 import { makeProblemDetailsSchema, makeRetryableProblemDetailsSchema } from '@app/shared-contracts/problem-details';
 import { Schema } from 'effect';
 import { HttpApi, HttpApiEndpoint, HttpApiGroup } from 'effect/http-api';
-import { moduleOperation } from '@app/core-runtime/sdk';
 
 import { AresAppliedEvidenceSchema } from '../domain/ares-application.ts';
 import { AssertionIdSchema } from '../domain/correction-contracts.ts';
@@ -20,7 +19,7 @@ export const PartyFactAssertionSchema = Schema.Struct({
   externalEvidence: Schema.OptionFromOptionalNullOr(AresAppliedEvidenceSchema, {
     onNoneEncoding: 'omit',
   }),
-  factKind: Schema.Literals(['PARTY_TYPE', 'FIRST_NAME', 'LAST_NAME', 'BUSINESS_NAME']),
+  factKind: Schema.Literals(['PARTY_TYPE', 'DISPLAY_NAME']),
   isCurrent: Schema.Boolean,
   partyRef: PartyRefSchema,
   recordedAt: IsoTimestampSchema,
@@ -29,8 +28,7 @@ export const PartyFactAssertionSchema = Schema.Struct({
   supersedesAssertionId: Schema.OptionFromNullOr(AssertionIdSchema),
   validFrom: IsoTimestampSchema,
   validTo: Schema.OptionFromNullOr(IsoTimestampSchema),
-  // Absent when the caller lacks `party.registry.party-identity.read`; the assertion identity stays.
-  value: Schema.optionalKey(Schema.String),
+  value: Schema.String,
 });
 export type PartyFactAssertion = typeof PartyFactAssertionSchema.Type;
 export const PartyDetailResolutionSchema = Schema.Struct({
@@ -40,19 +38,10 @@ export const PartyDetailResolutionSchema = Schema.Struct({
   requestedPartyRef: PartyRefSchema,
 });
 export type PartyDetailResolution = typeof PartyDetailResolutionSchema.Type;
-/** The names are absent when the caller lacks `party.registry.party-identity.read`. */
-const PartyDetailPartySchema = Schema.Struct({
-  ...PartySchema.fields,
-  businessName: Schema.optionalKey(PartySchema.fields.businessName),
-  displayName: Schema.optionalKey(PartySchema.fields.displayName),
-  firstName: Schema.optionalKey(PartySchema.fields.firstName),
-  lastName: Schema.optionalKey(PartySchema.fields.lastName),
-});
 export const PartyDetailResponseSchema = Schema.Struct({
   currentFactAssertions: Schema.Array(PartyFactAssertionSchema),
-  // Absent unless history was requested; a plain array (not an Option) so redaction projects its rows in place.
-  factHistory: Schema.optionalKey(Schema.Array(PartyFactAssertionSchema)),
-  party: PartyDetailPartySchema,
+  factHistory: Schema.OptionFromNullOr(Schema.Array(PartyFactAssertionSchema)),
+  party: PartySchema,
   resolution: PartyDetailResolutionSchema,
 });
 export type PartyDetailResponse = typeof PartyDetailResponseSchema.Type;
@@ -87,16 +76,3 @@ export const PartyDetailApi = HttpApi.make('PartyDetailApi').add(
     }),
   ),
 );
-
-/** The typed operation reference a consumer passes to the Core SDK's `call`. */
-export const partyDetailOperation = moduleOperation({
-  kind: 'read',
-  path: '/reads/party-detail',
-  provider: {
-    entrypointKey: 'party.registry.api.party-detail',
-    moduleId: 'party.registry',
-    schemaVersion: '1',
-  },
-  request: PartyDetailRequestSchema,
-  response: PartyDetailResponseSchema,
-});

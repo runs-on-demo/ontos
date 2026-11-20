@@ -1,4 +1,3 @@
-import { PartySourceUpdateReceiptResultSchema } from '../../shared/apis/party-source-effect-receipt.ts';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { utf8ToBytes } from '@noble/hashes/utils.js';
 
@@ -10,14 +9,13 @@ import { Hex } from 'effect/encoding';
 import type { UnarchivePartyBlocked } from '../../shared/actions/unarchive-party.ts';
 import type { AresAppliedEvidence } from '../../shared/domain/ares-application.ts';
 import { AresAppliedEvidenceSchema } from '../../shared/domain/ares-application.ts';
+import type { NormalizedOfficialIdentifier } from '../../shared/domain/identifier-contracts.ts';
+import { qualifiesForExclusiveClaim } from '../../shared/domain/identifier-contracts.ts';
 import type { Party, PartyCandidate, PartySubjectEvidence, PartyType } from '../../shared/domain/identity-contracts.ts';
 import {
-  PartyEvidenceEvaluationSchema,
-  makePartyRef,
   PartyPersistenceUnavailable,
   PartySchema,
   isPartyTypeEnrichment,
-  derivePartyDisplayName,
 } from '../../shared/domain/identity-contracts.ts';
 import { DuplicateCandidateCaseRefSchema } from '../../shared/resources/duplicate-candidate-case.ts';
 import { PartyMatchDecisionRefSchema } from '../../shared/resources/party-match-decision.ts';
@@ -28,20 +26,14 @@ import {
   duplicateCandidateCases,
   parties,
   partyFactAssertions,
+  partyIdentifierClaims,
   partyMatchDecisions,
   partyOfficialIdentifiers,
 } from '../db/schema.ts';
 import type { PartyTransaction } from '../db/types.ts';
 import { requireCanonicalPartyWriteTarget } from '../merge/party-alias-resolution.service.ts';
 import { requirePartySubjectEvidence } from '../policies/create-party-without-strong-identifier.policy.ts';
-import type { PartyClientSourceScope } from './party-client-source-evidence.service.ts';
-import { preparePartySourceEffect, recordPartySourceEffect } from './party-source-effect.service.ts';
-import type { UpdatePartyPayload } from '../../shared/actions/update-party.ts';
-import { UpdatePartyPayloadSchema } from '../../shared/actions/update-party.ts';
-import { lockTenantIdentityWrites } from './party-identifier-claim.service.ts';
-import { endedPartyFactTransition } from '../../shared/domain/fact-lifecycle.ts';
-import { OrganizationBusinessUpdateInputSchema } from '../../shared/apis/organization-record-facts.ts';
-import { updateOrganizationBusinessRecord } from './organization-business-update.service.ts';
+import { lockAndResolveClaims, lockTenantIdentityWrites } from './party-identifier-claim.service.ts';
 
 const PartyFoundSchema = Schema.TaggedStruct('found', { value: PartySchema });
 const PartyNotFoundSchema = Schema.TaggedStruct('not_found', {});
@@ -50,21 +42,34 @@ const PartyConflictSchema = Schema.TaggedStruct('conflict', {
   value: PartySchema,
 });
 const PartyLifecycleSchema = Schema.Union([PartyLookupSchema, PartyConflictSchema]);
+const PartyUnarchiveIdentityConflictSchema = Schema.TaggedStruct('identity_conflict', {
+  conflictingPartyId: PartyRefSchema.fields.resourceId,
+});
+const PartyUnarchiveIdentityAmbiguousSchema = Schema.TaggedStruct('identity_ambiguous', {
+  candidatePartyIds: Schema.Array(PartyRefSchema.fields.resourceId),
+});
 const PartyUnarchiveReviewRequiredSchema = Schema.TaggedStruct('review_required', {
   caseIds: Schema.Array(DuplicateCandidateCaseRefSchema.fields.resourceId),
   reasonCode: Schema.Literals(['OPEN_DUPLICATE_CASE', 'UNRESOLVED_IDENTITY']),
 });
-const PartyUnarchiveLifecycleSchema = Schema.Union([PartyLifecycleSchema, PartyUnarchiveReviewRequiredSchema]);
+const PartyUnarchiveLifecycleSchema = Schema.Union([
+  PartyLifecycleSchema,
+  PartyUnarchiveIdentityConflictSchema,
+  PartyUnarchiveIdentityAmbiguousSchema,
+  PartyUnarchiveReviewRequiredSchema,
+]);
+const ClaimAvailableSchema = Schema.TaggedStruct('available', {});
+const ClaimOwnershipSchema = Schema.Union([
+  ClaimAvailableSchema,
+  PartyUnarchiveIdentityConflictSchema,
+  PartyUnarchiveIdentityAmbiguousSchema,
+]);
+
 export type PartyLookup = typeof PartyLookupSchema.Type;
 export type PartyLifecycle = typeof PartyLifecycleSchema.Type;
 type PartyUnarchiveLifecycle = typeof PartyUnarchiveLifecycleSchema.Type;
 
 const MATCH_RULE_VERSION = 'party-exact-claims.v1';
-const partyNameFacts = [
-  { key: 'firstName', factKind: 'FIRST_NAME' },
-  { key: 'lastName', factKind: 'LAST_NAME' },
-  { key: 'businessName', factKind: 'BUSINESS_NAME' },
-] as const;
 export const findOpenDuplicateCandidateCase = (
   transaction: Pick<PartyTransaction, 'select'>,
   tenantId: string,
@@ -84,8 +89,37 @@ export const findOpenDuplicateCandidateCase = (
     .limit(1);
 
 const instantAsDate = (instant: string | DateTime.Utc): Date => DateTime.toDateUtc(DateTime.makeUnsafe(instant));
+const ClaimKeyJsonCodec = Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String, Schema.String]));
 const JsonCodec = Schema.fromJsonString(Schema.Any);
+const encodeClaimKey = (claimKey: readonly [string, string, string]): string =>
+  Result.getOrThrow(Schema.encodeResult(ClaimKeyJsonCodec)(claimKey));
 const encodeJson = <Value>(value: Value): string => Result.getOrThrow(Schema.encodeResult(JsonCodec)(value));
+
+export const endedPartyFactTransition = {
+  isCurrent: false,
+  state: 'ENDED' as const,
+};
+
+export const classifyUnarchiveClaimOwners = (
+  partyId: string,
+  resolvedClaims: readonly { readonly partyId?: string }[],
+): typeof ClaimOwnershipSchema.Type => {
+  const foreignOwners = [
+    ...new Set(
+      resolvedClaims.flatMap((claim) =>
+        claim.partyId === undefined || claim.partyId === partyId ? [] : [claim.partyId],
+      ),
+    ),
+  ].toSorted();
+  const [firstOwner] = foreignOwners;
+  if (firstOwner === undefined) {
+    return { _tag: 'available' };
+  }
+  if (foreignOwners.length === 1) {
+    return { _tag: 'identity_conflict', conflictingPartyId: firstOwner };
+  }
+  return { _tag: 'identity_ambiguous', candidatePartyIds: foreignOwners };
+};
 
 const unavailable = (cause?: unknown) => {
   const error = new PartyPersistenceUnavailable({
@@ -100,9 +134,6 @@ export const partyDto = (row: PartyRecord): Party => ({
   archivedAt: Option.fromNullOr(row.archivedAt).pipe(Option.map(DateTime.makeUnsafe)),
   createdAt: DateTime.makeUnsafe(row.createdAt),
   displayName: Option.fromNullOr(row.currentDisplayName),
-  firstName: Option.fromNullOr(row.firstName),
-  lastName: Option.fromNullOr(row.lastName),
-  businessName: Option.fromNullOr(row.businessName),
   partyRef: PartyRefSchema.make({
     moduleId: 'party.registry',
     resourceId: row.partyId,
@@ -139,10 +170,7 @@ export const insertPartyRecord = Effect.fn('PartyIdentityPersistenceService.inse
   },
 ) {
   yield* lockTenantIdentityWrites(transaction, tenantId);
-  const evaluation = yield* requirePartySubjectEvidence(candidate).pipe(
-    Effect.flatMap(Schema.encodeEffect(PartyEvidenceEvaluationSchema)),
-    Effect.catchTag('SchemaError', (cause) => Effect.fail(unavailable(cause))),
-  );
+  const evaluation = yield* requirePartySubjectEvidence(candidate);
   const externalEvidence =
     candidate.provenance.externalEvidence === undefined
       ? null
@@ -152,10 +180,7 @@ export const insertPartyRecord = Effect.fn('PartyIdentityPersistenceService.inse
   const [party] = yield* transaction
     .insert(parties)
     .values({
-      currentDisplayName: derivePartyDisplayName(candidate),
-      firstName: candidate.firstName ?? null,
-      lastName: candidate.lastName ?? null,
-      businessName: candidate.businessName ?? null,
+      currentDisplayName: candidate.displayName ?? null,
       currentType: candidate.partyType,
       tenantId,
     })
@@ -181,38 +206,146 @@ export const insertPartyRecord = Effect.fn('PartyIdentityPersistenceService.inse
         tenantId,
         validFrom: instantAsDate(candidate.validFrom),
       },
-      ...partyNameFacts.flatMap(({ key, factKind }) => {
-        const value = candidate[key];
-        return value === undefined
-          ? []
-          : [
-              {
-                acceptedByActionInvocationId: acceptance.actionInvocationId,
-                acceptedByPrincipalId: acceptance.principalId,
-                externalEvidence,
-                evidenceEvaluation: evaluation,
-                factKind,
-                normalizedValue: value,
-                partyId: party.partyId,
-                policyVersion: acceptance.policyVersion,
-                provenanceMethod: candidate.provenance.method,
-                provenanceSource: candidate.provenance.source,
-                tenantId,
-                validFrom: instantAsDate(candidate.validFrom),
-              },
-            ];
-      }),
+      ...(candidate.displayName === undefined
+        ? []
+        : [
+            {
+              acceptedByActionInvocationId: acceptance.actionInvocationId,
+              acceptedByPrincipalId: acceptance.principalId,
+              externalEvidence,
+              factKind: 'DISPLAY_NAME',
+              normalizedValue: candidate.displayName,
+              partyId: party.partyId,
+              policyVersion: acceptance.policyVersion,
+              provenanceMethod: candidate.provenance.method,
+              provenanceSource: candidate.provenance.source,
+              tenantId,
+              validFrom: instantAsDate(candidate.validFrom),
+            },
+          ]),
     ])
     .pipe(Effect.mapError(unavailable));
   return partyDto(party);
 });
 
+/** Reconciles exclusive claims before a Party type or active-state transition commits. */
+export const reconcilePartyIdentifierClaims = Effect.fn(
+  'PartyIdentityPersistenceService.reconcilePartyIdentifierClaims',
+)(function* reconcileClaims(
+  transaction: Pick<PartyTransaction, 'select' | 'insert' | 'delete'>,
+  tenantId: string,
+  partyId: string,
+  nextPartyType: PartyType,
+) {
+  yield* lockTenantIdentityWrites(transaction, tenantId);
+  const now = yield* DateTime.nowAsDate;
+  const identifierRows = yield* transaction
+    .select()
+    .from(partyOfficialIdentifiers)
+    .where(
+      and(
+        eq(partyOfficialIdentifiers.tenantId, tenantId),
+        eq(partyOfficialIdentifiers.partyId, partyId),
+        eq(partyOfficialIdentifiers.state, 'ACTIVE'),
+        eq(partyOfficialIdentifiers.isCurrent, true),
+        lte(partyOfficialIdentifiers.validFrom, now),
+        or(isNull(partyOfficialIdentifiers.validTo), gt(partyOfficialIdentifiers.validTo, now)),
+      ),
+    )
+    .for('update')
+    .pipe(Effect.mapError(unavailable));
+  const eligibleIdentifiers = identifierRows
+    .filter((row) => row.namespace === (row.identifierTypeKey === 'ICO' ? 'CZ:ICO' : 'CZ:DIC'))
+    .map((row) => ({
+      // SAFETY: The owner-local identifier type CHECK admits only the supported identifier codes.
+      identifierType: row.identifierTypeKey as NormalizedOfficialIdentifier['identifierType'],
+      // SAFETY: The preceding filter admits only the canonical namespace for the stored type.
+      namespace: row.namespace as NormalizedOfficialIdentifier['namespace'],
+      normalizedValue: row.normalizedValue,
+      // SAFETY: The owner-local verification CHECK admits only the declared verification states.
+      verification: row.verificationState as NormalizedOfficialIdentifier['verification'],
+    }))
+    .filter((identifier) => qualifiesForExclusiveClaim(identifier, nextPartyType, MATCH_RULE_VERSION));
+  const uniqueIdentifiers = [
+    ...new Map(
+      eligibleIdentifiers.map((identifier) => [
+        [identifier.identifierType, identifier.namespace, identifier.normalizedValue].join('\u0000'),
+        identifier,
+      ]),
+    ).values(),
+  ];
+  const resolvedClaims = yield* lockAndResolveClaims(transaction, tenantId, uniqueIdentifiers);
+  const claimOwnership = classifyUnarchiveClaimOwners(partyId, resolvedClaims);
+  if (!Schema.is(ClaimAvailableSchema)(claimOwnership)) {
+    return claimOwnership;
+  }
+
+  const ownedClaims = yield* transaction
+    .select()
+    .from(partyIdentifierClaims)
+    .where(and(eq(partyIdentifierClaims.tenantId, tenantId), eq(partyIdentifierClaims.partyId, partyId)))
+    .for('update')
+    .pipe(Effect.mapError(unavailable));
+  const eligibleKeys = new Set(
+    uniqueIdentifiers.map((identifier) =>
+      encodeClaimKey([identifier.identifierType, identifier.namespace, identifier.normalizedValue]),
+    ),
+  );
+  const releasedClaimIds = ownedClaims
+    .filter(
+      (claim) => !eligibleKeys.has(encodeClaimKey([claim.identifierTypeKey, claim.namespace, claim.normalizedValue])),
+    )
+    .map((claim) => claim.identifierClaimId);
+  if (releasedClaimIds.length > 0) {
+    yield* transaction
+      .delete(partyIdentifierClaims)
+      .where(
+        and(
+          eq(partyIdentifierClaims.tenantId, tenantId),
+          eq(partyIdentifierClaims.partyId, partyId),
+          inArray(partyIdentifierClaims.identifierClaimId, releasedClaimIds),
+        ),
+      )
+      .pipe(Effect.mapError(unavailable));
+  }
+
+  const identifiersByClaimKey = new Map(
+    identifierRows.map((row) => [[row.identifierTypeKey, row.namespace, row.normalizedValue].join('\u0000'), row]),
+  );
+  const unclaimedIdentifiers = resolvedClaims.flatMap(({ claim, partyId: ownerPartyId }) => {
+    if (ownerPartyId !== undefined) {
+      return [];
+    }
+    const record = identifiersByClaimKey.get(
+      [claim.identifierType, claim.namespace, claim.normalizedValue].join('\u0000'),
+    );
+    return record === undefined ? [] : [{ claim, record }];
+  });
+  if (unclaimedIdentifiers.length > 0) {
+    yield* transaction
+      .insert(partyIdentifierClaims)
+      .values(
+        unclaimedIdentifiers.map(({ claim, record }) => ({
+          identifierTypeKey: claim.identifierType,
+          namespace: claim.namespace,
+          normalizedValue: claim.normalizedValue,
+          officialIdentifierId: record.officialIdentifierId,
+          partyId,
+          tenantId,
+        })),
+      )
+      .pipe(Effect.mapError(unavailable));
+  }
+
+  return {
+    _tag: 'available',
+    eligibleClaimCount: uniqueIdentifiers.length,
+  } as const;
+});
+
 interface UpdatePartyIdentityInput {
   readonly actionInvocationId: string;
-  readonly sourceScope?: PartyClientSourceScope | undefined;
-  readonly firstName?: string | undefined;
-  readonly lastName?: string | undefined;
-  readonly businessName?: string | undefined;
+  readonly displayName?: string | undefined;
   readonly expectedRevision: number;
   readonly externalEvidence?: AresAppliedEvidence | undefined;
   readonly partyId: string;
@@ -225,22 +358,13 @@ interface UpdatePartyIdentityInput {
 }
 
 const evaluateTypeEnrichment = (current: PartyRecord, input: UpdatePartyIdentityInput) => {
-  if (
-    (input.partyType === undefined || input.partyType === current.currentType) &&
-    input.subjectEvidence?.some((item) => item.kind !== 'ACTOR_ATTESTATION') !== true
-  ) {
+  if (input.partyType === undefined || input.partyType === current.currentType) {
     return Effect.succeed(null);
   }
   return requirePartySubjectEvidence({
-    firstName: input.firstName ?? current.firstName,
-    lastName: input.lastName ?? current.lastName,
-    businessName: input.businessName ?? current.businessName,
-    partyType: input.partyType ?? partyDto(current).partyType,
+    partyType: input.partyType,
     subjectEvidence: input.subjectEvidence ?? [],
-  }).pipe(
-    Effect.flatMap(Schema.encodeEffect(PartyEvidenceEvaluationSchema)),
-    Effect.catchTag('SchemaError', (cause) => Effect.fail(unavailable(cause))),
-  );
+  });
 };
 
 const identityUpdateConflicts = (current: PartyRecord, input: UpdatePartyIdentityInput, now: Date): boolean =>
@@ -252,7 +376,7 @@ const identityUpdateConflicts = (current: PartyRecord, input: UpdatePartyIdentit
     !isPartyTypeEnrichment(current.currentType as PartyType, input.partyType));
 
 const changedIdentityFactKinds = (current: PartyRecord, input: UpdatePartyIdentityInput) => [
-  ...partyNameFacts.flatMap(({ key, factKind }) => (input[key] === undefined ? [] : [factKind])),
+  ...(input.displayName === undefined ? [] : ['DISPLAY_NAME' as const]),
   ...(input.partyType === undefined || input.partyType === current.currentType ? [] : ['PARTY_TYPE' as const]),
 ];
 
@@ -266,18 +390,9 @@ const identityRecordChanges = (current: PartyRecord, input: UpdatePartyIdentityI
     revision: current.revision + 1,
     updatedAt: now,
   };
-  for (const { key } of partyNameFacts) {
-    if (input[key] !== undefined) {
-      changes[key] = input[key];
-    }
+  if (input.displayName !== undefined) {
+    changes.currentDisplayName = input.displayName;
   }
-  changes.currentDisplayName = derivePartyDisplayName({
-    // SAFETY: The owner-local Party type CHECK restricts the stored type.
-    partyType: input.partyType ?? (current.currentType as PartyType),
-    firstName: input.firstName ?? current.firstName,
-    lastName: input.lastName ?? current.lastName,
-    businessName: input.businessName ?? current.businessName,
-  });
   if (input.partyType !== undefined) {
     changes.currentType = input.partyType;
   }
@@ -292,24 +407,20 @@ const identityUpdateAssertions = (
   evaluation: (typeof partyFactAssertions.$inferInsert)['evidenceEvaluation'],
 ) => {
   const assertions: (typeof partyFactAssertions.$inferInsert)[] = [];
-  for (const { key, factKind } of partyNameFacts) {
-    const value = input[key];
-    if (value !== undefined) {
-      assertions.push({
-        acceptedByActionInvocationId: input.actionInvocationId,
-        acceptedByPrincipalId: input.principalId,
-        evidenceEvaluation: evaluation,
-        externalEvidence,
-        factKind,
-        normalizedValue: value,
-        partyId: input.partyId,
-        policyVersion: 'party-identity.v1',
-        provenanceMethod: input.provenanceMethod,
-        provenanceSource: input.provenanceSource,
-        tenantId,
-        validFrom: instantAsDate(input.validFrom),
-      });
-    }
+  if (input.displayName !== undefined) {
+    assertions.push({
+      acceptedByActionInvocationId: input.actionInvocationId,
+      acceptedByPrincipalId: input.principalId,
+      externalEvidence,
+      factKind: 'DISPLAY_NAME',
+      normalizedValue: input.displayName,
+      partyId: input.partyId,
+      policyVersion: 'party-identity.v1',
+      provenanceMethod: input.provenanceMethod,
+      provenanceSource: input.provenanceSource,
+      tenantId,
+      validFrom: instantAsDate(input.validFrom),
+    });
   }
   if (input.partyType !== undefined && input.partyType !== current.currentType) {
     assertions.push({
@@ -337,68 +448,6 @@ export const updatePartyIdentityRecord = Effect.fn('PartyIdentityPersistenceServ
     input: UpdatePartyIdentityInput,
   ) {
     yield* lockTenantIdentityWrites(transaction, tenantId);
-    const requestInput: UpdatePartyPayload = {
-      partyRef: makePartyRef(tenantId, input.partyId),
-      expectedRevision: input.expectedRevision,
-      validFrom: DateTime.makeUnsafe(input.validFrom),
-      provenanceMethod: input.provenanceMethod,
-      provenanceSource: input.provenanceSource,
-    };
-    for (const key of [
-      'firstName',
-      'lastName',
-      'businessName',
-      'partyType',
-      'externalEvidence',
-      'subjectEvidence',
-    ] as const) {
-      if (input[key] !== undefined) {
-        Object.assign(requestInput, { [key]: input[key] });
-      }
-    }
-    const request = yield* Schema.encodeEffect(UpdatePartyPayloadSchema)(requestInput).pipe(
-      Effect.mapError(unavailable),
-    );
-    const sourceInput = { ...input, tenantId, operation: 'UPDATE' as const, request };
-    const prepared = yield* preparePartySourceEffect(transaction, sourceInput);
-    if (prepared?.organizationBusiness === true) {
-      const payload = yield* Schema.decodeUnknownEffect(OrganizationBusinessUpdateInputSchema, {
-        onExcessProperty: 'error',
-      })(request).pipe(Effect.mapError(unavailable));
-      if (input.sourceScope === undefined) {
-        return yield* unavailable();
-      }
-      return yield* updateOrganizationBusinessRecord(
-        transaction,
-        {
-          payload,
-          tenantId,
-          principalId: input.principalId,
-          actionInvocationId: input.actionInvocationId,
-          sourceScope: input.sourceScope,
-          request,
-        },
-        prepared,
-      );
-    }
-    if (prepared?.receipt !== undefined) {
-      const [current] = yield* transaction
-        .select()
-        .from(parties)
-        .where(and(eq(parties.tenantId, tenantId), eq(parties.partyId, input.partyId)))
-        .limit(1)
-        .pipe(Effect.mapError(unavailable));
-      if (current === undefined) {
-        return yield* unavailable();
-      }
-      const original = yield* Schema.decodeUnknownEffect(PartySourceUpdateReceiptResultSchema)(
-        prepared.receipt.result,
-      ).pipe(Effect.mapError(unavailable));
-      if (current.revision !== original.revision) {
-        return { _tag: 'conflict', value: partyDto(current) } as const;
-      }
-      return { _tag: 'found', value: partyDto(current), replayed: true } as const;
-    }
     const [current] = yield* transaction
       .select()
       .from(parties)
@@ -436,6 +485,12 @@ export const updatePartyIdentityRecord = Effect.fn('PartyIdentityPersistenceServ
     );
     if (invalidIdentityFactInterval(currentAssertions, input.validFrom)) {
       return { _tag: 'conflict', value: partyDto(current) } as const;
+    }
+    if (input.partyType !== undefined && input.partyType !== current.currentType) {
+      const claims = yield* reconcilePartyIdentifierClaims(transaction, tenantId, input.partyId, input.partyType);
+      if (!Schema.is(ClaimAvailableSchema)(claims)) {
+        return { _tag: 'conflict', value: partyDto(current) } as const;
+      }
     }
     const externalEvidence =
       input.externalEvidence === undefined
@@ -478,15 +533,7 @@ export const updatePartyIdentityRecord = Effect.fn('PartyIdentityPersistenceServ
     if (assertions.length > 0) {
       yield* transaction.insert(partyFactAssertions).values(assertions).pipe(Effect.mapError(unavailable));
     }
-    const value = partyDto(updated);
-    if (prepared !== undefined) {
-      const result = yield* Schema.encodeEffect(PartySourceUpdateReceiptResultSchema)({
-        partyRef: value.partyRef,
-        revision: value.revision,
-      }).pipe(Effect.mapError(unavailable));
-      yield* recordPartySourceEffect(transaction, sourceInput, prepared, result);
-    }
-    return { _tag: 'found', value } as const;
+    return { _tag: 'found', value: partyDto(updated) } as const;
   },
 );
 
@@ -602,6 +649,16 @@ export const unarchivePartyRecord = Effect.fn('PartyIdentityPersistenceService.u
         } as const;
       }
     }
+    const claims = yield* reconcilePartyIdentifierClaims(
+      transaction,
+      tenantId,
+      partyId,
+      // SAFETY: The owner-local parties type CHECK admits exactly the PartyType values.
+      current.currentType as PartyType,
+    );
+    if (!Schema.is(ClaimAvailableSchema)(claims)) {
+      return claims;
+    }
     const now = yield* DateTime.nowAsDate;
     const [updated] = yield* transaction
       .update(parties)
@@ -616,10 +673,28 @@ export const unarchivePartyRecord = Effect.fn('PartyIdentityPersistenceService.u
 type BlockedUnarchiveCheck = Exclude<PartyUnarchiveLifecycle, PartyLifecycle>;
 type UnarchiveTransaction = Parameters<typeof unarchivePartyRecord>[0];
 
-const unarchiveReviewReason = (check: BlockedUnarchiveCheck): UnarchivePartyBlocked['reasonCode'] => check.reasonCode;
-const unarchiveReviewParties = (partyId: string) => [partyId];
+const unarchiveReviewReason = (check: BlockedUnarchiveCheck): UnarchivePartyBlocked['reasonCode'] => {
+  if (Schema.is(PartyUnarchiveIdentityConflictSchema)(check)) {
+    return 'EXACT_CLAIM_CONFLICT';
+  }
+  if (Schema.is(PartyUnarchiveIdentityAmbiguousSchema)(check)) {
+    return 'EXACT_CLAIM_AMBIGUOUS';
+  }
+  return check.reasonCode;
+};
+
+const unarchiveReviewParties = (partyId: string, check: BlockedUnarchiveCheck) =>
+  [
+    ...new Set([
+      partyId,
+      ...(Schema.is(PartyUnarchiveIdentityConflictSchema)(check) ? [check.conflictingPartyId] : []),
+      ...(Schema.is(PartyUnarchiveIdentityAmbiguousSchema)(check) ? check.candidatePartyIds : []),
+    ]),
+  ].toSorted();
 
 const unarchiveReviewExplanations = {
+  EXACT_CLAIM_AMBIGUOUS: 'Current exact identifier claims resolve to multiple other Parties.',
+  EXACT_CLAIM_CONFLICT: 'A current exact identifier claim belongs to another Party.',
   OPEN_DUPLICATE_CASE: 'Open duplicate identity evidence requires review before reactivation.',
   UNRESOLVED_IDENTITY: 'No retained reviewed acceptance establishes this unresolved identity.',
 } as const;
@@ -688,14 +763,17 @@ const createUnarchiveReviewCase = Effect.fn('PartyIdentityPersistenceService.cre
       .pipe(Effect.mapError(unavailable));
     const snapshot: PartyCandidateSnapshot = {
       intent: 'UNARCHIVE',
-      firstName: Option.getOrNull(party.firstName),
-      lastName: Option.getOrNull(party.lastName),
-      businessName: Option.getOrNull(party.businessName),
+      names: Option.match(party.displayName, {
+        onNone: () => [],
+        onSome: (name) => [name],
+      }),
       officialIdentifiers: identifiers.map((identifier) => ({
-        // SAFETY: Owner-local CHECK constraints restrict identifier types.
+        // SAFETY: Owner-local CHECK constraints restrict identifier and verification types.
         identifierTypeKey: identifier.identifierTypeKey as 'ICO' | 'CZ_DIC',
         namespace: identifier.namespace,
         normalizedValue: identifier.normalizedValue,
+        // SAFETY: Owner-local CHECK constraints restrict verification types.
+        verificationState: identifier.verificationState as 'VERIFIED' | 'UNVERIFIED' | 'REJECTED',
       })),
       partyType: party.partyType,
       policyVersion: MATCH_RULE_VERSION,
@@ -707,7 +785,7 @@ const createUnarchiveReviewCase = Effect.fn('PartyIdentityPersistenceService.cre
       validFrom: DateTime.formatIso(party.updatedAt),
     };
     const reasonCode = unarchiveReviewReason(check);
-    const partyIds = unarchiveReviewParties(party.partyRef.resourceId);
+    const partyIds = unarchiveReviewParties(party.partyRef.resourceId, check);
     const explanation: PartyEvidenceExplanation = {
       evidenceRefs: partyIds.map((id) => partyReviewSourceRef(tenantId, id)),
       outcome: 'AMBIGUOUS',
