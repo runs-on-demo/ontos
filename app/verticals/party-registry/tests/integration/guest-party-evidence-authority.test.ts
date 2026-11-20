@@ -5,6 +5,7 @@ import {
 import { ActionRuntime, ReadRuntime } from '@app/core-runtime';
 import { STAFF_AUTHENTICATION_NAMESPACE_ID } from '@app/core-runtime/auth/staff-authentication-namespace';
 import { makeLiveOperationFixture } from '@app/core-runtime/testing/actions';
+import { makePartyDeniedAccess } from '../support/live-access-authority.ts';
 import { partyRegistryBackendRegistration } from '../../vertical.runtime-declaration.ts';
 import { testCoreDatabase } from '@app/core-runtime/testing/owner-evidence';
 import { makeIsolatedNativeDatabaseFixture } from '@app/core-runtime/testing/isolated-native-database';
@@ -20,7 +21,6 @@ import { ultramodernApiMarker } from '../../shared/ultramodern-build.ts';
 import { createPartyAction } from '../../src/actions/create-party.action.ts';
 import { addContactPointAction } from '../../src/actions/add-contact-point.action.ts';
 import { endContactPointAction } from '../../src/actions/end-contact-point.action.ts';
-import { resolveDuplicateCandidateCreateAction } from '../../src/actions/resolve-duplicate-candidate-create.action.ts';
 import { resolveDuplicateCandidateMatchAction } from '../../src/actions/resolve-duplicate-candidate-match.action.ts';
 import { guestPartyResolutionRead } from '../../src/api/guest-party-resolution.read.ts';
 import { makePartyDatabase } from '../../src/db/client.ts';
@@ -43,16 +43,15 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
       mode: 'schema-only',
       purpose: 'stabilization-1241-guest-evidence',
     });
-    yield* isolated.assertClonedSchema();
     const native = yield* preparePartyReconciliationNative(isolated.connections);
     const gateway = yield* makePartyReconciliationGateway(native, snapshot);
     const fixture = yield* Effect.acquireRelease(
       makeLiveOperationFixture({
+        access: 'allowed',
         actionKeys: [
           createPartyAction,
           addContactPointAction,
           endContactPointAction,
-          resolveDuplicateCandidateCreateAction,
           resolveDuplicateCandidateMatchAction,
         ].map(({ descriptor }) => descriptor.actionKey),
         authenticationNamespaceId: STAFF_AUTHENTICATION_NAMESPACE_ID,
@@ -63,7 +62,8 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
       }),
       (resource) => resource.close().pipe(Effect.orDie),
     );
-    const context = yield* Layer.build(fixture.layer);
+    const deniedAccess = makePartyDeniedAccess();
+    const context = yield* Layer.build(fixture.layer.pipe(Layer.provide(deniedAccess.layer)));
     const runtime = yield* ActionRuntime.pipe(Effect.provideContext(context));
     const reads = yield* ReadRuntime.pipe(Effect.provideContext(context));
     const adminLayer = PgClient.layer({ url: Redacted.make(isolated.connections.admin.connectionString) }).pipe(
@@ -78,7 +78,7 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
     });
     const sourceSubject = yield* nextId;
     const candidate = {
-      displayName: 'Observed Guest person',
+      firstName: 'Observed Guest person',
       evidenceRefs: ['person-observation'],
       officialIdentifiers: [],
       partyType: 'PERSON',
@@ -103,21 +103,8 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
         transport: yield* transport,
       })
       .pipe(Effect.provideContext(context));
-    assert.isOk(seedCase.outcome === 'AMBIGUOUS');
-    const seeded = yield* runtime
-      .runAction({
-        registration: resolveDuplicateCandidateCreateAction,
-        payload: {
-          caseRef: seedCase.caseRef,
-          expectedRevision: 1,
-          reason: 'Reviewed one concrete human without a strong identifier',
-        },
-        principal: yield* gateway.verifyPrincipal(principal),
-        transport: yield* transport,
-      })
-      .pipe(Effect.provideContext(context));
-    assert.isOk(seeded.partyRef !== null);
-    const { partyRef } = seeded;
+    assert.isOk(seedCase.outcome === 'CREATED');
+    const { partyRef } = seedCase;
     const evidenceRef = `guest-evidence-${yield* nextId}`;
     const correlationRoot = `purchase-${yield* nextId}`;
     const legalEntityRef = {
@@ -137,7 +124,6 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
         source: 'USER_ASSERTION',
       },
       validFrom: '2020-01-01T00:00:00.000Z',
-      verification: { state: 'UNVERIFIED' },
     };
     const contact = yield* runtime
       .runAction({
@@ -158,7 +144,6 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
       );
     expect(storedContact).toMatchObject({
       provenanceAuthoritative: false,
-      verificationState: 'UNVERIFIED',
       evidenceReference: evidenceRef,
       state: 'ACTIVE',
     });
@@ -196,12 +181,6 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
           ...contactPayload,
           contactPoint: { preferred: false, type: 'EMAIL', value: 'verified-guest-1241@example.test' },
           provenance: { ...contactPayload.provenance, authoritative: true },
-          verification: {
-            state: 'VERIFIED',
-            method: 'MANUAL_CONFIRMATION',
-            verifiedAt: DateTime.formatIso(yield* DateTime.now),
-            verifierReference: 'reviewed-channel-control',
-          },
         },
         principal: yield* gateway.verifyPrincipal(principal),
         transport: yield* transport,
@@ -312,6 +291,11 @@ const nativeGuestEvidenceAuthority = Effect.fn('GuestEvidenceTest.nativeGuestEvi
       .pipe(Effect.provideContext(context));
     // Ending contactability cannot manufacture or erase the separate retained reviewed identity.
     expect(yield* resolve()).toEqual({ outcome: 'EXISTING_PARTY_RESOLVED', partyRef });
+    // v2: the one access gate decides this read (O62); a principal it does not admit is refused
+    // before any owner work. The fixture scripts its gate per capability, so the refusal of this
+    // one principal is named on the fixture's own per-request owner seam (the removed SpiceDB
+    // reader tuple no longer refuses anyone).
+    deniedAccess.deny(fixture.legalEntityOnly.principalId, 'party.registry.guest-party.resolve');
     expect(
       Result.isFailure(
         yield* reads
