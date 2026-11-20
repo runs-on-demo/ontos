@@ -38,7 +38,6 @@
     "./db/client": "./src/db/client.ts",
     "./actions/principal-context": "./src/actions/principal-context.ts",
     "./actions/runtime-wiring": "./src/actions/runtime-wiring.ts",
-    "./execution/module-call-route": "./src/execution/module-call-route.ts",
     "./auth/external-identity-admission": "./src/auth/external-identity/verifier.ts",
     "./auth/external-identity-contracts": "./src/auth/external-identity-contracts.ts",
     "./auth/gateway-assertion-redemption": "./src/auth/gateway-assertion-redemption.ts",
@@ -56,8 +55,6 @@
       "workerd": "./src/modules/active-application-composition-source.workerd.ts",
       "default": "./src/modules/active-application-composition-source.node.ts"
     },
-    "./modules/manifest": "./src/modules/manifest.ts",
-    "./modules/mcp-contribution": "./src/modules/mcp-contribution.ts",
     "./operations/context": "./src/operations/context.ts",
     "./operations/external-authentication": "./src/operations/external-authentication.ts",
     "./outbox/core-identity-principal-binding-activated-v1": "./src/outbox/core-identity-principal-binding-activated-v1.ts",
@@ -67,28 +64,21 @@
     "./permissions/principal-ref": "./src/permissions/principal-ref.ts",
     "./resources/legal-entity": "./src/resources/legal-entity.ts",
     "./route-meta": "./src/modules/route-meta.ts",
-    "./sdk": "./src/sdk/index.ts",
-    "./sdk/core": "./src/sdk/core-operations.ts",
-    "./sdk/read": "./src/sdk/read.ts",
     "./testing/access-gate": "./src/testing/access-gate.ts",
     "./testing/actions": "./src/testing/actions.ts",
     "./testing/gateway-scope-grant": "./src/testing/gateway-scope-grant.ts",
     "./testing/application-composition-source": "./src/modules/active-application-composition-source-service.ts",
     "./testing/outbox": "./src/outbox/verified-handler-context.ts",
     "./testing/reads": "./src/testing/reads.ts",
-    "./testing/sdk": "./src/testing/sdk.ts",
     "./testing/native-reads": "./src/testing/native-reads.ts",
     "./testing/isolated-native-database": "./src/testing/isolated-native-database.ts",
-    "./testing/source-execution-fence-native": "./src/testing/source-execution-fence-native.ts",
-    "./testing/workload-binding-native": "./src/testing/workload-binding-native.ts",
     "./testing/scripted-pg-client": "./src/testing/scripted-pg-client.ts",
     "./testing/tenant-access": "./src/testing/tenant-access.ts",
     "./testing/module-contract": "./src/testing/module-contract.ts",
     "./unit-service-fetch": "./src/http/unit-service-fetch.export.ts",
     "./workspace-environment": "./src/environment/workspace-environment.ts",
     "./testing/owner-evidence": "./src/testing/owner-evidence.ts",
-    "./legacy-completion-publication": "./src/modules/legacy-completion-publication.ts",
-    "./drizzle-config": "./src/environment/drizzle-config.ts"
+    "./legacy-completion-publication": "./src/modules/legacy-completion-publication.ts"
   },
   "imports": {
     "#database-runtime": {
@@ -127,11 +117,10 @@
     "effect": "4.0.7"
   },
   "devDependencies": {
-    "@grpc/grpc-js": "1.14.5",
-    "@rstest/core": "0.12.6",
+    "@rstest/core": "0.11.12",
     "@types/node": "^26.4.1",
     "drizzle-kit": "1.0.0-rc.5-ab785fc",
-    "effect-rstest": "1.0.0",
+    "effect-rstest": "https://pkg.pr.new/ScriptedAlchemy/effect-rstest@cbbf87e05c7517a85eb412d33421cd2ab5234597",
     "pg": "8.22.0",
     "yaml": "2.9.1"
   }
