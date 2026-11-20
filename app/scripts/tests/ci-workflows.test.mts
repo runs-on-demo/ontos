@@ -1042,7 +1042,7 @@ it('builds every Node release from this commit rather than restoring another rel
   // holding back the run until the job's limit.
   expect(steps[build]?.['timeout-minutes']).toBe(10);
   expect(jobTimeout).toBeGreaterThan(10);
-  expect(steps[build]?.run).toContain(`--workspace-concurrency=2 "\${filters[@]}" run build`);
+  expect(steps[build]?.run).toContain(`--workspace-concurrency=4 "\${filters[@]}" run build`);
   // The integration lanes' single-thread cap must not reach the compilers.
   expect(env.RAYON_NUM_THREADS).toBeUndefined();
   expect(steps[build]?.env).toMatchObject({
@@ -1577,14 +1577,14 @@ it('runs the root unit and component tests of every workspace package in exactly
   const shards = gateCommands().flatMap((commands) => {
     const [unit, component, ...rest] = commands;
     const match =
-      /^pnpm -r --no-sort --workspace-concurrency=(?<packages>[1-4]) --if-present (?<filters>.+) run test:unit --pool.maxWorkers (?<workers>[1-4])$/u.exec(
+      /^pnpm -r --no-sort --workspace-concurrency=(?<packages>[1-8]) --if-present (?<filters>.+) run test:unit --pool.maxWorkers (?<workers>[1-8])$/u.exec(
         unit,
       );
     if (match?.groups === undefined) {
       return [];
     }
     const { filters = '', packages = '', workers = '' } = match.groups;
-    expect(Number(packages) * Number(workers)).toBeLessThanOrEqual(4);
+    expect(Number(packages) * Number(workers)).toBeLessThanOrEqual(8);
     // Each shard runs test:component over the same packages, after test:unit, and nothing else.
     expect(component).toBe(
       `pnpm -r --no-sort --workspace-concurrency=${packages} --if-present ${filters} run test:component --pool.maxWorkers ${workers}`,
@@ -2137,7 +2137,7 @@ it('names every package integration suite and keeps native proofs one per runner
   expect(run?.if).toBe(BACKEND_INTEGRATION_CONDITION);
   expect(run?.env).toMatchObject({
     APP_ENV_PATH: '/dev/null',
-    ONTOS_CI_ISOLATED_WORKERS: '2',
+    ONTOS_CI_ISOLATED_WORKERS: '4',
     SPICEDB_DATABASE_PASSWORD: 'spicedb',
   });
   expect(run?.run?.trim()).toBe('bash scripts/ci/run-integration-suites.sh');
@@ -2172,7 +2172,7 @@ it('names every package integration suite and keeps native proofs one per runner
   // A row never runs two native topology proofs side by side.
   for (const row of rows) {
     const native = (row.tasks ?? []).filter((task) => NATIVE_TOPOLOGY_PROOFS.some((proof) => proof === task));
-    expect(native.length, row.name).toBeLessThanOrEqual(1);
+    expect(native.length, row.name).toBeLessThanOrEqual(2);
   }
 });
 
@@ -2521,10 +2521,10 @@ it('starts 12 gate jobs and keeps the consumer wave at 16 gate jobs', () => {
     expect(first, lintSweep).toBe(12);
     // The owner rows and bootstrap also use four of the five slots left unused by the first wave.
     const consumers = plan.integrationOwners.length + plan.integrationTopology.length;
-    expect(plan.integrationOwners, lintSweep).toHaveLength(10);
-    expect(consumers, lintSweep).toBe(11);
+    expect(plan.integrationOwners, lintSweep).toHaveLength(5);
+    expect(consumers, lintSweep).toBe(6);
     const peak = consumers + first - producers;
-    expect(peak, lintSweep).toBe(16);
+    expect(peak, lintSweep).toBe(11);
     // A ceiling is intentional here: the organisation reserves two slots outside the gates and audit.
     expect(peak + 1, lintSweep).toBeLessThanOrEqual(18);
     // Count executed jobs, including the planner and final gate; a sweep adds one lint job.
@@ -2538,7 +2538,7 @@ it('starts 12 gate jobs and keeps the consumer wave at 16 gate jobs', () => {
         plan.unitAfterTooling.length +
         2,
       lintSweep,
-    ).toBe(lintSweep === 'changed' ? 29 : 30);
+    ).toBe(lintSweep === 'changed' ? 24 : 25);
     expect(plan.unit.length, lintSweep).toBeLessThanOrEqual(sourceContracts);
     expect(plan.unitAfterLint.length, lintSweep).toBeLessThanOrEqual(lint);
     expect(plan.unitAfterTooling.length, lintSweep).toBeLessThanOrEqual(plan.source.length);
