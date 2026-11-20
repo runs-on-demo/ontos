@@ -3074,9 +3074,12 @@ const tenantPartyPublicGateway = Effect.fn('TenantPartyGatewayTest.publicGateway
       expect(Result.isFailure(disabled) && disabled.failure.code === 'api_key_invalid').toBe(true);
       yield* keys.setEnabled(pending.providerKeyId, true);
       // Only this fixture's own key is expired; the real provider must still reject it.
+      // The provider treats a key as expired only once its expiry is strictly in the past, so an expiry of
+      // "now" can still be valid when the check runs within the same millisecond on a fast runner.
+      const expiredAt = DateTime.subtract(DateTime.makeUnsafe(yield* DateTime.nowAsDate), { seconds: 1 });
       yield* authPersistence.executor
         .update(apikey)
-        .set({ expiresAt: yield* DateTime.nowAsDate })
+        .set({ expiresAt: DateTime.toDateUtc(expiredAt) })
         .where(eq(apikey.id, pending.providerKeyId));
       const expired = yield* keys.verify(Redacted.value(pending.secret)).pipe(Effect.result);
       expect(Result.isFailure(expired) && expired.failure.code === 'api_key_invalid').toBe(true);

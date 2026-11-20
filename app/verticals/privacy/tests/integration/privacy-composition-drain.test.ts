@@ -2520,12 +2520,12 @@ it.layer(nativeFixtureServices, { concurrent: true, excludeTestServices: true, t
             retried: 0,
             succeeded: 1,
           });
-          // Shell's real installed-catalog matcher also runs: this worker may find its delivery already matched.
+          // Shell's real installed-catalog matcher also runs: this worker may find the message already matched.
           // Keep both matchers and require the same single claim/ACK and exact message-derived debt settlement.
-          expect([0, 1]).toContain(completedCycle.matched.deliveriesCreated);
-          expect(completedCycle.matched.messagesMatched).toBeGreaterThanOrEqual(
-            completedCycle.matched.deliveriesCreated,
-          );
+          // Whichever matcher runs first matches the one message and creates a delivery for each subscribed
+          // worker in one transaction: Privacy's dispatch watchdog and Party's execute worker.
+          expect([0, 1]).toContain(completedCycle.matched.messagesMatched);
+          expect(completedCycle.matched.deliveriesCreated).toBe(completedCycle.matched.messagesMatched * 2);
           const original = yield* coreDebtSettled(f);
           expect(original.handoffFingerprint).toBe(digest(canonical));
           expect(original.outcome).toMatchObject({
