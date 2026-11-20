@@ -1387,6 +1387,18 @@ const fixture = Effect.gen(function* publicCompletionFixture() {
       })),
     });
   });
+  const benchDeliveryFacts = Effect.all(
+    {
+      deliveries: coreEvidenceExecutor.query.outboxDeliveries.findMany({
+        columns: { consumerModuleKey: true, createdAt: true, outboxMessageId: true, status: true, workerKey: true },
+      }),
+      messages: coreEvidenceExecutor.query.outboxMessages.findMany({
+        columns: { createdAt: true, matchedAt: true, outboxMessageId: true, producerModuleKey: true, topic: true },
+      }),
+      now: Effect.tryPromise(() => Promise.resolve(new Date())),
+    },
+    { concurrency: 3 },
+  );
   const observeSealFailure = Effect.gen(function* observeSealFailure() {
     const facts = yield* Effect.all({
       deliveries: coreEvidenceExecutor.query.outboxDeliveries.findMany({
@@ -1618,6 +1630,7 @@ const fixture = Effect.gen(function* publicCompletionFixture() {
   );
 
   return {
+    benchDeliveryFacts,
     control,
     cycle,
     dispatch,
@@ -2511,8 +2524,11 @@ it.layer(nativeFixtureServices, { concurrent: true, excludeTestServices: true, t
           });
           yield* f.isolated.composition.closeAdmission();
           yield* pending(f);
+          yield* Effect.logInfo(`BENCH-DIAG before-cycle ${JSON.stringify(yield* f.benchDeliveryFacts)}`);
           // Actual registered handler + repository.complete: succeeded is counted only after durable ACK.
           const completedCycle = yield* f.cycle();
+          yield* Effect.logInfo(`BENCH-DIAG cycle ${JSON.stringify(completedCycle)}`);
+          yield* Effect.logInfo(`BENCH-DIAG after-cycle ${JSON.stringify(yield* f.benchDeliveryFacts)}`);
           expect(completedCycle).toMatchObject({
             claimed: 1,
             dead: 0,
