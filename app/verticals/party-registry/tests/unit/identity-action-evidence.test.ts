@@ -14,6 +14,7 @@ import { makePartyMatchDecisionRef } from '../../shared/resources/party-match-de
 import { archivePartyAction } from '../../src/actions/archive-party.action.ts';
 import { unarchivePartyAction } from '../../src/actions/unarchive-party.action.ts';
 import { updatePartyAction } from '../../src/actions/update-party.action.ts';
+import { OrganizationBusinessPartyUpdatedSchema } from '../../shared/actions/update-party.ts';
 
 const tenantId = Schema.decodeSync(TenantIdSchema)('11111111-1111-4111-8111-111111111111');
 const partyId = '22222222-2222-4222-8222-222222222222';
@@ -34,7 +35,10 @@ const harnessPrincipal = trustResolvedSystemPrincipalContext({
 const party = Schema.decodeSync(PartySchema)({
   archivedAt: null,
   createdAt: '2026-01-01T00:00:00.000Z',
+  businessName: 'Example organization',
   displayName: 'Example organization',
+  firstName: null,
+  lastName: null,
   partyRef: makePartyRef(tenantId, partyId),
   partyType: 'ORGANIZATION',
   revision: 2,
@@ -62,7 +66,7 @@ it.effect('Update Party records metadata-only invariant evidence with its event 
     );
     yield* getActionHandler(updatePartyAction)(
       {
-        displayName: 'Example organization',
+        businessName: 'Example organization',
         expectedRevision: 1,
         partyRef: party.partyRef,
         provenanceMethod: 'MANUAL',
@@ -148,11 +152,11 @@ it.effect('Unarchive review outcome commits once and replays without an unarchiv
         ...party,
         archivedAt: Option.some(DateTime.makeUnsafe('2026-01-01T00:00:00.000Z')),
       },
-      reasonCode: 'EXACT_CLAIM_CONFLICT' as const,
+      reasonCode: 'OPEN_DUPLICATE_CASE' as const,
     };
     const harness = yield* makeActionTestHarness({
+      access: 'allowed',
       ownerRegistration: partyRegistryBackendRegistration,
-      actionPermission: 'allowed',
       services: [
         bindActionTestServices(unarchivePartyAction, {
           unarchive: () =>
@@ -162,7 +166,6 @@ it.effect('Unarchive review outcome commits once and replays without an unarchiv
             }),
         }),
       ],
-      tenantPermission: 'allowed',
     });
     const request = {
       payload: {
@@ -188,4 +191,48 @@ it.effect('Unarchive review outcome commits once and replays without an unarchiv
     expect(snapshot.committed[0]?.evidence.domainEvents).toEqual([]);
     expect(snapshot.committed[0]?.evidence.outboxMessages).toEqual([]);
   }),
+);
+
+it.effect(
+  'governed organization update handler exposes only its minimal acknowledgement and reference-only events',
+  () =>
+    Effect.gen(function* boundedOrganizationUpdateEvidence() {
+      for (const replayed of [false, true]) {
+        const collector = createActionCollector(
+          updatePartyAction.descriptor.domainEvents,
+          'party.registry',
+          updatePartyAction.descriptor.accessEvidencePolicy,
+        );
+        const minimal = OrganizationBusinessPartyUpdatedSchema.make({ partyRef: party.partyRef, revision: 2 });
+        const result = yield* getActionHandler(updatePartyAction)(
+          {
+            businessName: 'Example organization',
+            expectedRevision: 1,
+            partyRef: party.partyRef,
+            provenanceMethod: 'CLIENT_SOURCE_ASSERTION',
+            provenanceSource: 'INTERNAL',
+            validFrom: DateTime.makeUnsafe('2026-01-01T00:00:00.000Z'),
+          },
+          {
+            ...collector,
+            actionInvocationId,
+            compositionRevision: 'a'.repeat(64),
+            scope,
+            services: {
+              update: () => Effect.succeed({ _tag: 'organization_business_updated', result: minimal, replayed }),
+            },
+          },
+        );
+        expect(result).toEqual(minimal);
+        expect(Object.keys(result).toSorted()).toEqual(['_tag', 'partyRef', 'revision']);
+        const snapshot = collector.snapshot();
+        expect(snapshot.dataAccessEvents.length).toBe(1);
+        expect(snapshot.domainEvents.length).toBe(replayed ? 0 : 1);
+        expect(snapshot.outboxMessages.length).toBe(replayed ? 0 : 1);
+        if (!replayed) {
+          const [event] = snapshot.domainEvents;
+          expect(event?.payloadJson).toEqual({ partyRef: party.partyRef });
+        }
+      }
+    }),
 );
