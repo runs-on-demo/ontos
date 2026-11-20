@@ -1,5 +1,4 @@
 /* eslint-disable anti-slop/no-chained-type-assertions, anti-slop/no-unsafe-dictionary-type -- This harness implements the correction service's Drizzle boundary. expires: 2026-12-31. */
-import { TrustedPrincipalContextSchema } from '@app/core-runtime';
 import { DateTime, Effect, Match, Option, Schema, Predicate } from 'effect';
 import { expect, it } from 'effect-rstest';
 import { TestClock } from 'effect/testing';
@@ -14,7 +13,7 @@ import {
 import { PartyCommandConflictProblemSchema } from '../../shared/command-api.ts';
 import { confirmDuplicatePartiesAction } from '../../src/actions/confirm-duplicate-parties.action.ts';
 import { correctPartyFactAction } from '../../src/actions/correct-party-fact.action.ts';
-import { partyCorrectionRead } from '../../src/api/party-correction.read.ts';
+import { partyCorrectionPermissionTarget } from '../../src/api/party-correction.read.ts';
 import { mapPartyActionProblem } from '../../api/party-command-problems.ts';
 import {
   correctPartyFactRecord,
@@ -56,19 +55,8 @@ const relationshipCommandEncoded = {
   replacementValidTo: '2026-02-01T00:00:00.000Z',
 } as const;
 const relationshipCommand = Schema.decodeSync(SupersedeRelationshipCorrectionCommandSchema)(relationshipCommandEncoded);
-/** The trusted scope a record target is resolved in; the payload-derived target reads only its record. */
-const scope = {
-  ...Schema.decodeSync(TrustedPrincipalContextSchema)({
-    authBindingId: '90000000-0000-4000-8000-000000000001',
-    authContextRef: 'better-auth-session:correction-contract',
-    authMethod: 'session',
-    principalId,
-    tenantId,
-  }),
-  correlationId: 'correction-contract',
-};
-it('correction is closed to Party type, structured names, and official identifier assertions', () => {
-  for (const factKind of ['PARTY_TYPE', 'FIRST_NAME', 'LAST_NAME', 'BUSINESS_NAME', 'OFFICIAL_IDENTIFIER']) {
+it('correction is closed to Party type, display name, and official identifier assertions', () => {
+  for (const factKind of ['PARTY_TYPE', 'DISPLAY_NAME', 'OFFICIAL_IDENTIFIER']) {
     expect(() =>
       decode(PartyCorrectionCommandSchema)({
         ...evidence,
@@ -93,9 +81,7 @@ it('correction is closed to Party type, structured names, and official identifie
 });
 it('correction follow-up is typed and duplicate confirmation remains readiness-only', () => {
   expect(classifyCorrectionRoute('PARTY_TYPE')).toBe('LIFECYCLE_REVIEW');
-  for (const factKind of ['FIRST_NAME', 'LAST_NAME', 'BUSINESS_NAME'] as const) {
-    expect(classifyCorrectionRoute(factKind)).toBe('ENRICHMENT_REVIEW');
-  }
+  expect(classifyCorrectionRoute('DISPLAY_NAME')).toBe('ENRICHMENT_REVIEW');
   expect(classifyCorrectionRoute('OFFICIAL_IDENTIFIER')).toBe('CLAIM_REASSIGNMENT_REVIEW');
   expect(classifyCorrectionRoute('RELATIONSHIP')).toBe('RELATIONSHIP_REVIEW');
   expect(confirmDuplicatePartiesAction.descriptor.actionKey).toBe('party.registry.confirm-duplicate-parties');
@@ -119,18 +105,9 @@ it('correction follow-up is typed and duplicate confirmation remains readiness-o
     ],
     targetAssertionId: assertionId,
   });
-  // One capability now governs every correction fact kind; the record it is decided on is the Party,
-  // or the corrected Relationship (O9, O27).
-  expect(correctPartyFactAction.descriptor.accessDeclaration?.key).toBe('party.registry.party-fact.correct');
-  expect(correctPartyFactAction.descriptor.accessTarget?.(partyTypeCommand, scope)).toEqual({
-    moduleKey: 'party.registry',
-    recordKey: partyId,
-  });
+  expect(correctPartyFactAction.descriptor.tenantPermission?.(partyTypeCommand)).toBe('manage_party_identity');
   expect(correctPartyFactAction.descriptor.auditProfile).toBe('sensitive');
-  expect(correctPartyFactAction.descriptor.accessTarget?.(relationshipCommand, scope)).toEqual({
-    moduleKey: 'party.registry',
-    recordKey: assertionId,
-  });
+  expect(correctPartyFactAction.descriptor.tenantPermission?.(relationshipCommand)).toBe('manage_party_relationships');
 });
 
 it('public correction conflicts preserve bounded relationship prerequisites in the 409 contract', () => {
@@ -148,6 +125,7 @@ it('public correction conflicts preserve bounded relationship prerequisites in t
   }
   expect(problem.code).toBe('party_correction_conflict');
   expect(problem.conflictingRelationshipRefs).toEqual(refs);
+  expect(Schema.is(PartyCommandConflictProblemSchema)(problem)).toBe(true);
 });
 it('relationship correction is closed, revisioned, interval checked, and has no caller authority hints', () => {
   const strictDecode = Schema.decodeUnknownSync(PartyCorrectionCommandSchema, {
@@ -167,7 +145,7 @@ it('relationship correction is closed, revisioned, interval checked, and has no 
     'fromPartyRef',
     'toPartyRef',
     'relationshipType',
-    'accessDeclaration',
+    'tenantPermission',
     'actingPrincipalId',
     'approvingPrincipalId',
   ]) {
@@ -467,26 +445,16 @@ it.effect('correction of a durable relationship preserves stored alias endpoints
     expect(h.insertValues[0]?.['fromPartyId']).not.toBe(canonicalId);
   }),
 );
-it('correction history is its own governed read on the correction record, never the Party identity read', () => {
-  const { accessDeclaration } = partyCorrectionRead.descriptor;
-  expect(accessDeclaration?.key).toBe('party.registry.party-correction.read');
-  expect(accessDeclaration?.risk).toBe('sensitive');
-  expect(accessDeclaration?.selectors).toEqual(['all']);
-  // The record the read answers is the correction itself (O9), so a grant on the Party alone never
-  // opens the reviewer evidence it returns.
-  expect(
-    partyCorrectionRead.descriptor.accessTarget?.(
-      {
-        correctionRef: {
-          moduleId: 'party.registry',
-          resourceId: correctionId,
-          resourceType: 'party.registry.party-correction',
-          tenantId,
-        },
-      },
-      scope,
-    ),
-  ).toEqual({ moduleKey: 'party.registry', recordKey: correctionId });
+it('correction history requires reviewer authority; ordinary identity read permission is insufficient', () => {
+  const target = partyCorrectionPermissionTarget();
+  expect(target).toEqual({
+    kind: 'tenant',
+    permission: 'review_party_identity',
+  });
+  expect(target).not.toEqual({
+    kind: 'tenant',
+    permission: 'read_party_identity',
+  });
 });
 for (const scenario of [
   {
@@ -495,6 +463,26 @@ for (const scenario of [
     replacement: 'PERSON',
     claimReads: [],
     reason: /enrichment/u,
+  },
+  {
+    name: 'Party Type correction reconciles newly eligible claims before superseding the original fact',
+    original: 'PERSON',
+    replacement: 'ORGANIZATION',
+    claimReads: [
+      [],
+      [
+        {
+          identifierTypeKey: 'ICO',
+          namespace: 'CZ:ICO',
+          normalizedValue: '27074358',
+          officialIdentifierId: replacementId,
+          verificationState: 'VERIFIED',
+        },
+      ],
+      [],
+      [{ partyId: organizationId }],
+    ],
+    reason: /exclusive identifier claims/u,
   },
 ]) {
   it.effect(scenario.name, () =>
@@ -650,6 +638,9 @@ it.effect(
             [],
             [{ partyId: scenario.partyId }],
             [targetAssertion],
+            [],
+            [],
+            [],
             [relationship],
           ]);
           const command = yield* Schema.decodeUnknownEffect(PartyCorrectionCommandSchema)({
@@ -746,7 +737,17 @@ it.effect('Party Type correction preserves the SQL-selected incompatible relatio
     const conflictingRow = relationshipRow({
       relationshipId: '93000000-0000-4000-8000-000000000001',
     });
-    const h = transactionHarness([[], [{ partyId }], [], [{ partyId }], [targetAssertion], [conflictingRow]]);
+    const h = transactionHarness([
+      [],
+      [{ partyId }],
+      [],
+      [{ partyId }],
+      [targetAssertion],
+      [],
+      [],
+      [],
+      [conflictingRow],
+    ]);
     const command = yield* Schema.decodeEffect(PartyCorrectionCommandSchema)({
       ...evidence,
       factKind: 'PARTY_TYPE',
@@ -799,6 +800,7 @@ const identifierCorrectionRow = (overrides: Readonly<Record<string, unknown>> = 
   tenantId,
   validFrom: DateTime.toDateUtc(DateTime.makeUnsafe('2025-01-01T00:00:00.000Z')),
   validTo: null,
+  verificationState: 'VERIFIED',
   ...overrides,
 });
 const identifierCorrectionCommand = (replacementValue?: string) =>
@@ -815,6 +817,8 @@ const identifierCorrectionSelects = (replacement: readonly Readonly<Record<strin
   [],
   [{ partyId }],
   [identifierCorrectionRow()],
+  [],
+  [],
   replacement,
 ];
 it.effect('identifier correction converges to existing Current B without inserting or rewriting B', () =>
@@ -859,6 +863,7 @@ it.effect('identifier correction rejects same-ID and incompatible replacement be
       { identifierTypeKey: 'CZ_DIC', namespace: 'CZ:DIC' },
       { normalizedValue: '27074358' },
       { state: 'ENDED', isCurrent: false },
+      { verificationState: 'REJECTED' },
       { validFrom: DateTime.toDateUtc(DateTime.makeUnsafe('2027-01-01T00:00:00.000Z')) },
       { validTo: DateTime.toDateUtc(DateTime.makeUnsafe('2026-01-01T00:00:00.000Z')) },
     ]) {
