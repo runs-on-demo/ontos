@@ -23,6 +23,7 @@ import {
   partyContactPoints,
   partyCorrections,
   partyFactAssertions,
+  partyIdentifierClaims,
   partyMatchDecisions,
   partyMerges,
   partyOfficialIdentifiers,
@@ -43,6 +44,7 @@ const configuredTables = [
   partyContactPoints,
   partyCorrections,
   partyFactAssertions,
+  partyIdentifierClaims,
   partyMatchDecisions,
   partyMerges,
   partyOfficialIdentifiers,
@@ -91,15 +93,12 @@ it('owns the complete Party Registry operational catalog in the party schema', (
     'party_contact_point_purposes',
     'party_contact_points',
     'party_corrections',
-    'party_create_source_receipts',
     'party_fact_assertions',
-    'party_ico_correlation_epochs',
-    'party_legacy_ico_authority_fences',
+    'party_identifier_claims',
     'party_match_decisions',
     'party_merges',
     'party_official_identifiers',
     'party_relationships',
-    'party_source_effect_receipts',
     'privacy_measure_executions',
   ]);
   expect(qualifiedNames).toEqual(PARTY_TABLE_INVENTORY.map((name) => `party.${name}`));
@@ -205,43 +204,12 @@ it('gives every tenant-owned record a tenant-qualified identity and forced-RLS p
   }
 });
 
-it('retains acceptance and lifecycle evidence without classifying Party assertions by verification', () => {
-  for (const table of [partyFactAssertions, partyOfficialIdentifiers, partyContactPoints, partyContactPointPurposes]) {
-    const config = configOf(table);
-    for (const columnName of ['accepted_by_action_invocation_id', 'accepted_by_principal_id', 'policy_version']) {
-      expect(
-        config.columns.some((column) => column.name === columnName && column.notNull),
-        columnName,
-      ).toBe(true);
-    }
-    for (const columnName of [
-      'verification_state',
-      'verification_method',
-      'verifier_reference',
-      'verified_by_principal_id',
-      'verified_at',
-    ]) {
-      expect(
-        config.columns.some((column) => column.name === columnName),
-        columnName,
-      ).toBe(false);
-    }
-    expect(config.checks.some((constraint) => constraint.name.endsWith('_verification_ck'))).toBe(false);
-    expect(config.checks.some((constraint) => constraint.name.endsWith('_interval_ck'))).toBe(true);
-  }
-});
-
 it('models Party identity and assertion history without conflating effective and recorded time', () => {
   const partyConfig = configOf(parties);
-  for (const name of ['current_display_name', 'first_name', 'last_name', 'business_name']) {
-    expect(partyConfig.columns.some((column) => column.name === name && !column.notNull)).toBeTruthy();
-  }
+  expect(partyConfig.columns.some((column) => column.name === 'current_display_name' && !column.notNull)).toBeTruthy();
   expect(uniqueColumns(parties, 'party_parties_tenant_id_uk')).toEqual(['tenant_id', 'party_id']);
   expect(partyConfig.checks.map((candidate) => candidate.name).toSorted()).toEqual([
-    'party_parties_business_name_ck',
     'party_parties_display_name_ck',
-    'party_parties_first_name_ck',
-    'party_parties_last_name_ck',
     'party_parties_revision_ck',
     'party_parties_type_ck',
   ]);
@@ -253,6 +221,7 @@ it('models Party identity and assertion history without conflating effective and
     'state',
     'provenance_source',
     'provenance_method',
+    'verification_state',
     'accepted_by_action_invocation_id',
     'accepted_by_principal_id',
     'policy_version',
@@ -269,7 +238,13 @@ it('models Party identity and assertion history without conflating effective and
   ).toBe(getTableName(parties));
 });
 
-it('keeps official assertions historical without exclusive identifier identity claims', () => {
+it('keeps official assertions historical while exclusive claims own exact matching uniqueness', () => {
+  expect(uniqueColumns(partyIdentifierClaims, 'party_identifier_claims_exact_claim_uk')).toEqual([
+    'tenant_id',
+    'identifier_type_key',
+    'namespace',
+    'normalized_value',
+  ]);
   expect(
     configOf(partyOfficialIdentifiers)
       .checks.map((candidate) => candidate.name)
@@ -281,8 +256,12 @@ it('keeps official assertions historical without exclusive identifier identity c
     'party_official_identifiers_original_input_digits_ck',
     'party_official_identifiers_state_ck',
     'party_official_identifiers_type_ck',
+    'party_official_identifiers_verification_ck',
   ]);
-  expect(configuredTables.map((table) => getTableName(table))).not.toContain('party_identifier_claims');
+  const claims = configOf(partyIdentifierClaims);
+  expect(
+    claims.indexes.some((candidate) => candidate.config.name === 'party_identifier_claims_party_lookup_idx'),
+  ).toBeTruthy();
 });
 
 it('preserves bounded external observation evidence separately from trusted actor and effective time', () => {
@@ -324,6 +303,8 @@ it('models typed contact point lifecycles with owner-local references', () => {
     'provenance_authoritative',
     'evidence_reference',
     'additional_evidence_refs',
+    'verification_method',
+    'verifier_reference',
     'end_reason',
     'end_provenance_source',
     'end_provenance_method',
@@ -370,6 +351,9 @@ it('models contact point purpose lifecycles with owner-local references', () => 
     'jurisdiction',
     'provenance_authoritative',
     'evidence_reference',
+    'verification_state',
+    'verification_method',
+    'verifier_reference',
     'end_reason',
     'end_provenance_source',
     'end_provenance_method',
@@ -547,9 +531,7 @@ it('persists one recoverable match decision per Action and bounded duplicate rev
   if (snapshotCheck === undefined) {
     throw new Error('Expected value to be present');
   }
-  const snapshotSql = dialect.sqlToQuery(snapshotCheck.value).sql;
-  expect(snapshotSql).toMatch(/firstName.*lastName.*businessName.*provenance.*source.*method.*validFrom/u);
-  expect(snapshotSql).not.toContain("->'names'");
+  expect(dialect.sqlToQuery(snapshotCheck.value).sql).toMatch(/provenance.*source.*method.*validFrom/u);
   expect(
     getTableName(
       foreignKey(duplicateCandidateCaseParties, 'party_duplicate_candidate_case_parties_tenant_party_fk').reference()
@@ -634,9 +616,12 @@ it.layer(NodeFileSystem.layer)('schema-contract', (suite) => {
       const migration = yield* FileSystem.FileSystem.use((fs) =>
         fs.readFileString(fileURLToPath(new URL(`${migrationFolders[0] ?? ''}/migration.sql`, migrationDirectory))),
       );
-      // The immutable initial migration includes claims and predates privacy executions.
-      expect(migration.match(/ALTER TABLE "party"\."[^"]+" ENABLE ROW LEVEL SECURITY;/gu)?.length).toBe(17);
-      expect(migration.match(/ALTER TABLE "party"\."[^"]+" FORCE ROW LEVEL SECURITY;/gu)?.length).toBe(17);
+      expect(migration.match(/ALTER TABLE "party"\."[^"]+" ENABLE ROW LEVEL SECURITY;/gu)?.length).toBe(
+        PARTY_TABLE_INVENTORY.length - 1,
+      );
+      expect(migration.match(/ALTER TABLE "party"\."[^"]+" FORCE ROW LEVEL SECURITY;/gu)?.length).toBe(
+        PARTY_TABLE_INVENTORY.length - 1,
+      );
       expect(migration).not.toMatch(/REFERENCES "(?:core|auth|contacts)"\./u);
       expect(migration).toMatch(/party_reject_correction_mutation/u);
       expect(migration).toMatch(/before update or delete on "party"\."party_corrections"/iu);
@@ -647,6 +632,25 @@ it.layer(NodeFileSystem.layer)('schema-contract', (suite) => {
       expect(migration).toMatch(
         /party_counterparty_role_periods_no_overlap_excl[\s\S]*EXCLUDE USING gist[\s\S]*tstzrange/iu,
       );
+    }),
+  );
+
+  suite.effect('registers Party ownership in application database grants and exact verification', () =>
+    Effect.gen(function* testScenario() {
+      const bootstrap = yield* FileSystem.FileSystem.use((fs) =>
+        fs.readFileString(
+          fileURLToPath(new URL('../../../../scripts/postgres/runtime-role-bootstrap.mts', import.meta.url)),
+        ),
+      );
+      const verifier = yield* FileSystem.FileSystem.use((fs) =>
+        fs.readFileString(
+          fileURLToPath(new URL('../../../../scripts/verify-application-db-schema.mts', import.meta.url)),
+        ),
+      );
+      expect(bootstrap).toMatch(/\['core', 'auth', 'catalog', 'inventory', 'tax', 'privacy', 'projects'\]/u);
+      expect(bootstrap).toMatch(/revoke all on all tables in schema/u);
+      expect(verifier).toContain('loadApplicationMigrationInventory');
+      expect(verifier).toContain('for (const path of stream.verifierPaths)');
     }),
   );
 });
