@@ -196,17 +196,27 @@ const objectValue = (object: ObjectExpression | undefined, name: string): Node |
   return property?.type === 'Property' ? property.value : undefined;
 };
 
-const rstestEnvironmentEvidence = (facts: SourceFacts, workspace: string): KnipModelEvidence[] => {
+const rstestEnvironmentEvidence = (
+  facts: SourceFacts,
+  workspace: string,
+  directory: string,
+  path: Path.Path,
+): KnipModelEvidence[] => {
   if (!/rstest\.config\.[cm]?[jt]s$/u.test(facts.file)) {
     return [];
   }
   const config = exportedObject(facts);
   const projects = unwrap(objectValue(config, 'projects'), facts.variables);
-  const configurations = [config];
+  // Rstest 0.12.6 runs only the declared projects once `projects` is set and gives inline projects
+  // none of the root's setupFiles or testEnvironment. The root stays an active project while its
+  // projects cannot be read statically, because they may resolve to nothing.
+  const configurations = projects?.type === 'ArrayExpression' ? [] : [config];
   if (projects?.type === 'ArrayExpression') {
     for (const element of projects.elements) {
-      const project = unwrap(element ?? undefined, facts.variables);
-      if (project?.type === 'ObjectExpression') {
+      // An inline project may arrive wrapped, as in `defineInlineProject({ ... })` or `{ ... } satisfies T`.
+      const project =
+        element?.type === 'SpreadElement' ? undefined : objectExpression(element ?? undefined, facts.variables);
+      if (project !== undefined) {
         configurations.push(project);
       }
     }
@@ -214,18 +224,44 @@ const rstestEnvironmentEvidence = (facts: SourceFacts, workspace: string): KnipM
   return configurations.flatMap((object) => {
     const environment = objectValue(object, 'testEnvironment');
     const target = staticString(environment, facts.variables);
-    return target === undefined || target === 'node'
-      ? []
-      : [
-          evidenceAt(
-            facts,
-            workspace,
-            'dependency',
-            target,
-            environment?.start ?? 0,
-            'Rstest testEnvironment consumer',
-          ),
-        ];
+    const environmentEvidence =
+      target === undefined || target === 'node'
+        ? []
+        : [
+            evidenceAt(
+              facts,
+              workspace,
+              'dependency',
+              target,
+              environment?.start ?? 0,
+              'Rstest testEnvironment consumer',
+            ),
+          ];
+    // A relocated root changes what a relative setup path names. Do not invent
+    // file liveness when that framework resolution has not been established.
+    const setup =
+      objectValue(config, 'root') === undefined && objectValue(object, 'root') === undefined
+        ? unwrap(objectValue(object, 'setupFiles'), facts.variables)
+        : undefined;
+    const setupFiles = setup?.type === 'ArrayExpression' ? setup.elements : [setup];
+    return [
+      ...environmentEvidence,
+      ...setupFiles.flatMap((file) => {
+        const setupFile = staticString(file ?? undefined, facts.variables);
+        return setupFile === undefined || path.isAbsolute(setupFile) || setupFile.includes(':')
+          ? []
+          : [
+              evidenceAt(
+                facts,
+                workspace,
+                'file',
+                path.join(directory, setupFile),
+                file?.start ?? 0,
+                'Rstest setupFiles consumer',
+              ),
+            ];
+      }),
+    ];
   });
 };
 
@@ -2507,7 +2543,7 @@ const sourceEvidence = (
     NewExpression: recordUrl,
     ObjectExpression: recordLintPlugin,
   }).visit(facts.program);
-  result.push(...rstestEnvironmentEvidence(facts, workspace));
+  result.push(...rstestEnvironmentEvidence(facts, workspace, directory, path));
   if (facts.file === 'scripts/quality-audit.mts') {
     const recordAuditStep = (node: ObjectExpression) => {
       const tool = staticString(objectValue(node, 'tool'), facts.variables);
@@ -3692,6 +3728,73 @@ const apiSchemaAliasGroup = (
   };
 };
 
+const actionProposalModule = '@app/core-runtime/http/action-proposal';
+const actionProposalName = 'ActionProposalAcceptedSchema';
+const consumesActionProposalSuccess = (facts: SourceFacts): boolean => {
+  const parents = nativeSubprocessParents(facts.program);
+  for (const node of parents.keys()) {
+    for (const reference of apiAliasEndpointReferences(facts, node, parents)) {
+      if (
+        reference.reason.endsWith(' endpoint success') &&
+        reference.node.type === 'ArrayExpression' &&
+        reference.node.elements.some(
+          (element) =>
+            element !== null && apiAliasImportedObject(facts, element, actionProposalModule, actionProposalName),
+        )
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
+
+/** Codesmith publishes the parked-proposal codec from each composed Action HTTP contract. */
+const generatedActionProposalEvidence = (
+  factsByPath: ReadonlyMap<string, SourceFacts>,
+  prefix: string,
+  workspace: string,
+): KnipModelEvidence[] =>
+  [...factsByPath.values()].flatMap((facts) => {
+    const slug = /^\/\/ @ontos-action-http-slug (?<slug>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)$/mu.exec(facts.source)?.groups
+      ?.slug;
+    if (
+      !facts.source.startsWith('// @generated by OntOS Codesmith Action HTTP v1\n') ||
+      !/^\/\/ @ontos-action-http-owner [a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/mu.test(facts.source) ||
+      slug === undefined ||
+      facts.file !== `${prefix}shared/apis/${slug}-action.ts`
+    ) {
+      return [];
+    }
+    const exported = facts.program.body.find(
+      (statement) =>
+        statement.type === 'ExportNamedDeclaration' &&
+        statement.exportKind !== 'type' &&
+        statement.source?.value === actionProposalModule &&
+        statement.specifiers.some(
+          (specifier) =>
+            specifier.exportKind !== 'type' &&
+            propertyName(specifier.local) === actionProposalName &&
+            propertyName(specifier.exported) === actionProposalName,
+        ),
+    );
+    if (exported === undefined) {
+      return [];
+    }
+    return consumesActionProposalSuccess(facts)
+      ? [
+          evidenceAt(
+            facts,
+            workspace,
+            'export',
+            `${facts.file}#${actionProposalName}`,
+            exported.start,
+            'Generated Action HTTP parked-proposal public contract',
+          ),
+        ]
+      : [];
+  });
+
 const apiSchemaAliasEvidence = (
   factsByPath: ReadonlyMap<string, SourceFacts>,
   appRoot: string,
@@ -3925,6 +4028,7 @@ const workspaceModel = Effect.fn('QualityAudit.knipWorkspaceModel')(function* bu
     ...catalogSharedContractEvidence(factsByPath, workspace),
     ...catalogAliasEvidence(factsByPath, manifest, prefix, workspace, path),
     ...generatedModuleApiEvidence(factsByPath, prefix, workspace),
+    ...generatedActionProposalEvidence(factsByPath, prefix, workspace),
     ...generatedOutboxMessageEvidence(factsByPath, manifest, prefix, workspace),
     ...drizzleEvidence(factsByPath, prefix, workspace, path),
   );
