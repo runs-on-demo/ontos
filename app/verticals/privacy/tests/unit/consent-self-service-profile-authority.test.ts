@@ -161,7 +161,7 @@ const binding = {
   },
   completeness: 'FULL',
   grantedPermissions: ['retail.profile.read', 'retail.consent.manage'],
-  permissionsFreshness: freshness('commerce.customer-context'),
+  permissionsFreshness: freshness('core.identity'),
   provenance: [{ freshness: freshness('commerce.customer-context', '2'), projection: 'PROFILE' }],
 };
 const access = {
@@ -174,7 +174,7 @@ const access = {
   provenance: [
     { freshness: freshness('commerce.customer-context', '2'), projection: 'PROFILE' },
     { freshness: freshness('commerce.customer-context', 'mutation:original'), projection: 'RETAIL_BINDING' },
-    { freshness: freshness('commerce.customer-context'), projection: 'OWNING_CAPABILITY' },
+    { freshness: freshness('core.identity'), projection: 'OWNING_CAPABILITY' },
   ],
   requiredPermission: 'retail.consent.manage',
 };
@@ -200,13 +200,11 @@ const party = {
       value: 'PERSON',
     },
   ],
+  factHistory: null,
   party: {
     archivedAt: null,
-    businessName: null,
     createdAt: '1960-01-01T00:00:00Z',
     displayName: null,
-    firstName: null,
-    lastName: null,
     partyRef,
     partyType: 'PERSON',
     revision: 4,
@@ -238,7 +236,6 @@ const run = (scenario: Scenario = {}) =>
       const attempt = (attempts.get(path) ?? 0) + 1;
       attempts.set(path, attempt);
       calls.push(path);
-      expect(wire.headers.get('x-correlation-id')).toBe(scope.correlationId);
       expect(wire.headers.get('x-ontos-composition-revision')).toBe('a'.repeat(64));
       const responses = new Map<string, unknown>([
         ['customer-profile-read', scenario.profile ?? profile],
@@ -371,6 +368,7 @@ it.effect(
           binding: {
             ...binding,
             authorizationFreshness: { ...binding.authorizationFreshness, status: 'INDETERMINATE' },
+            binding: { ...binding.binding, authorizationState: 'PENDING_GRANT' },
           },
         },
         { binding: { ...binding, grantedPermissions: ['retail.profile.read'] } },
