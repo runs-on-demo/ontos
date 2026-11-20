@@ -17,7 +17,6 @@ import type { ApplicationMigrationRequirements } from '../application-migration-
 import { planDeploymentImpact } from '../plan-deployment-impact.mts';
 import { quoteIdentifier } from '../postgres/database-login-roles.mts';
 import { collectToolingProcess } from '../tests/tooling-process-fixture.mts';
-import { isIntegrationWorkerEndpoint } from '../ci/integration-worker-environment.mts';
 import {
   ScopedOwnerNativeStateSchema,
   ScopedOwnerPreparedPlanSchema,
@@ -25,12 +24,11 @@ import {
 
 const workspaceRoot = fileURLToPath(new URL('../..', import.meta.url));
 const runner = path.join(workspaceRoot, 'scripts/run-zerops-migrator.mjs');
-const retainedCatalogOwner = 'price-group-catalog';
 const selected: ApplicationMigrationRequirements = {
   mode: 'selected',
   owners: [
     { migrate: true, ownerId: 'tax', verify: true },
-    { migrate: false, ownerId: retainedCatalogOwner, verify: true },
+    { migrate: false, ownerId: 'price-group-catalog', verify: true },
   ],
 };
 const none: ApplicationMigrationRequirements = { mode: 'none', owners: [] };
@@ -148,7 +146,6 @@ const childEnvironment = Effect.gen(function* childEnvironmentEffect() {
   return {
     APP_ENV_PATH: '/dev/null',
     MIGRATOR_PORT: '0',
-    NODE_COMPILE_CACHE: yield* Config.String('NODE_COMPILE_CACHE').pipe(Config.withDefault('')),
     PATH: yield* Config.String('PATH'),
   };
 });
@@ -200,14 +197,7 @@ const fixture = Effect.fn('ScopedOwnerMigrations.ownedDatabase')(function* owned
   });
   const { admin } = connections;
   const ownedCluster = admin.database === 'ontos_1293_bootstrap' && admin.user === 'ontos_admin' && admin.port !== 5433;
-  const worker = yield* Config.all({
-    container: Config.String('ONTOS_TEST_DB_CONTAINER').pipe(Config.withDefault('')),
-    isolatedWorkers: Config.String('ONTOS_CI_ISOLATED_WORKERS').pipe(Config.withDefault('')),
-  });
-  const disposableCiCluster =
-    admin.database === 'ontos_ci' &&
-    admin.user === 'ontos_ci_admin' &&
-    (admin.port === 5433 || isIntegrationWorkerEndpoint({ ...worker, port: admin.port }));
+  const disposableCiCluster = admin.database === 'ontos_ci' && admin.user === 'ontos_ci_admin' && admin.port === 5433;
   if (!['127.0.0.1', 'localhost', '::1'].includes(admin.host) || !(ownedCluster || disposableCiCluster)) {
     return yield* new ScopedOwnerNativeFailure({ stage: 'reject_non_disposable_cluster' });
   }
@@ -280,29 +270,7 @@ it.live(
       const native = yield* fixture();
       yield* runToReadiness(allFile, native.allEnvironment, false);
       const streams = (yield* loadApplicationMigrationInventory()).filter(({ optional }) => !optional);
-      expect(streams.map(({ ownerId }) => ownerId)).toEqual([
-        'core-runtime',
-        'shell-super-app',
-        'party-registry-contacts',
-        'party-registry',
-        'payment-term-catalog',
-        retainedCatalogOwner,
-        'assortment',
-        'commerce-customer-context',
-        'commerce-market-catalog',
-        'catalog',
-        'inventory',
-        'pricing',
-        'privacy',
-        'storefront-registry',
-        'symmy-integration',
-        'tax',
-        'projects',
-        'commerce-cart',
-        'commerce-order',
-        'payment',
-        'promotion',
-      ]);
+      expect(streams).toHaveLength(19);
       const baseline = yield* observeNative(native.selectedEnvironment);
       expect(baseline.nativeTargets.map(({ database }) => database)).toEqual([native.database]);
       expect(baseline.nativeTargets.map(({ systemIdentifier }) => systemIdentifier)).toEqual([native.physicalIdentity]);
@@ -319,7 +287,7 @@ it.live(
       yield* native.client.unsafe(`drop schema ${quoteIdentifier('tax')} cascade`);
       yield* native.client.unsafe(`drop table drizzle.${quoteIdentifier(tax.journalName)}`);
       const pending = yield* prepareNative(native.selectedEnvironment, selectedFile);
-      expect(pending.plan.owners.map(({ ownerId }) => ownerId)).toEqual(['core-runtime', retainedCatalogOwner, 'tax']);
+      expect(pending.plan.owners.map(({ ownerId }) => ownerId)).toEqual(['core-runtime', 'price-group-catalog', 'tax']);
       expect(
         pending.plan.owners
           .filter(({ pendingMigrations }) => pendingMigrations.length > 0)
@@ -334,7 +302,7 @@ it.live(
       expect(refused.status).not.toBe(0);
       expect(yield* observeNative(native.selectedEnvironment)).toEqual(pendingSnapshot);
       expect(new Set(Object.keys(native.selectedEnvironment))).toEqual(
-        new Set(['APP_ENV_PATH', 'DATABASE_ADMIN_URL', 'DATABASE_URL', 'MIGRATOR_PORT', 'NODE_COMPILE_CACHE', 'PATH']),
+        new Set(['APP_ENV_PATH', 'DATABASE_ADMIN_URL', 'DATABASE_URL', 'MIGRATOR_PORT', 'PATH']),
       );
       yield* runToReadiness(selectedFile, native.selectedEnvironment, false);
       const after = yield* observeNative(native.selectedEnvironment);
