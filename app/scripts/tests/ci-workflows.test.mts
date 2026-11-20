@@ -658,7 +658,10 @@ it('stops a red merge queue run as soon as one early check fails, from jobs that
   // A matrix need waits for every row: the owner rows end with the run, so nothing would be saved.
   expect(Object.values(STOPPED_CHECKS)).not.toContain(OWNER_INTEGRATION_JOB);
   // The required check still reports on a cancelled run, red, so the queue removes the entry at once.
-  expect(jobs['workspace-gates']?.if).toBe(expression('always()'));
+  // Benchmark harness (runs-on-demo/ontos): a bench/** push only seeds caches.
+  expect(jobs['workspace-gates']?.if).toBe(
+    expression("always() && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/bench/'))"),
+  );
   for (const [job, { needs }] of Object.entries(jobs)) {
     for (const stop of stops) {
       expect(needs ?? [], job).not.toContain(stop);
@@ -695,12 +698,10 @@ it('classifies documentation before installation and schedules full regression w
       [CI_PLAN_JOB]: Schema.Struct({ steps: Schema.Array(WorkflowStepSchema) }),
       'workspace-gates': Schema.Struct({ permissions: Schema.Record(Schema.String, Schema.String) }),
     }),
-    on: Schema.Struct({
-      schedule: Schema.Array(Schema.Struct({ cron: Schema.String })),
-    }),
+    // Benchmark harness (runs-on-demo/ontos): the nightly schedule is removed.
+    on: Schema.Struct({}),
   });
   const workflow = Schema.decodeUnknownSync(schema)(readGateWorkflow());
-  expect(workflow.on.schedule).toEqual([{ cron: '30 2 * * *' }]);
   expect(workflow.jobs['workspace-gates'].permissions).toEqual({ contents: 'read' });
   const { steps } = workflow.jobs[CI_PLAN_JOB];
   const classify = steps.findIndex(({ id }) => id === 'changes');
@@ -797,7 +798,10 @@ const PLANNED_HELPERS = [
 it('requires the exact CI plan and rejects missing, failed or unplanned skipped gates', () => {
   const gates = readTargetWorkflow().jobs['workspace-gates'];
   expect(gates.name).toBe('Workspace gates');
-  expect(gates.if).toBe(expression('always()'));
+  // Benchmark harness (runs-on-demo/ontos): a bench/** push only seeds caches.
+  expect(gates.if).toBe(
+    expression("always() && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/bench/'))"),
+  );
   expect(gates.needs).toEqual([
     QUEUE_PROOF_JOB,
     CI_PLAN_JOB,
@@ -1218,7 +1222,10 @@ it('warms only reusable dependencies and typecheck state on main, never commit-b
     }),
   });
   const warm = Schema.decodeUnknownSync(schema)(readGateWorkflow()).jobs['warm-caches'];
-  expect(warm.if).toBe("github.event_name == 'push' && github.ref == 'refs/heads/main'");
+  // Benchmark harness (runs-on-demo/ontos): bench/** base branches are warmed like main.
+  expect(warm.if).toBe(
+    "github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/bench/'))",
+  );
   expect(warm.steps.find(({ name }) => name === INSTALL_APP_STEP)?.uses).toBe(INSTALL_APP_ACTION);
   expect(readFileSync(GATES_WORKFLOW_URL, 'utf-8')).not.toContain('pnpm-workspace-');
   expect(warm.steps.find(({ name }) => name === INSTALL_APP_STEP)?.with).toMatchObject({
