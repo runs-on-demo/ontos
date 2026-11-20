@@ -2,7 +2,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { NodeServices } from '@effect/platform-node';
-import { Console as EffectConsole, Deferred, Effect, Fiber, FileSystem, Ref, Schema, Stream } from 'effect';
+import { Deferred, Effect, Fiber, FileSystem, Ref, Schema, Stream } from 'effect';
 import { ChildProcess, ChildProcessSpawner } from 'effect/process';
 import { expect, it } from 'effect-rstest';
 
@@ -14,18 +14,6 @@ import {
 
 const workspaceRoot = path.resolve(import.meta.dirname, '../..');
 const nativeControlPath = fileURLToPath(new URL('outbox-worker-host-proof-native.fixture.mts', import.meta.url));
-
-// The generator's supported default package profile can emit this pinned Node26 advisory while
-// native TypeScript module detection imports real owner registrations. Every byte stays visible.
-const nodeModuleTypeWarnings = new RegExp(
-  String.raw`^(?:\(node:\d+\) \[MODULE_TYPELESS_PACKAGE_JSON\] Warning: Module type of file:\/\/[^\r\n]+\.ts is not specified and it doesn't parse as CommonJS\.\n` +
-    String.raw`Reparsing as ES module because module syntax was detected\. This incurs a performance overhead\.\n` +
-    String.raw`To eliminate this warning, add "type": "module" to [^\r\n]+\/package\.json\.\n` +
-    String.raw`(?:\(Use \x60node --trace-warnings \.\.\.\x60 to show where the warning was created\)\n)?)+(?![\s\S])`,
-  'u',
-);
-const hasOnlyNativeModuleTypeWarnings = (stderr: string): boolean =>
-  stderr === '' || nodeModuleTypeWarnings.test(stderr);
 
 const runSignalControl = (control: 'signal' | 'signal-finalizer-failure') =>
   Effect.gen(function* realNativeSignal() {
@@ -150,13 +138,10 @@ it.live('preserves the real complete catalog and serves exact native snapshot by
       ],
       { concurrency: 'unbounded' },
     );
-    if (stderr !== '') {
-      yield* EffectConsole.error(stderr);
-    }
-    expect({ code, stdout }).toEqual({
+    expect({ code, stderr, stdout }).toEqual({
       code: 0,
+      stderr: '',
       stdout: 'complete native host admission controls passed\n',
     });
-    expect(hasOnlyNativeModuleTypeWarnings(stderr)).toBe(true);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

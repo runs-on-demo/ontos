@@ -1,7 +1,0 @@
-{
-  "extends": "../../tsconfig.base.json",
-  "include": ["shared/api.ts"],
-  "compilerOptions": {
-    "skipLibCheck": true
-  }
-}
