@@ -159,6 +159,40 @@ runs:
           echo "manifests=${manifests%% *}"
         } >>"$GITHUB_OUTPUT"
 
+    # Bench (sticky disk arms): bind-mount every node_modules farm from the sticky disk before anything restores.
+    - name: Mount the installed workspace from the sticky disk
+      id: sticky
+      if: inputs.restore-node-modules == 'true' && env.RUNS_ON_STICKYDISK_READY_FILE != ''
+      shell: bash
+      working-directory: app
+      env:
+        PACKAGES: ${{ steps.packages.outputs.directories }}
+      run: |
+        set -euo pipefail
+        waited=$SECONDS
+        for _ in $(seq 300); do
+          [[ -f "$RUNS_ON_STICKYDISK_READY_FILE" || -f "$RUNS_ON_STICKYDISK_UNAVAILABLE_FILE" ]] && break
+          sleep 1
+        done
+        if [[ ! -f "$RUNS_ON_STICKYDISK_READY_FILE" ]]; then
+          echo "::warning::No sticky disk after $((SECONDS - waited)) s; restoring the cached workspace instead."
+          exit 0
+        fi
+        echo "Sticky disk ready after $((SECONDS - waited)) s."
+        sudo chown "$(id -u):$(id -g)" "$RUNS_ON_STICKYDISK_DIR"
+        mapfile -t packages <<<"$PACKAGES"
+        for farm in node_modules "${packages[@]/%//node_modules}"; do
+          mkdir -p "$RUNS_ON_STICKYDISK_DIR/app/$farm" "$farm"
+          sudo mount --bind "$RUNS_ON_STICKYDISK_DIR/app/$farm" "$farm"
+        done
+        if [[ -f node_modules/.modules.yaml ]]; then
+          echo "The sticky disk holds an installed workspace ($(du -sh "$RUNS_ON_STICKYDISK_DIR/app" | cut -f1))."
+        else
+          echo 'The sticky disk is blank; this job installs the workspace onto it.'
+        fi
+        echo 'mounted=true' >>"$GITHUB_OUTPUT"
+        echo 'BENCH_STICKY=true' >>"$GITHUB_ENV"
+
     - name: Name the installed workspace
       id: workspace-key
       if: inputs.restore-node-modules == 'true'
@@ -169,7 +203,7 @@ runs:
 
     - name: Restore the installed workspace
       id: workspace
-      if: inputs.restore-node-modules == 'true'
+      if: inputs.restore-node-modules == 'true' && steps.sticky.outputs.mounted != 'true'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.packages.outputs.paths }}
@@ -188,7 +222,8 @@ runs:
       shell: bash
       working-directory: app
       env:
-        RESTORED: ${{ steps.workspace.outputs.cache-hit }}
+        RESTORED: ${{ steps.sticky.outputs.mounted == 'true' && 'true' || steps.workspace.outputs.cache-hit }}
+        STICKY: ${{ steps.sticky.outputs.mounted }}
         PACKAGES: ${{ steps.packages.outputs.directories }}
       run: |
         set -euo pipefail
@@ -210,7 +245,9 @@ runs:
             echo '::warning::pnpm would not run in the restored app/ workspace without installing.'
           fi
         fi
-        if [[ "$RESTORED" == 'true' && "$usable" != 'true' ]]; then
+        if [[ "$STICKY" == 'true' && "$usable" != 'true' ]]; then
+          echo 'The sticky workspace is out of date; pnpm updates it in place.'
+        elif [[ "$RESTORED" == 'true' && "$usable" != 'true' ]]; then
           echo '::warning::Installing instead of using the restored workspace.'
           rm -rf node_modules
           for package in "${packages[@]}"; do
@@ -341,7 +378,7 @@ runs:
       id: publishable
       if: >-
         inputs.save-node-modules == 'true' && inputs.restore-node-modules == 'true' &&
-        steps.workspace.outputs.cache-hit != 'true'
+        steps.workspace.outputs.cache-hit != 'true' && steps.sticky.outputs.mounted != 'true'
       shell: bash
       working-directory: app
       env:
@@ -377,7 +414,7 @@ runs:
     - name: Save the installed workspace
       if: >-
         inputs.save-node-modules == 'true' && inputs.restore-node-modules == 'true' &&
-        steps.workspace.outputs.cache-hit != 'true'
+        steps.workspace.outputs.cache-hit != 'true' && steps.sticky.outputs.mounted != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.packages.outputs.paths }}
@@ -392,7 +429,7 @@ runs:
       run: echo "key=tsgo-${{ runner.os }}-${{ hashFiles('app/.mise.toml', 'app/pnpm-lock.yaml') }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
     - name: Restore the TS-Go typecheck build
-      if: inputs.restore-typescript-build == 'true'
+      if: inputs.restore-typescript-build == 'true' && steps.sticky.outputs.mounted != 'true'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: app/node_modules/.cache/tsgo
