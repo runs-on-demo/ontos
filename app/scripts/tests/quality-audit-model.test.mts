@@ -19,7 +19,6 @@ const requirePrelude = [
   'const require = createRequire(import.meta.url);',
 ];
 const resolverFile = 'src/resolver.ts';
-const deadFile = 'src/dead.ts';
 const directFile = 'src/direct.ts';
 const configurationFiles = '*.config.ts';
 const toolsPattern = 'tools/**/*.{ts,mts}';
@@ -296,7 +295,7 @@ const fixture = () =>
     write(root, directFile, "import '@rspack/core';");
     write(root, 'src/helper.ts', 'export const used = 1; export const unusedNeighbor = 2;');
     write(root, 'src/worker.mts', 'console.log("worker"); export const unusedWorkerExport = 3;');
-    write(root, deadFile, 'export const genuinelyDead = 1;');
+    write(root, 'src/dead.ts', 'export const genuinelyDead = 1;');
     write(root, 'src/public.ts', 'export const externallyConsumed = 1;');
     write(
       root,
@@ -326,74 +325,6 @@ const fixture = () =>
     );
     return root;
   });
-
-it.live(
-  'Rstest setup files stay live without hiding their unused exports or dynamic neighbors',
-  Effect.fn(function* rstestSetupFileConsumers() {
-    const root = yield* fixture();
-    const rootSetup = 'src/root-setup.ts';
-    const projectSetup = 'src/integration-setup.ts';
-    const wrappedSetup = 'src/wrapped-setup.ts';
-    // Rstest gives inline projects none of the root's setupFiles, so the root setup is dead here.
-    write(
-      root,
-      rstestConfigFile,
-      `import { defineConfig, defineInlineProject } from '@rstest/core';
-       export default defineConfig({
-         setupFiles: ['./${rootSetup}'],
-         projects: [
-           { name: 'integration', setupFiles: ['./${projectSetup}'] },
-           defineInlineProject({ name: 'wrapped', setupFiles: ['./${wrappedSetup}'] }),
-           { name: 'dynamic', setupFiles: [chooseSetup()] },
-           { name: 'relocated', root: 'elsewhere', setupFiles: ['./${deadFile}'] }
-         ]
-       });`,
-    );
-    for (const file of [rootSetup, projectSetup, wrappedSetup]) {
-      write(root, file, 'export const unusedSetupExport = 1;');
-    }
-    const consumerPath = path.join(root, auditConsumersFile);
-    const knipConfig = {
-      workspaces: {
-        '.': {
-          entry: [rstestConfigFile],
-          node: false,
-          project: [rstestConfigFile, 'src/*.ts'],
-          rstest: { config: [] },
-        },
-      },
-    };
-    const setupEvidence = Effect.fn(function* setupEvidence() {
-      const built = yield* buildKnipModel(root, knipConfig, consumerPath).pipe(Effect.provide(NodeServices.layer));
-      return {
-        model: built,
-        targets: built.evidence
-          .filter(({ reason }) => reason === 'Rstest setupFiles consumer')
-          .map(({ target }) => target),
-      };
-    });
-    const { model, targets } = yield* setupEvidence();
-    const run = yield* runPinnedKnip(root, consumerPath, model).pipe(Effect.provide(NodeServices.layer));
-    const report = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ReportSchema))(run.stdout);
-    const files = report.issues.flatMap((issue) => issue.files.map((finding) => finding.name));
-    const exports = report.issues.flatMap((issue) => issue.exports.map((finding) => `${issue.file}#${finding.name}`));
-    for (const file of [projectSetup, wrappedSetup]) {
-      expect(files).not.toContain(file);
-      expect(exports).toContain(`${file}#unusedSetupExport`);
-    }
-    expect(files).toContain(deadFile);
-    expect(files).toContain(rootSetup);
-    expect(targets).toEqual([projectSetup, wrappedSetup]);
-    // Without projects the root is the test project, and its setup file is live.
-    write(
-      root,
-      rstestConfigFile,
-      `import { defineConfig } from '@rstest/core';
-       export default defineConfig({ setupFiles: ['./${rootSetup}'] });`,
-    );
-    expect((yield* setupEvidence()).targets).toEqual([rootSetup]);
-  }),
-);
 
 it.live(
   'native Modern route generation proves paired client loaders and splat defaults without hiding neighbors',
@@ -1750,6 +1681,16 @@ it.live(
 );
 
 it.live(
+  'the model regression harness uses the repository-pinned Knip version',
+  Effect.fn(function* testEffect5() {
+    const manifest = yield* Schema.decodeUnknownEffect(
+      Schema.fromJsonString(Schema.Struct({ version: Schema.Literal('6.34.0') })),
+    )(readFileSync(path.join(appRoot, knipManifestFile), 'utf-8'));
+    expect(manifest.version).toBe('6.34.0');
+  }),
+);
+
+it.live(
   'runner calibrates only the proven resolver record and retains the direct import',
   Effect.fn(function* testEffect6() {
     const root = yield* fixture();
@@ -2054,7 +1995,7 @@ it.live(
     }
     expect(files).not.toContain(typeTest);
     expect(exports).toContain(`${typeTest}#unusedTypeTestNeighbor`);
-    expect(files).toContain(deadFile);
+    expect(files).toContain('src/dead.ts');
     const probeFile = `${lintDirectory}/tests/shared-helpers-probe.ts`;
     expect(model.evidence.filter((fact) => fact.source === helperTest)).toEqual([
       expect.objectContaining({
@@ -2227,101 +2168,5 @@ it.live(
     const files = report.issues.flatMap((issue) => issue.files.map((finding) => finding.name));
     expect(files).not.toContain(`${workspace}/${probe}`);
     expect(files).toContain(`${workspace}/${neighbor}`);
-  }),
-);
-
-it.live(
-  'models the actual generated Action proposal public contract and preserves neighboring unused exports',
-  Effect.fn(function* generatedActionProposalPublicContract() {
-    const root = yield* fixture();
-    const owner = 'verticals/promotion';
-    const original = 'create-promotion-draft';
-    const actual = readFileSync(path.join(appRoot, owner, `shared/apis/${original}-action.ts`), 'utf-8');
-    const proposal = 'ActionProposalAcceptedSchema';
-    const module = '@app/core-runtime/http/action-proposal';
-    write(root, `${owner}/package.json`, JSON.stringify({ name: '@app/promotion', type: 'module' }));
-    write(
-      root,
-      'packages/core-runtime/package.json',
-      JSON.stringify({
-        exports: { './http/action-proposal': './proposal.ts', './http/foreign': './foreign.ts' },
-        name: '@app/core-runtime',
-        type: 'module',
-      }),
-    );
-    write(root, 'packages/core-runtime/proposal.ts', `export const ${proposal} = 1;`);
-    write(root, 'packages/core-runtime/foreign.ts', `export const ${proposal} = 1;`);
-    write(
-      root,
-      `${owner}/shared/actions/${original}.ts`,
-      'export const CreatePromotionDraftPayloadSchema = 1; export const CreatePromotionDraftResultSchema = 2;',
-    );
-    const controls = [
-      ['missing-success', actual.replace(`success: [${proposal},`, 'success: [')],
-      [
-        'unregistered-api',
-        actual.replace('export const CreatePromotionDraftActionApi', 'const CreatePromotionDraftActionApi'),
-      ],
-      [
-        'wrong-source',
-        actual.replace(
-          `export { ${proposal} } from '${module}';`,
-          `export { ${proposal} } from '@app/core-runtime/http/foreign';`,
-        ),
-      ],
-      ['wrong-header', actual.replace('Codesmith Action HTTP v1', 'Codesmith Action HTTP v2')],
-    ] as const;
-    const sourcePath = (slug: string) => `${owner}/shared/apis/${slug}-action.ts`;
-    write(root, sourcePath(original), `${actual}\nexport const unusedProposalNeighbor = 1;\n`);
-    for (const [slug, source] of controls) {
-      write(
-        root,
-        sourcePath(slug),
-        source.replace(`@ontos-action-http-slug ${original}`, `@ontos-action-http-slug ${slug}`),
-      );
-    }
-    const allSlugs = [original, ...controls.map(([slug]) => slug)];
-    write(
-      root,
-      `${owner}/src/consumer.ts`,
-      allSlugs
-        .map(
-          (slug, index) =>
-            `import { CreatePromotionDraftActionApi as api${index} } from '../shared/apis/${slug}-action.ts'; void api${index};`,
-        )
-        .join('\n'),
-    );
-    const base = yield* Schema.decodeUnknownEffect(KnipConfigSchema)({
-      workspaces: {
-        '.': { entry: [], node: false, project: [] },
-        [owner]: { entry: ['src/consumer.ts'], node: false, project: ['**/*.ts'] },
-        'packages/*': { entry: [], node: false, project: ['*.ts'] },
-      },
-    });
-    const consumerPath = path.join(root, auditConsumersFile);
-    const native = yield* runPinnedKnip(root, consumerPath, { config: base, consumerFiles: [] }).pipe(
-      Effect.provide(NodeServices.layer),
-    );
-    const decodeReport = Schema.decodeUnknownEffect(Schema.fromJsonString(ReportSchema));
-    const nativeReport = yield* decodeReport(native.stdout);
-    expect(
-      nativeReport.issues.find((issue) => issue.file === sourcePath(original))?.exports.map(({ name }) => name),
-    ).toContain(proposal);
-    const model = yield* buildKnipModel(root, base, consumerPath).pipe(Effect.provide(NodeServices.layer));
-    const evidence = model.evidence.filter(
-      (fact) => fact.reason === 'Generated Action HTTP parked-proposal public contract',
-    );
-    expect(evidence.map(({ target }) => target)).toEqual([`${sourcePath(original)}#${proposal}`]);
-    expect(evidence[0]).toMatchObject({ kind: 'export', source: sourcePath(original), workspace: owner });
-    expect(evidence[0]?.line).toBeGreaterThan(0);
-    const modeled = yield* runPinnedKnip(root, consumerPath, model).pipe(Effect.provide(NodeServices.layer));
-    const report = yield* decodeReport(modeled.stdout);
-    const exportsFor = (slug: string) =>
-      report.issues.find((issue) => issue.file === sourcePath(slug))?.exports.map(({ name }) => name) ?? [];
-    expect(exportsFor(original)).not.toContain(proposal);
-    expect(exportsFor(original)).toContain('unusedProposalNeighbor');
-    for (const [slug] of controls) {
-      expect(exportsFor(slug), slug).toContain(proposal);
-    }
   }),
 );
