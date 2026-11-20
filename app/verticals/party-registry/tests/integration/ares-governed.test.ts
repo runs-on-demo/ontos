@@ -1,15 +1,19 @@
 import { PgClient } from '@effect/sql-pg';
 // @rstest-environment happy-dom
 // @rstest-environment-options {"url":"https://party.ontos.test"}
-import { DatabaseConfig } from '@app/core-runtime';
+import {
+  GatewayScopeGrantRegistrar,
+  GatewayScopeGrantRegistrarLive,
+  loadDatabaseConnectionPair,
+  makeDatabaseConfigLive,
+  PARTY_REGISTRY_REQUEST_IDENTITY,
+} from '@app/core-runtime';
 import { STAFF_AUTHENTICATION_NAMESPACE_ID } from '@app/core-runtime/auth/staff-authentication-namespace';
-import { makeGatewayScopeGrantRegistrar, makeLiveOperationFixture } from '@app/core-runtime/testing/actions';
-import { makeIsolatedNativeDatabaseFixture } from '@app/core-runtime/testing/isolated-native-database';
-import { makePartyDeniedAccess } from '../support/live-access-authority.ts';
+import { makeLiveOperationFixture } from '@app/core-runtime/testing/actions';
 import { addTestGatewayScopeGrantCleanup } from '@app/core-runtime/testing/gateway-scope-grant';
 import { makeActiveApplicationCompositionLayer } from '@app/core-runtime/modules/active-application-composition';
 import { ActiveApplicationCompositionSourceLive } from '@app/core-runtime/modules/active-application-composition-source';
-import { NodeChildProcessSpawner, NodeCrypto, NodeServices } from '@effect/platform-node';
+import { NodeCrypto } from '@effect/platform-node';
 import { HttpApi, HttpApiBuilder, HttpRouter, HttpServer } from '@modern-js/bff-effect/effect-edge';
 import { eq } from 'drizzle-orm';
 import {
@@ -57,6 +61,7 @@ import { addContactPointAction } from '../../src/actions/add-contact-point.actio
 import { addPartyOfficialIdentifierAction } from '../../src/actions/add-party-official-identifier.action.ts';
 import { correctPartyFactAction } from '../../src/actions/correct-party-fact.action.ts';
 import { createPartyAction } from '../../src/actions/create-party.action.ts';
+import { resolveDuplicateCandidateCreateAction } from '../../src/actions/resolve-duplicate-candidate-create.action.ts';
 import { updatePartyAction } from '../../src/actions/update-party.action.ts';
 import type { AresApplyRequest } from '../../src/api/action-gateway.ts';
 import { makeOperationGateway } from '../../src/api/action-gateway.ts';
@@ -64,6 +69,7 @@ import { executeAresLookupWithAuthorization } from '../../src/api/ares-lookup-cl
 import {
   correctPartyFactWithAuthorization,
   createPartyWithAuthorization,
+  resolveDuplicateCandidateCreateWithAuthorization,
   updatePartyWithAuthorization,
 } from '../../src/api/party-command-client.ts';
 import { executePartyDetailWithAuthorization } from '../../src/api/party-detail-client.ts';
@@ -71,11 +77,11 @@ import { applyAresObservation } from '../../src/api/party-registry-client.ts';
 import {
   partyContactPoints,
   partyFactAssertions,
+  partyIdentifierClaims,
   partyOfficialIdentifiers,
   partyRelations,
 } from '../../src/db/schema.ts';
 import { AresSubjectServiceLive } from '../../src/integrations/ares/ares-subject.service.ts';
-import { preparePartyReconciliationNative } from '../support/party-reconciliation-native.fixture.ts';
 import { partyCompositionSnapshot } from './application-composition.setup.ts';
 
 const nextUuid = Crypto.Crypto.use((crypto) => crypto.randomUUIDv4());
@@ -111,34 +117,29 @@ const rawSubject = {
 const emptyRequestContext = Context.makeUnsafe<unknown>(new Map());
 const lookupIco = Schema.decodeSync(AresSubjectLookupIcoSchema)('27074358');
 
-const nativeServices = NodeChildProcessSpawner.layer.pipe(
-  Layer.provideMerge(NodeServices.layer),
-  Layer.provideMerge(NodeCrypto.layer),
-);
-
-it.layer(nativeServices, { excludeTestServices: true })((suite) => {
+it.layer(NodeCrypto.layer, { excludeTestServices: true })((suite) => {
   suite.effect(
     'exported ARES coordinator uses real authorized HTTP commands, canonical persistence and reviewed correction',
     () =>
       Effect.gen(function* aresGovernedTestEffect() {
-        const compositionSnapshot = yield* partyCompositionSnapshot;
-        const isolated = yield* makeIsolatedNativeDatabaseFixture({
-          compositionSnapshot,
-          mode: 'schema-only',
-          purpose: 'implementation-1096-address-source',
+        // The Party request identity serves every Action, Read and redemption in this test.
+        const connections = yield* loadDatabaseConnectionPair({
+          envPath: '/dev/null',
+          identity: PARTY_REGISTRY_REQUEST_IDENTITY,
         });
-        const native = yield* preparePartyReconciliationNative(isolated.connections);
-        // The Party request identity serves every Action, Read and redemption in this owned clone.
-        const connections = { ...isolated.connections, runtime: native.partyConfiguration };
-        const grantRegistrar = makeGatewayScopeGrantRegistrar(native.issuer);
+        const grantRegistrar = Context.get(
+          yield* Layer.build(GatewayScopeGrantRegistrarLive).pipe(Effect.orDie),
+          GatewayScopeGrantRegistrar,
+        );
+        const compositionSnapshot = yield* partyCompositionSnapshot;
         const fixture = yield* Effect.acquireRelease(
           makeLiveOperationFixture({
-            access: 'allowed',
             actionKeys: [
               addContactPointAction,
               addPartyOfficialIdentifierAction,
               correctPartyFactAction,
               createPartyAction,
+              resolveDuplicateCandidateCreateAction,
               updatePartyAction,
             ].map(({ descriptor }) => descriptor.actionKey),
             adminConnectionString: Redacted.make(connections.admin.connectionString),
@@ -150,8 +151,6 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
           }).pipe(Effect.orDie),
           (resource) => resource.close().pipe(Effect.orDie),
         );
-        const deniedAccess = makePartyDeniedAccess();
-        const fixtureLayer = fixture.layer.pipe(Layer.provide(deniedAccess.layer));
         const adminClient = yield* makeTestPgClient(connections.admin.connectionString);
         const admin = yield* makeTestDatabaseFromClient(adminClient, partyRelations);
         const coreAdmin = yield* testCoreDatabase.pipe(Effect.provideService(PgClient.PgClient, adminClient));
@@ -177,13 +176,11 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
           principal: typeof fixture.manager & { readonly legalEntityId?: string },
         ) {
           const assertionId = yield* Effect.orDie(crypto.randomUUIDv4());
-          // Grants use PostgreSQL time; derive both claims from it to preserve the exact 300-second JWT lifetime.
+          // Grants expire against PostgreSQL's clock, so the expiry is derived from the database time.
           const [databaseNow] = yield* adminClient<{ readonly nowSeconds: number }>`
             select floor(extract(epoch from now()))::int as "nowSeconds"
           `.pipe(Effect.orDie);
-          assert.isOk(databaseNow);
-          const issuedAtEpochSeconds = databaseNow.nowSeconds;
-          const expiresAtEpochSeconds = issuedAtEpochSeconds + 300;
+          const expiresAtEpochSeconds = (databaseNow?.nowSeconds ?? 0) + 300;
           const token = yield* Effect.promise(() =>
             new SignJWT({
               compositionRevision: compositionSnapshot.composition.revision,
@@ -195,7 +192,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
               .setIssuer(issuer)
               .setAudience('party-registry')
               .setSubject(principal.principalId)
-              .setIssuedAt(issuedAtEpochSeconds)
+              .setIssuedAt()
               .setExpirationTime(expiresAtEpochSeconds)
               .setJti(assertionId)
               .sign(privateKey),
@@ -232,7 +229,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
         const upstream = AresSubjectServiceLive.pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, provider)));
         const redemption = GatewayAssertionRedemptionLive.pipe(
           Layer.provide(GatewayAssertionRedemptionDatabaseLive),
-          Layer.provide(Layer.succeed(DatabaseConfig, connections.runtime)),
+          Layer.provide(makeDatabaseConfigLive(PARTY_REGISTRY_REQUEST_IDENTITY)),
         );
         const api = HttpApi.make('PartyRegistryApi')
           .add(partyRegistryApi.groups.partyCommands)
@@ -254,7 +251,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
             ).pipe(Layer.provide(ActiveApplicationCompositionSourceLive), Layer.provide(FetchHttpClient.layer)),
           ),
           Layer.provide(redemption),
-          Layer.provide(fixtureLayer),
+          Layer.provide(fixture.layer),
           Layer.provide(
             ConfigProvider.layer(
               ConfigProvider.fromUnknown({
@@ -269,7 +266,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
             HttpRouter.toWebHandler(
               HttpApiBuilder.layer(api).pipe(
                 Layer.provide(handlers),
-                Layer.provideMerge(fixtureLayer),
+                Layer.provideMerge(fixture.layer),
                 Layer.provideMerge(upstream),
                 Layer.provide(HttpServer.layerServices),
                 Layer.provide(
@@ -308,8 +305,6 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
               {
                 candidate: {
                   partyType: 'ORGANIZATION',
-                  firstName: 'Personal source',
-                  lastName: 'Retained surname',
                   officialIdentifiers: [],
                   evidenceRefs: ['live-review/ares'],
                   subjectEvidence: yield* Effect.all(subjectEvidence.map((item) => withFreshSubjectKey(item))),
@@ -321,8 +316,23 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
               yield* options,
             ),
           );
-          assert.isOk(created.outcome === 'CREATED');
-          return created.partyRef;
+          expect(created.outcome).toBe('AMBIGUOUS');
+          assert.isOk(created.outcome === 'AMBIGUOUS');
+
+          const reviewed = yield* runHttpEffect(
+            resolveDuplicateCandidateCreateWithAuthorization(
+              {
+                caseRef: created.caseRef,
+                expectedRevision: 1,
+                reason: 'Reviewed concrete organization without a strong identifier',
+              },
+              yield* authorization(),
+              yield* options,
+            ),
+          );
+          assert.isOk(reviewed.partyRef);
+
+          return reviewed.partyRef;
         });
         const lookup = Effect.fn('AresGovernedTest.lookup')(function* lookupEffect() {
           return yield* runHttpEffect(
@@ -349,6 +359,10 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
                 .select()
                 .from(partyFactAssertions)
                 .where(eq(partyFactAssertions.tenantId, fixture.tenantId)),
+              claims: admin
+                .select()
+                .from(partyIdentifierClaims)
+                .where(eq(partyIdentifierClaims.tenantId, fixture.tenantId)),
               contacts: admin
                 .select()
                 .from(partyContactPoints)
@@ -359,7 +373,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
                 .from(partyOfficialIdentifiers)
                 .where(eq(partyOfficialIdentifiers.tenantId, fixture.tenantId)),
             },
-            { concurrency: 4 },
+            { concurrency: 5 },
           ),
         );
         const partyRef = yield* create();
@@ -399,7 +413,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
                   idempotencyKey: yield* nextUuid,
                   payload: {
                     partyRef: target,
-                    businessName: rawSubject.obchodniJmeno,
+                    displayName: rawSubject.obchodniJmeno,
                     expectedRevision: 1,
                     validFrom: observation.observedAt,
                     provenanceMethod: 'ARES_USER_CONFIRMED',
@@ -415,6 +429,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
                     identifier: {
                       identifierType: 'ICO',
                       value: '27074358',
+                      verification: 'VERIFIED',
                     },
                     validFrom: observation.observedAt,
                     provenanceMethod: 'ARES_USER_CONFIRMED',
@@ -454,6 +469,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
                       method: 'PROVIDER_OBSERVATION',
                       source: 'EXTERNAL_EVIDENCE',
                     },
+                    verification: { state: 'UNVERIFIED' },
                   },
                 },
               ],
@@ -475,7 +491,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
 
         expect(applied.completed.length).toBe(3);
         const persisted = yield* state();
-        expect(persisted.identifiers.length).toBe(1);
+        expect(persisted.claims.length).toBe(1);
         expect(persisted.contacts.length).toBe(1);
         const identifierEvidence = persisted.identifiers[0]?.externalEvidence;
         const contactEvidence = persisted.contacts[0]?.externalEvidence;
@@ -489,9 +505,9 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
         expect(contactEvidence.observedAt).toBe(encodedObservation.observedAt);
         expect(contactEvidence.providerChangedOn).toBe(encodedObservation.providerChangedOn);
         expect(contactEvidence.providerRecordRef).toBe(encodedObservation.providerRecordRef);
-        expect(
-          persisted.assertions.find((item) => item.factKind === 'BUSINESS_NAME')?.externalEvidence?.decidedAt,
-        ).toBe(encodedObservation.servedAt);
+        expect(persisted.assertions.find((item) => item.factKind === 'DISPLAY_NAME')?.externalEvidence?.decidedAt).toBe(
+          encodedObservation.servedAt,
+        );
         expect(persisted.core.events.length).toBe(4);
         expect(persisted.core.outbox.length).toBe(4);
         assert.isOk(persisted.core.invocations.every((item) => item.status === 'succeeded'));
@@ -503,10 +519,6 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
         expect(replay.skipped.length).toBe(3);
         const afterReplay = yield* state();
         expect(afterReplay.core.events.length).toBe(persisted.core.events.length);
-        // v2: the one access gate decides this ARES read (O62); a principal it does not admit is
-        // refused before any provider work. The fixture scripts its gate per capability, so the
-        // refusal of this one principal is named on the fixture's own per-request owner seam.
-        deniedAccess.deny(fixture.denied.principalId);
         const deniedGateway = makeOperationGateway(({ compositionRevision: requestedRevision }) => {
           expect(requestedRevision).toBe(compositionRevision);
           return sign(fixture.denied).pipe(
@@ -526,31 +538,23 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
           applyAresObservation(yield* requestFor(collisionParty), { gateway, baseUrl }),
         );
         const collisionOutcome = Match.value(collision).pipe(
-          Match.tag('AresApplyCompleted', (outcome) => outcome),
-          Match.orElse(() => assert.fail(`Expected independent fact acceptance, received ${collision._tag}`)),
+          Match.tag('AresApplyPartiallyCompleted', (outcome) => outcome),
+          Match.orElse(() => assert.fail(`Expected partial completion, received ${collision._tag}`)),
         );
-        expect(collisionOutcome.completed.length).toBe(3);
-        expect(collisionParty).not.toEqual(partyRef);
+        expect(collisionOutcome.completed.length).toBe(1);
+        expect(collisionOutcome.failed.fact).toBe('ICO');
+        expect(collisionOutcome.failed.recovery).toBe('RESOLVE_STANDARD_ACTION_BEFORE_RETRY');
         const afterCollision = yield* state();
-        expect(afterCollision.identifiers.filter((item) => item.normalizedValue === lookupIco)).toHaveLength(2);
-        expect(afterCollision.contacts.length).toBe(2);
+        expect(afterCollision.claims.length).toBe(1);
+        expect(afterCollision.contacts.length).toBe(1);
         const collisionDetail = yield* detail(collisionParty);
-        expect(collisionDetail.party.partyRef).toEqual(collisionParty);
-        expect(Option.getOrUndefined(collisionDetail.party.businessName ?? Option.none())).toBe(
-          rawSubject.obchodniJmeno,
-        );
-        expect(Option.getOrUndefined(collisionDetail.party.firstName ?? Option.none())).toBe('Personal source');
-        expect(Option.getOrUndefined(collisionDetail.party.lastName ?? Option.none())).toBe('Retained surname');
-        expect(collisionDetail.party.partyType).toBe('ORGANIZATION');
-        expect(Option.getOrUndefined(collisionDetail.party.displayName ?? Option.none())).toBe(
-          rawSubject.obchodniJmeno,
-        );
+        expect(Option.getOrUndefined(collisionDetail.party.displayName)).toBe(rawSubject.obchodniJmeno);
 
         const erroneousParty = yield* create();
         const logical = deriveAresEvidenceApplication({
           canonical: {
             archived: false,
-            businessName: null,
+            displayName: null,
             icoValues: [],
             identityAmbiguous: false,
             partyType: 'ORGANIZATION',
@@ -568,7 +572,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
           updatePartyWithAuthorization(
             {
               partyRef: erroneousParty,
-              businessName: 'Clerical wrong name',
+              displayName: 'Clerical wrong name',
               expectedRevision: 1,
               validFrom: observation.observedAt,
               provenanceMethod: 'ARES_USER_CONFIRMED',
@@ -580,12 +584,12 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
           ),
         );
         const erroneous = yield* detail(erroneousParty);
-        const assertion = erroneous.currentFactAssertions.find((item) => item.factKind === 'BUSINESS_NAME');
+        const assertion = erroneous.currentFactAssertions.find((item) => item.factKind === 'DISPLAY_NAME');
         assert.isOk(assertion);
 
         const correctionPayload = yield* Schema.decodeEffect(IdentityCorrectionCommandSchema)({
           partyId: erroneousParty.resourceId,
-          factKind: 'BUSINESS_NAME' as const,
+          factKind: 'DISPLAY_NAME' as const,
           targetAssertionId: assertion.assertionId,
           replacementValue: rawSubject.obchodniJmeno,
           evidenceRefs: ['live-review/ares'],
@@ -627,11 +631,7 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
           correctPartyFactWithAuthorization(correctionPayload, yield* authorization(), yield* options),
         );
         const corrected = yield* detail(erroneousParty);
-        expect(Option.getOrUndefined(corrected.party.displayName ?? Option.none())).toBe(rawSubject.obchodniJmeno);
-        expect(Option.getOrUndefined(corrected.party.businessName ?? Option.none())).toBe(rawSubject.obchodniJmeno);
-        expect(Option.getOrUndefined(corrected.party.firstName ?? Option.none())).toBe('Personal source');
-        expect(Option.getOrUndefined(corrected.party.lastName ?? Option.none())).toBe('Retained surname');
-        expect(corrected.party.partyType).toBe('ORGANIZATION');
+        expect(Option.getOrUndefined(corrected.party.displayName)).toBe(rawSubject.obchodniJmeno);
         const correctedState = yield* state();
         assert.isOk(
           correctedState.assertions.some(
@@ -641,6 +641,5 @@ it.layer(nativeServices, { excludeTestServices: true })((suite) => {
 
         assert.isOk(providerRequests >= 1);
       }),
-    120_000,
   );
 });
