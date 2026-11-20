@@ -93,12 +93,6 @@
     },
     {
       "path": "verticals/commerce-order"
-    },
-    {
-      "path": "verticals/promotion"
-    },
-    {
-      "path": "verticals/symmy-integration"
     }
   ]
 }
