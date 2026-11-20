@@ -1042,7 +1042,7 @@ it('builds every Node release from this commit rather than restoring another rel
   // holding back the run until the job's limit.
   expect(steps[build]?.['timeout-minutes']).toBe(10);
   expect(jobTimeout).toBeGreaterThan(10);
-  expect(steps[build]?.run).toContain(`--workspace-concurrency=2 "\${filters[@]}" run build`);
+  expect(steps[build]?.run).toContain(`--workspace-concurrency=4 "\${filters[@]}" run build`);
   // The integration lanes' single-thread cap must not reach the compilers.
   expect(env.RAYON_NUM_THREADS).toBeUndefined();
   expect(steps[build]?.env).toMatchObject({
@@ -1577,14 +1577,14 @@ it('runs the root unit and component tests of every workspace package in exactly
   const shards = gateCommands().flatMap((commands) => {
     const [unit, component, ...rest] = commands;
     const match =
-      /^pnpm -r --no-sort --workspace-concurrency=(?<packages>[1-4]) --if-present (?<filters>.+) run test:unit --pool.maxWorkers (?<workers>[1-4])$/u.exec(
+      /^pnpm -r --no-sort --workspace-concurrency=(?<packages>[1-8]) --if-present (?<filters>.+) run test:unit --pool.maxWorkers (?<workers>[1-8])$/u.exec(
         unit,
       );
     if (match?.groups === undefined) {
       return [];
     }
     const { filters = '', packages = '', workers = '' } = match.groups;
-    expect(Number(packages) * Number(workers)).toBeLessThanOrEqual(4);
+    expect(Number(packages) * Number(workers)).toBeLessThanOrEqual(8);
     // Each shard runs test:component over the same packages, after test:unit, and nothing else.
     expect(component).toBe(
       `pnpm -r --no-sort --workspace-concurrency=${packages} --if-present ${filters} run test:component --pool.maxWorkers ${workers}`,
@@ -2137,7 +2137,7 @@ it('names every package integration suite and keeps native proofs one per runner
   expect(run?.if).toBe(BACKEND_INTEGRATION_CONDITION);
   expect(run?.env).toMatchObject({
     APP_ENV_PATH: '/dev/null',
-    ONTOS_CI_ISOLATED_WORKERS: '2',
+    ONTOS_CI_ISOLATED_WORKERS: '4',
     SPICEDB_DATABASE_PASSWORD: 'spicedb',
   });
   expect(run?.run?.trim()).toBe('bash scripts/ci/run-integration-suites.sh');
