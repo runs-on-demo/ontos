@@ -363,6 +363,14 @@ it.live(
           'retail-profile',
         ]);
         const existingStatus = yield* jobStatus(fixture, existing.jobId);
+        const benchEffects = yield* admin`select effect_key,state,version,outcome,lease_until::text as lease_until
+          from symmy_integration.job_effects where job_id=${existing.jobId} order by effect_key`;
+        const benchInvocations = yield* admin`select action_key,status,count(*)::integer as count
+          from core.action_invocations where tenant_id=${tenantId} group by action_key,status order by action_key,status`;
+        console.log(`BENCH-DIAG c14-existing ${JSON.stringify({ effects: benchEffects, invocations: benchInvocations, status: existingStatus })}`);
+        if (existingStatus.status !== 'completed_all') {
+          yield* dumpDiagnostics(fixture, worker);
+        }
         expect(existingStatus.status).toBe('completed_all');
         // One customer in the request is one item, whatever contacts and addresses the plan binds beside it.
         expect(existingStatus.items.map(({ outcome }) => outcome)).toEqual(['accepted']);
