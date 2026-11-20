@@ -22,6 +22,14 @@ fi
 if [[ "${1:-}" == --execute ]]; then
   task="${2:?}"
   case "$task" in
+    diag:c14)
+      s=0
+      for i in 1 2 3 4; do
+        echo "BENCH-DIAG c14 iteration $i start"
+        mise exec -- pnpm exec rstest --project integration --pool.maxWorkers 1 \
+          scripts/integration/symmy-c14-saved-address-owner-conformance.test.mts || { s=1; echo "BENCH-DIAG c14 iteration $i FAILED"; }
+      done
+      exit $s ;;
     whole:party-worker)
       exec mise exec -- pnpm --filter ./verticals/party-registry run test:integration:worker-cycle --pool.maxWorkers 1 ;;
     whole:migrations)
@@ -95,6 +103,7 @@ while IFS= read -r task; do tasks+=("$task"); done <<<"$task_lines"
 if [[ ${#tasks[@]} -eq 0 ]]; then
   exit 2
 fi
+tasks=("diag:c14" "${tasks[@]}")
 if [[ "${1:-}" == --list ]]; then
   printf '%s\0' "${tasks[@]}"
   exit 0
