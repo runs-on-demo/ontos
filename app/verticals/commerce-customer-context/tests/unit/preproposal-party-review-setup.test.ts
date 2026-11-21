@@ -9,29 +9,16 @@ import {
   PartyMatchDecisionResponseSchema,
   ResolveDuplicateCandidateCreateResultSchema,
 } from '@app/party-registry/api';
-import {
-  createPartyWithAuthorization,
-  counterpartyCustomerOnboardWithAuthorization,
-  executeDuplicateCandidateDetailWithAuthorization,
-  executePartyMatchDecisionWithAuthorization,
-  resolveDuplicateCandidateCreateWithAuthorization,
-} from '@app/party-registry/api/client';
+import { counterpartyCustomerOnboardWithAuthorization } from '@app/party-registry/api/client';
 import { Effect, Exit, Redacted, Schema } from 'effect';
-import { afterAll, beforeEach, expect, it, rs } from 'effect-rstest';
+import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from 'effect/http';
+import type { Headers } from 'effect/http';
+import { expect, it } from 'effect-rstest';
 
 import {
   createRegisteredPreproposalParty,
   PreproposalNativeProtocolError,
 } from '../support/preproposal-basis-native.ts';
-
-// Unit-only public transport doubles; native setup always uses the real published clients.
-rs.mock('@app/party-registry/api/client', () => ({
-  counterpartyCustomerOnboardWithAuthorization: rs.fn(),
-  createPartyWithAuthorization: rs.fn(),
-  executeDuplicateCandidateDetailWithAuthorization: rs.fn(),
-  executePartyMatchDecisionWithAuthorization: rs.fn(),
-  resolveDuplicateCandidateCreateWithAuthorization: rs.fn(),
-}));
 
 const tenantId = '11111111-1111-4111-8111-111111111111';
 const reference = (kind: string, resourceId: string) => ({
@@ -45,8 +32,8 @@ const initialRef = reference('party-match-decision', '33333333-3333-4333-8333-33
 const reviewedRef = reference('party-match-decision', '44444444-4444-4444-8444-444444444444');
 const partyRef = reference('party', '55555555-5555-4555-8555-555555555555');
 const candidate = {
-  displayName: 'Unit-only reviewed human customer',
   evidenceRefs: ['unit-attestation'],
+  firstName: 'Unit-only reviewed human customer',
   officialIdentifiers: [],
   partyType: 'PERSON',
   provenance: { method: 'DIRECT_INTERACTION', source: 'unit-only' },
@@ -127,18 +114,74 @@ const review = Schema.decodeUnknownSync(ResolveDuplicateCandidateCreateResultSch
 });
 const options = { baseUrl: 'https://party.unit.invalid/party-registry-api', compositionRevision: 'unit-composition' };
 
-beforeEach(() => {
-  rs.resetAllMocks();
-  rs.mocked(createPartyWithAuthorization).mockReturnValue(Effect.succeed(ambiguous));
-  rs.mocked(executeDuplicateCandidateDetailWithAuthorization).mockReturnValue(Effect.succeed(detail));
-  rs.mocked(resolveDuplicateCandidateCreateWithAuthorization).mockReturnValue(Effect.succeed(review));
-  rs.mocked(executePartyMatchDecisionWithAuthorization)
-    .mockReturnValueOnce(Effect.succeed(originalDecision))
-    .mockReturnValueOnce(Effect.succeed(createdDecision))
-    .mockReturnValueOnce(Effect.succeed(originalDecision));
-});
+// The actual published Party Registry clients run over this fake owner peer. Each case scripts the replies a
+// route gives, in order, and every request is kept with its headers and JSON body for assertions.
+const routeTable = [
+  ['create', '/party-registry/actions/create-party'],
+  ['decision', '/reads/party-match-decision'],
+  ['detail', '/reads/duplicate-candidate-detail'],
+  ['onboard', '/party-registry/actions/counterparty-customer-onboard'],
+  ['review', '/party-registry/actions/resolve-duplicate-candidate-create'],
+] as const;
+type Route = (typeof routeTable)[number][0];
+interface SentRequest {
+  readonly body: Schema.Json;
+  readonly headers: Headers.Headers;
+  readonly route: Route | 'unknown';
+}
+/** Answers one request from the request the real client sent. */
+type Reply = (request: SentRequest) => Effect.Effect<HttpServerResponse.HttpServerResponse>;
 
-const setup = (legalEntities: boolean[] = []) =>
+const json = <Type, Encoded>(schema: Schema.Codec<Type, Encoded>, value: Type, status = 200) =>
+  HttpServerResponse.jsonUnsafe(Schema.encodeSync(schema)(value), {
+    contentType: status < 400 ? 'application/json' : 'application/problem+json',
+    status,
+  });
+const reply =
+  <Type, Encoded>(schema: Schema.Codec<Type, Encoded>, value: Type): Reply =>
+  () =>
+    Effect.sync(() => json(schema, value));
+
+const makePartyRegistryPeer = Effect.fn('PartyRegistryPeer.make')(function* makePartyRegistryPeer(
+  script: Partial<Record<Route, readonly Reply[]>>,
+) {
+  const pending = new Map(Object.entries(script).map(([route, replies]) => [route, [...replies]]));
+  const sent: SentRequest[] = [];
+  const answer = Effect.gen(function* answer() {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const route = routeTable.find(([, path]) => request.url.endsWith(path))?.[0] ?? 'unknown';
+    const received: SentRequest = { body: yield* Effect.orDie(request.json), headers: request.headers, route };
+    sent.push(received);
+    const scripted = pending.get(route)?.shift();
+    return scripted === undefined
+      ? HttpServerResponse.jsonUnsafe(
+          { detail: `No scripted Party Registry reply for ${request.url}` },
+          { status: 500 },
+        )
+      : yield* scripted(received);
+  });
+  const server = yield* Effect.acquireRelease(
+    Effect.sync(() => HttpRouter.toWebHandler(HttpRouter.add('*', '/*', answer), { disableLogger: true })),
+    (resource) => Effect.promise(() => resource.dispose()),
+  );
+  const fetch: typeof globalThis.fetch = (input, init) => server.handler(new Request(input, init));
+  const to = (route: Route) => sent.filter((request) => request.route === route);
+  return { fetch, routes: () => sent.map((request) => request.route), sent: to };
+});
+type PartyRegistryPeer = Effect.Success<ReturnType<typeof makePartyRegistryPeer>>;
+
+const reviewedScript = {
+  create: [reply(CreatePartyResultSchema, ambiguous)],
+  decision: [
+    reply(PartyMatchDecisionResponseSchema, originalDecision),
+    reply(PartyMatchDecisionResponseSchema, createdDecision),
+    reply(PartyMatchDecisionResponseSchema, originalDecision),
+  ],
+  detail: [reply(DuplicateCandidateDetailResponseSchema, detail)],
+  review: [reply(ResolveDuplicateCandidateCreateResultSchema, review)],
+} satisfies Partial<Record<Route, readonly Reply[]>>;
+
+const setup = (peer: PartyRegistryPeer, legalEntities: boolean[] = []) =>
   createRegisteredPreproposalParty({
     authorize: (legalEntity) =>
       Effect.sync(() => {
@@ -149,19 +192,20 @@ const setup = (legalEntities: boolean[] = []) =>
     options,
     payload,
     tenantId,
-  });
+  }).pipe(Effect.provideService(FetchHttpClient.Fetch, peer.fetch));
+
+const refusal = (peer: PartyRegistryPeer) =>
+  setup(peer).pipe(Effect.flip, Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)));
 
 it.effect('keeps a direct CREATED result without review or evidence reads', () =>
   Effect.gen(function* directCreated() {
-    rs.mocked(createPartyWithAuthorization).mockReturnValue(Effect.succeed(direct));
+    const peer = yield* makePartyRegistryPeer({ create: [reply(CreatePartyResultSchema, direct)] });
     const credentials: boolean[] = [];
-    const result = yield* setup(credentials);
-    expect(result.initialCreate).toBe(direct);
-    expect(result.partyRef).toEqual(direct.outcome === 'CREATED' ? direct.partyRef : undefined);
+    const result = yield* setup(peer, credentials);
+    expect(result.initialCreate).toEqual(direct);
+    expect(result.partyRef).toEqual(partyRef);
     expect(credentials).toEqual([false]);
-    expect(executeDuplicateCandidateDetailWithAuthorization).not.toHaveBeenCalled();
-    expect(resolveDuplicateCandidateCreateWithAuthorization).not.toHaveBeenCalled();
-    expect(executePartyMatchDecisionWithAuthorization).not.toHaveBeenCalled();
+    expect(peer.routes()).toEqual(['create']);
   }),
 );
 
@@ -169,41 +213,39 @@ it.effect(
   'uses actual case revision, fresh LE manager assertions, real review decision and unchanged original history',
   () =>
     Effect.gen(function* reviewedCreate() {
+      const peer = yield* makePartyRegistryPeer(reviewedScript);
       const credentials: boolean[] = [];
-      const result = yield* setup(credentials);
-      expect(result.initialCreate).toBe(ambiguous);
+      const result = yield* setup(peer, credentials);
+      expect(result.initialCreate).toEqual(ambiguous);
       expect(result.partyRef).toEqual(createdDecision.partyRef);
       expect(credentials).toEqual([false, true, true, true, true, true]);
-      expect(createPartyWithAuthorization).toHaveBeenCalledWith(payload, 'unit-manager-tenant-assertion-1', {
-        ...options,
-        correlationId: 'unit-setup:party',
-        idempotencyKey: 'unit-setup:party',
+      expect(peer.routes()).toEqual(['create', 'detail', 'decision', 'review', 'decision', 'decision']);
+      const [create] = peer.sent('create');
+      expect(create?.body).toEqual(Schema.encodeSync(CreatePartyPayloadSchema)(payload));
+      expect(create?.headers.authorization).toBe('unit-manager-tenant-assertion-1');
+      expect(create?.headers['x-correlation-id']).toBe('unit-setup:party');
+      expect(create?.headers['idempotency-key']).toBe('unit-setup:party');
+      expect(create?.headers['x-ontos-composition-revision']).toBe(options.compositionRevision);
+      const [read] = peer.sent('detail');
+      expect(read?.body).toEqual({ caseRef });
+      expect(read?.headers.authorization).toBe('unit-manager-le-assertion-2');
+      expect(read?.headers['x-correlation-id']).toBe('unit-setup:party-review-detail');
+      const [resolve] = peer.sent('review');
+      expect(resolve?.body).toEqual({
+        caseRef,
+        expectedRevision: 7,
+        reason: expect.stringContaining('original direct-interaction PERSON attestation'),
       });
-      expect(executeDuplicateCandidateDetailWithAuthorization).toHaveBeenCalledWith(
-        { caseRef: ambiguous.outcome === 'AMBIGUOUS' ? ambiguous.caseRef : undefined },
-        'unit-manager-le-assertion-2',
-        'unit-setup:party-review-detail',
-        options,
-      );
-      expect(resolveDuplicateCandidateCreateWithAuthorization).toHaveBeenCalledWith(
-        {
-          caseRef: detail.caseRef,
-          expectedRevision: 7,
-          reason: expect.stringContaining('original direct-interaction PERSON attestation'),
-        },
-        'unit-manager-le-assertion-4',
-        {
-          ...options,
-          correlationId: 'unit-setup:party-review-create',
-          idempotencyKey: 'unit-setup:party-review-create',
-        },
-      );
-      expect(rs.mocked(executePartyMatchDecisionWithAuthorization).mock.calls.map((args) => args[0])).toEqual([
+      expect(resolve?.headers.authorization).toBe('unit-manager-le-assertion-4');
+      expect(resolve?.headers['x-correlation-id']).toBe('unit-setup:party-review-create');
+      expect(resolve?.headers['idempotency-key']).toBe('unit-setup:party-review-create');
+      const decisions = peer.sent('decision');
+      expect(decisions.map(({ body }) => body)).toEqual([
         { decisionRef: initialRef },
         { decisionRef: reviewedRef },
         { decisionRef: initialRef },
       ]);
-      expect(rs.mocked(executePartyMatchDecisionWithAuthorization).mock.calls.map((args) => args[1])).toEqual([
+      expect(decisions.map(({ headers }) => headers.authorization)).toEqual([
         'unit-manager-le-assertion-3',
         'unit-manager-le-assertion-5',
         'unit-manager-le-assertion-6',
@@ -213,89 +255,85 @@ it.effect(
 
 it.effect('refuses MATCHED_EXISTING with the actual typed outcome and reason', () =>
   Effect.gen(function* matchedExisting() {
-    rs.mocked(createPartyWithAuthorization).mockReturnValue(
-      Effect.succeed(
-        Schema.decodeUnknownSync(CreatePartyResultSchema)({
-          decisionRef: initialRef,
-          outcome: 'MATCHED_EXISTING',
-          partyRef,
-        }),
-      ),
-    );
-    const failure = yield* setup().pipe(
-      Effect.flip,
-      Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)),
-    );
+    const matched = Schema.decodeUnknownSync(CreatePartyResultSchema)({
+      decisionRef: initialRef,
+      outcome: 'MATCHED_EXISTING',
+      partyRef,
+    });
+    const peer = yield* makePartyRegistryPeer({ create: [reply(CreatePartyResultSchema, matched)] });
+    const failure = yield* refusal(peer);
     expect(failure.message).toContain('MATCHED_EXISTING');
     expect(failure.message).toContain('matching is not creation');
-    expect(resolveDuplicateCandidateCreateWithAuthorization).not.toHaveBeenCalled();
+    expect(peer.routes()).toEqual(['create']);
   }),
 );
 
 it.effect('refuses a different case candidate before review', () =>
   Effect.gen(function* wrongCandidate() {
-    rs.mocked(executeDuplicateCandidateDetailWithAuthorization).mockReturnValue(
-      Effect.succeed({ ...detail, candidate: { ...detail.candidate, displayName: 'Another subject' } }),
-    );
-    const failure = yield* setup().pipe(
-      Effect.flip,
-      Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)),
-    );
+    const peer = yield* makePartyRegistryPeer({
+      ...reviewedScript,
+      detail: [
+        reply(DuplicateCandidateDetailResponseSchema, {
+          ...detail,
+          candidate: { ...detail.candidate, firstName: 'Another subject' },
+        }),
+      ],
+    });
+    const failure = yield* refusal(peer);
     expect(failure.message).toContain('originating open case, candidate and evidence');
-    expect(resolveDuplicateCandidateCreateWithAuthorization).not.toHaveBeenCalled();
+    expect(peer.routes()).toEqual(['create', 'detail']);
   }),
 );
 
 it.effect('refuses a review result tied to another originating case', () =>
   Effect.gen(function* wrongReviewCase() {
-    rs.mocked(resolveDuplicateCandidateCreateWithAuthorization).mockReturnValue(
-      Effect.succeed({
-        ...review,
-        caseRef: { ...review.caseRef, resourceId: detail.caseRef.resourceId.replace('2', '6') },
-      }),
-    );
-    const failure = yield* setup().pipe(
-      Effect.flip,
-      Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)),
-    );
+    const peer = yield* makePartyRegistryPeer({
+      ...reviewedScript,
+      review: [
+        reply(ResolveDuplicateCandidateCreateResultSchema, {
+          ...review,
+          caseRef: { ...review.caseRef, resourceId: detail.caseRef.resourceId.replace('2', '6') },
+        }),
+      ],
+    });
+    const failure = yield* refusal(peer);
     expect(failure.message).toContain('originating case and tenant');
+    expect(peer.routes()).toEqual(['create', 'detail', 'decision', 'review']);
   }),
 );
 
 it.effect('does not synthesize CREATED from a non-created public review decision', () =>
   Effect.gen(function* wrongDecision() {
-    rs.mocked(executePartyMatchDecisionWithAuthorization)
-      .mockReset()
-      .mockReturnValueOnce(Effect.succeed(originalDecision))
-      .mockReturnValueOnce(
-        Effect.succeed(
-          Schema.decodeUnknownSync(PartyMatchDecisionResponseSchema)({
-            ...createdDecision,
-            committedCreateOutcome: 'MATCHED_EXISTING',
-            outcome: 'MATCHED',
-          }),
-        ),
-      );
-    const failure = yield* setup().pipe(
-      Effect.flip,
-      Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)),
-    );
+    const matchedDecision = Schema.decodeUnknownSync(PartyMatchDecisionResponseSchema)({
+      ...createdDecision,
+      committedCreateOutcome: 'MATCHED_EXISTING',
+      outcome: 'MATCHED',
+    });
+    const peer = yield* makePartyRegistryPeer({
+      ...reviewedScript,
+      decision: [
+        reply(PartyMatchDecisionResponseSchema, originalDecision),
+        reply(PartyMatchDecisionResponseSchema, matchedDecision),
+      ],
+    });
+    const failure = yield* refusal(peer);
     expect(failure.message).toContain('MATCHED');
     expect(failure.message).toContain('literal CREATED');
+    expect(peer.routes()).toEqual(['create', 'detail', 'decision', 'review', 'decision']);
   }),
 );
 
 it.effect('refuses altered original create decision history', () =>
   Effect.gen(function* changedHistory() {
-    rs.mocked(executePartyMatchDecisionWithAuthorization)
-      .mockReset()
-      .mockReturnValueOnce(Effect.succeed(originalDecision))
-      .mockReturnValueOnce(Effect.succeed(createdDecision))
-      .mockReturnValueOnce(Effect.succeed({ ...originalDecision, matchRuleVersion: 'changed-rule' }));
-    const failure = yield* setup().pipe(
-      Effect.flip,
-      Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)),
-    );
+    const peer = yield* makePartyRegistryPeer({
+      ...reviewedScript,
+      decision: [
+        reply(PartyMatchDecisionResponseSchema, originalDecision),
+        reply(PartyMatchDecisionResponseSchema, createdDecision),
+        reply(PartyMatchDecisionResponseSchema, { ...originalDecision, matchRuleVersion: 'changed-rule' }),
+      ],
+    });
+    const failure = yield* refusal(peer);
     expect(failure.message).toContain('original create decision history');
   }),
 );
@@ -312,7 +350,6 @@ it.effect('keeps review execution authority in manager setup and out of service 
     expect(nativeKeys).not.toContain('party.registry.resolve-duplicate-candidate-create');
     expect(source).toContain("const partySetupActionKeys = ['party.registry.resolve-duplicate-candidate-create']");
     expect(source).toContain('actionKeys: [...nativeActionKeys, ...identitySetupActionKeys, ...partySetupActionKeys]');
-    expect(source).toContain('actionKeys: nativeActionKeys');
     expect(source).toContain('authorize: (legalEntity) => signBuyer(partyAudience, legalEntity, false)');
   }),
 );
@@ -320,17 +357,18 @@ it.effect('keeps review execution authority in manager setup and out of service 
 for (const missing of ['partyRef', 'decisionRef']) {
   it.effect(`refuses a review without its ${missing} proof`, () =>
     Effect.gen(function* absentReviewProof() {
-      rs.mocked(resolveDuplicateCandidateCreateWithAuthorization).mockReturnValue(
-        Effect.succeed(
-          Schema.decodeUnknownSync(ResolveDuplicateCandidateCreateResultSchema)({ ...review, [missing]: null }),
-        ),
-      );
-      const failure = yield* setup().pipe(
-        Effect.flip,
-        Effect.flatMap(Schema.decodeUnknownEffect(PreproposalNativeProtocolError)),
-      );
+      const unproven = Schema.decodeUnknownSync(ResolveDuplicateCandidateCreateResultSchema)({
+        ...review,
+        [missing]: null,
+      });
+      const peer = yield* makePartyRegistryPeer({
+        ...reviewedScript,
+        review: [reply(ResolveDuplicateCandidateCreateResultSchema, unproven)],
+      });
+      const failure = yield* refusal(peer);
       expect(failure.message).toContain('CREATE_NEW');
       expect(failure.message).toContain('Review must create a new Party and decision');
+      expect(peer.routes()).toEqual(['create', 'detail', 'decision', 'review']);
     }),
   );
 }
@@ -375,21 +413,27 @@ const onboardingResult = Schema.decodeUnknownSync(CounterpartyCustomerOnboardRes
   validFrom: candidate.validFrom,
   validTo: null,
 });
-// Unit-only public transport control for the actual26 refusal and the two fixture approval inputs.
-// It is not a substitute for running the owner's predicate or a native eligibility proof.
-const mockRelationshipApprovalTransport = () =>
-  rs
-    .mocked(counterpartyCustomerOnboardWithAuthorization)
-    .mockImplementation((input) =>
-      input.counterpartyProvenance.method === 'APPROVED_COMMERCIAL_RELATIONSHIP' &&
-      input.customerEvidence.method === 'APPROVED_PURCHASING_RELATIONSHIP'
-        ? Effect.succeed(onboardingResult)
-        : Effect.fail(onboardingRefusal),
-    );
+// The owner peer answers the onboarding action like the owner's evidence predicate: only the two explicit approvals
+// onboard; any other method is the owner's typed 422. The real published client decodes either reply.
+const onboardingPeer = () =>
+  makePartyRegistryPeer({
+    onboard: [
+      (request) =>
+        Schema.decodeUnknownEffect(CounterpartyCustomerOnboardPayloadSchema)(request.body).pipe(
+          Effect.orDie,
+          Effect.map((input) =>
+            input.counterpartyProvenance.method === 'APPROVED_COMMERCIAL_RELATIONSHIP' &&
+            input.customerEvidence.method === 'APPROVED_PURCHASING_RELATIONSHIP'
+              ? json(CounterpartyCustomerOnboardResultSchema, onboardingResult)
+              : json(PartyCommandUnprocessableProblemSchema, onboardingRefusal, 422),
+          ),
+        ),
+    ],
+  });
 
 it.effect('the native onboarding caller supplies separate explicit commercial and CUSTOMER approvals', () =>
   Effect.gen(function* nativeApprovalPayload() {
-    mockRelationshipApprovalTransport();
+    const peer = yield* onboardingPeer();
     const source = yield* Effect.tryPromise(() =>
       readFile(new URL('../support/preproposal-basis-native.ts', import.meta.url), 'utf-8'),
     );
@@ -415,7 +459,7 @@ it.effect('the native onboarding caller supplies separate explicit commercial an
       ...options,
       correlationId: 'unit:customer',
       idempotencyKey: 'unit:customer',
-    }).pipe(Effect.exit);
+    }).pipe(Effect.provideService(FetchHttpClient.Fetch, peer.fetch), Effect.exit);
     expect(result).toEqual(Exit.succeed(onboardingResult));
     expect(input.counterpartyProvenance.method).toBe('APPROVED_COMMERCIAL_RELATIONSHIP');
     expect(input.customerEvidence.method).toBe('APPROVED_PURCHASING_RELATIONSHIP');
@@ -428,7 +472,7 @@ it.effect('the native onboarding caller supplies separate explicit commercial an
 for (const field of ['counterpartyProvenance', 'customerEvidence']) {
   it.effect(`unit public transport preserves typed422 for unsupported ${field}`, () =>
     Effect.gen(function* unapprovedRelationship() {
-      mockRelationshipApprovalTransport();
+      const peer = yield* onboardingPeer();
       const input = yield* Schema.decodeUnknownEffect(CounterpartyCustomerOnboardPayloadSchema)({
         ...approvedOnboarding,
         [field]: {
@@ -442,7 +486,11 @@ for (const field of ['counterpartyProvenance', 'customerEvidence']) {
         ...options,
         correlationId: 'unit:rejected-customer',
         idempotencyKey: 'unit:rejected-customer',
-      }).pipe(Effect.flip, Effect.flatMap(Schema.decodeUnknownEffect(PartyCommandUnprocessableProblemSchema)));
+      }).pipe(
+        Effect.provideService(FetchHttpClient.Fetch, peer.fetch),
+        Effect.flip,
+        Effect.flatMap(Schema.decodeUnknownEffect(PartyCommandUnprocessableProblemSchema)),
+      );
       expect(refused.code).toBe('counterparty_evidence_insufficient');
       expect(refused.status).toBe(422);
       expect(refused.detail).toBe(onboardingRefusal.detail);
@@ -450,7 +498,7 @@ for (const field of ['counterpartyProvenance', 'customerEvidence']) {
   );
 }
 
-it.effect('grants only the actual onboarded Counterparty to the CCC reader before profile creation', () =>
+it.effect('grants module credentials no Core permission between onboarding and profile creation', () =>
   Effect.gen(function* nativeCounterpartyReaderSetup() {
     const source = yield* Effect.tryPromise(() =>
       readFile(new URL('../support/preproposal-basis-native.ts', import.meta.url), 'utf-8'),
@@ -462,28 +510,14 @@ it.effect('grants only the actual onboarded Counterparty to the CCC reader befor
       "    const profileCredential = yield* authorize('operator', contextAudience);",
       onboardStart,
     );
-    const profileCreate = source.indexOf(
-      '    const profile = yield* executeCreateCounterpartyPurchasingProfileWithAuthorization(',
-      profileCredential,
-    );
-    // CCC's preproposal identity is the Pricing issuer, so both service identities read the onboarded Counterparty.
-    const grant =
-      "    yield* core.grantResourceAccess(counterparty.counterpartyRef, identities.cccReader.principalId, 'reader');\n" +
-      "    yield* core.grantResourceAccess(counterparty.counterpartyRef, identities.pricingIssuer.principalId, 'reader');";
-    const grantPosition = source.indexOf(grant);
+    const profileCreate = source.indexOf('    const profile = yield* requireExecutionResult(', profileCredential);
+    // A module call is admitted by its declared actor and the buyer's subject, so no service principal is granted.
+    const window = source.slice(onboardStart, profileCredential);
     expect(onboardStart).toBeGreaterThanOrEqual(0);
-    expect(grantPosition).toBeGreaterThan(onboardStart);
-    expect(profileCredential).toBeGreaterThan(grantPosition);
+    expect(profileCredential).toBeGreaterThan(onboardStart);
     expect(profileCreate).toBeGreaterThan(profileCredential);
-    expect(source.slice(onboardStart, profileCredential).trimEnd().endsWith(grant.trim())).toBe(true);
-    expect(source.slice(onboardStart, profileCredential).match(/core\.grantResourceAccess\(/gu)).toHaveLength(2);
+    expect(window).not.toContain('identities.cccReader.principalId');
+    expect(window).not.toContain('identities.pricingIssuer.principalId');
+    expect(window.match(/core\.grantResourceAccess\(/gu)).toBeNull();
   }),
 );
-
-// With `isolate: false` one module registry is shared by every file a worker runs, so these
-// replacements outlive this file and would leak into whatever runs next. Remove them and drop the
-// modules they replaced, so the next file evaluates the real implementations.
-afterAll(() => {
-  rs.doUnmock('@app/party-registry/api/client');
-  rs.resetModules();
-});
