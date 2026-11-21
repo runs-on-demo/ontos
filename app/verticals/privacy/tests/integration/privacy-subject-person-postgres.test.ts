@@ -15,6 +15,7 @@ import {
   ReadRuntime,
   runAction,
   TrustedPrincipalContextSchema,
+  makeActiveApplicationCompositionService,
 } from '@app/core-runtime';
 import { NodeChildProcessSpawner, NodeCrypto, NodeHttpServer, NodeServices } from '@effect/platform-node';
 import {
@@ -24,9 +25,10 @@ import {
   executeDuplicateCandidateDetailWithAuthorization,
   resolveDuplicateCandidateCreateWithAuthorization,
 } from '@app/party-registry/api/client';
-import { EXTERNAL_GATEWAY_ASSERTION_VERSION } from '@app/shared-contracts';
+import { EXTERNAL_GATEWAY_ASSERTION_VERSION, GATEWAY_ASSERTION_TTL_SECONDS } from '@app/shared-contracts';
 import { SignJWT, decodeJwt, exportJWK, generateKeyPair } from 'jose';
 import {
+  DateTime,
   Config,
   Context,
   Crypto,
@@ -65,6 +67,7 @@ import { privacyOperationRepositoryForScope } from '../../src/persistence/privac
 it.live('rejects resolved person admission without authoritative Party proof in the native owner factory', () =>
   Effect.gen(function* unprovenPersonNative() {
     const native = yield* makeNativeReadTestContext({
+      access: 'allowed',
       contextPermissions: ['privacy.subjects.read'],
       moduleId: 'privacy.core',
       ownerFixtureRetention: 'retain-complete-context',
@@ -119,6 +122,7 @@ it.live('rejects resolved person admission without authoritative Party proof in 
 it.live('foreign-only Subject references cannot select all trusted-Tenant records', () =>
   Effect.gen(function* exactForeignSubjectSelection() {
     const native = yield* makeNativeReadTestContext({
+      access: 'allowed',
       contextPermissions: ['privacy.subjects.read'],
       moduleId: 'privacy.core',
       ownerFixtureRetention: 'retain-complete-context',
@@ -390,6 +394,7 @@ it.layer(publicProofServices, { excludeTestServices: true })('actual Party owner
       }
       const fixture = yield* Effect.acquireRelease(
         makeLiveOperationFixture({
+          access: 'allowed',
           actionKeys: [
             'party.registry.create-party',
             'party.registry.archive-party',
@@ -398,7 +403,7 @@ it.layer(publicProofServices, { excludeTestServices: true })('actual Party owner
           ],
           adminConnectionString: Redacted.make(isolated.connections.admin.connectionString),
           allowedAudiences: ['party-registry', 'privacy'],
-          applicationComposition: { load: Effect.succeed(snapshot) },
+          applicationComposition: makeActiveApplicationCompositionService(Effect.succeed(snapshot)),
           authenticationNamespaceId: STAFF_AUTHENTICATION_NAMESPACE_ID,
           compositionRevision: snapshot.composition.revision,
           expectedDeployment: description.privacyContract.deployment,
@@ -484,6 +489,7 @@ it.layer(publicProofServices, { excludeTestServices: true })('actual Party owner
       const baseUrl = `http://127.0.0.1:${ready.port}/party-registry-api`;
       const authorization = Effect.fn('PersonOwnerTest.authorization')(function* freshAuthorization() {
         const id = yield* nextId();
+        const issuedAt = Math.floor((yield* DateTime.nowAsDate).getTime() / 1000);
         const token = yield* Effect.tryPromise(() =>
           new SignJWT({
             compositionRevision: snapshot.composition.revision,
@@ -495,8 +501,8 @@ it.layer(publicProofServices, { excludeTestServices: true })('actual Party owner
             .setIssuer(issuer)
             .setAudience('party-registry')
             .setSubject(principal.principalId)
-            .setIssuedAt()
-            .setExpirationTime('5m')
+            .setIssuedAt(issuedAt)
+            .setExpirationTime(issuedAt + GATEWAY_ASSERTION_TTL_SECONDS)
             .setJti(id)
             .sign(pair.privateKey),
         );
@@ -566,10 +572,10 @@ it.layer(publicProofServices, { excludeTestServices: true })('actual Party owner
         const result = yield* createPartyWithAuthorization(
           yield* Schema.decodeUnknownEffect(CreatePartyPayloadSchema)({
             candidate: {
-              displayName: `Privacy ${partyType}`,
               evidenceRefs: ['review/privacy-owner'],
               officialIdentifiers: [],
               partyType,
+              [partyType === 'PERSON' ? 'firstName' : 'businessName']: `Privacy ${partyType}`,
               provenance: { method: 'DOCUMENT', source: 'privacy-owner-native' },
               subjectEvidence: [
                 {
