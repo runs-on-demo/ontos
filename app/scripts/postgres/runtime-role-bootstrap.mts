@@ -221,6 +221,10 @@ export const grantSharedRuntimeRole = (
         'grant select, insert, delete on table catalog.gateway_assertion_redemptions to ontos_runtime',
       );
     }
+    if (yield* exists(client, schemaExistsQuery, 'promotion')) {
+      yield* query(client, 'revoke all on schema promotion from public, ontos_runtime');
+      yield* query(client, 'grant usage on schema promotion to ontos_runtime');
+    }
     // Durable owner fences retain their exact migration grants after any shared-schema grants.
     yield* Effect.forEach(
       entry.tableGrantExceptions ?? [],
@@ -235,6 +239,9 @@ export const grantSharedRuntimeRole = (
             return;
           }
           const role = quoteIdentifier(entry.identity.role);
+          if (table === 'assortment.gateway_assertion_redemptions') {
+            yield* query(client, `grant usage on schema assortment to ${role}`);
+          }
           yield* query(client, `revoke all on table ${qualifiedRelation(table)} from public, ${role}`);
           yield* Effect.forEach(privileges, grantTablePrivilege(client, table, columns, role), {
             concurrency: 1,
