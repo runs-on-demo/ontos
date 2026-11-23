@@ -1250,17 +1250,18 @@ it('warms the caches on the image of every gate job that restores them', () => {
   });
   const source = readFileSync(GATES_WORKFLOW_URL, 'utf-8');
   const { jobs } = Schema.decodeUnknownSync(schema)(parse(source));
-  const image = jobs['warm-caches']?.['runs-on'];
+  // Benchmark harness (runs-on-demo/ontos, arm G): jobs run on machines sized for their load, so the
+  // labels differ only in the instance family; the image, extras and every other part must match.
+  const withoutFamily = (label: string | undefined) => label?.replace(/\/family=[^/]+/u, '');
+  const image = withoutFamily(jobs['warm-caches']?.['runs-on']);
   const restorers = (jobs['workspace-gates']?.needs ?? []).filter((job) =>
     (jobs[job]?.steps ?? []).some(({ uses }) => uses === INSTALL_APP_ACTION),
   );
   expect(restorers.length).toBeGreaterThan(10);
+  expect(image).toContain('/image=');
   for (const job of restorers) {
-    expect(jobs[job]?.['runs-on'], job).toBe(image);
+    expect(withoutFamily(jobs[job]?.['runs-on']), job).toBe(image);
   }
-  // One label, written once: a job cannot follow a new image without the warmer following it too.
-  expect(source.match(/runs-on: &gate-image /gu)).toHaveLength(1);
-  expect(source.match(/runs-on: \*gate-image$/gmu)).toHaveLength(restorers.length);
 });
 
 it('saves no toolchain under a merge group ref, which no later run can read', () => {
