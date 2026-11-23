@@ -929,7 +929,7 @@ jobs:
       contents: read
     needs: [ci-plan, node-artifact-build]
     if: ${{ !cancelled() && needs.ci-plan.result == 'success' && needs.node-artifact-build.result == 'success' && fromJSON(needs.ci-plan.outputs.expected)['service-integration'] == 'success' }}
-    runs-on: runs-on=${{ github.run_id }}/family=m8a.large/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
+    runs-on: runs-on=${{ github.run_id }}/family=m8a.xlarge/image=ubuntu26-full-x64/extras=s3-cache+git-cache+apt-cache+ecr-pull-through/env=dev-sujoysingh
     timeout-minutes: 30
     strategy:
       fail-fast: false
