@@ -6,6 +6,7 @@ import {
   Crypto,
   Data,
   DateTime,
+  Duration,
   Effect,
   Exit,
   Layer,
@@ -80,8 +81,7 @@ import type { ContextPermissionAccessTarget } from '../permissions/context-acces
 import { makeActionPermissionLive } from '../permissions/service.ts';
 import { fullyConsistent } from '../permissions/client.ts';
 import { OwnerAuthorizationOverlay, failClosedOwnerAuthorizationOverlay } from '../access/enforcement/owner-overlay.ts';
-import { openSpiceDbGrpcRpc } from '../permissions/spicedb-grpc-rpc.ts';
-import type { SpiceDbRpc, SpiceDbRpcError } from '../permissions/spicedb-rpc.ts';
+import { newSpiceDbGrpcClient } from '../permissions/spicedb-grpc-rpc.ts';
 import { makeScriptedBoundAccessGate, makeTestOperationalScopeAccess, TEST_ACCESS_OUTCOMES } from './access-gate.ts';
 import { ReadRuntime, makeReadRuntime } from '../reads/runtime.ts';
 import type { ReadRuntimeOptions } from '../reads/runtime.ts';
@@ -93,8 +93,7 @@ interface FixturePermissionEnvironment {
   ULTRAMODERN_DEPLOYMENT_ENVIRONMENT?: string;
 }
 
-/** The fixture's SpiceDB deadline per call: the 30 s the fixture always allowed an external call. */
-const LIVE_FIXTURE_SPICEDB_TIMEOUT_MS = 30_000;
+const LIVE_FIXTURE_EXTERNAL_TIMEOUT = Duration.seconds(30);
 const LOAD_EVIDENCE_FAILURE = 'Unable to load live fixture evidence';
 const LOCAL_DATABASE_HOSTS: ReadonlySet<string> = new Set(['localhost', '127.0.0.1']);
 const fixturePartyModule = 'party.registry';
@@ -245,15 +244,19 @@ const validateFixtureRuntimeBindings = Effect.fn('LiveOperations.validateRuntime
   },
 );
 
-/**
- * One SpiceDB call of the fixture, bounded by the client's deadline. The failure's cause is the transport's own
- * error: the gRPC status SpiceDB answered with, or the deadline's timeout.
- */
-const attemptFixtureSpiceDb = <Value>(
+const attemptFixturePromise = <Value>(
   reason: string,
-  operation: Effect.Effect<Value, SpiceDbRpcError>,
+  operation: () => PromiseLike<Value>,
 ): Effect.Effect<Value, LiveOperationFixtureError> =>
-  operation.pipe(Effect.mapError(({ cause }) => fixtureFailure(reason, cause)));
+  Effect.tryPromise({
+    catch: (cause) => fixtureFailure(reason, cause),
+    try: operation,
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: LIVE_FIXTURE_EXTERNAL_TIMEOUT,
+      orElse: () => Effect.fail(fixtureFailure(`${reason}: timed out`)),
+    }),
+  );
 
 const verifyFixturePermission = Effect.fn('LiveOperations.verifyFixturePermission')(
   function* verifyFixturePermissionEffect(
@@ -270,9 +273,9 @@ const verifyFixturePermission = Effect.fn('LiveOperations.verifyFixturePermissio
       resource: { objectId: resourceId, objectType: resourceType },
       subject: { object: { objectId: principalId, objectType: 'principal' } },
     });
-    const result = yield* attemptFixtureSpiceDb(
+    const result = yield* attemptFixturePromise(
       'Unable to verify live fixture authorization',
-      spice.checkPermission(request),
+      spice.promises.checkPermission.bind(spice.promises, request),
     );
     const expected = allowed
       ? v1.CheckPermissionResponse_Permissionship.HAS_PERMISSION
@@ -285,7 +288,7 @@ const verifyFixturePermission = Effect.fn('LiveOperations.verifyFixturePermissio
 );
 
 type FixtureExecutor = (typeof CoreDatabase)['Service']['executor'];
-type FixtureSpiceClient = SpiceDbRpc;
+type FixtureSpiceClient = ReturnType<typeof v1.NewClient>;
 const FixtureFaultSchema = Schema.Literals(['lost-ack', 'rollback']);
 type FixtureFault = typeof FixtureFaultSchema.Type;
 
@@ -508,9 +511,10 @@ const prepareFixtureNamespaceProvisioning = Effect.fn('LiveOperations.prepareNam
     const namespaceCleanup =
       namespaceRelationships.length === 0
         ? Effect.void
-        : attemptFixtureSpiceDb(
+        : attemptFixturePromise(
             'Unable to remove fixture-owned namespace provisioning relationships',
-            spice.writeRelationships(
+            spice.promises.writeRelationships.bind(
+              spice.promises,
               v1.WriteRelationshipsRequest.create({
                 updates: namespaceRelationships.map((item) =>
                   v1.RelationshipUpdate.create({
@@ -685,9 +689,9 @@ const setupLiveOperationFixture = Effect.fn('LiveOperations.setupLiveOperationFi
         }),
       ),
     });
-    yield* attemptFixtureSpiceDb(
+    yield* attemptFixturePromise(
       'Unable to write live fixture authorization relationships',
-      input.spice.writeRelationships(writeRelationshipsRequest),
+      input.spice.promises.writeRelationships.bind(input.spice.promises, writeRelationshipsRequest),
     );
     if (input.managerIdentityAdmin === true) {
       yield* Effect.forEach(
@@ -840,9 +844,9 @@ const grantFixtureResourceAccess = Effect.fn('LiveOperations.grantResourceAccess
         }),
       ),
     });
-    return yield* attemptFixtureSpiceDb(
+    return yield* attemptFixturePromise(
       'Unable to grant live fixture resource access',
-      spice.writeRelationships(writeRelationshipsRequest),
+      spice.promises.writeRelationships.bind(spice.promises, writeRelationshipsRequest),
     );
   },
 );
@@ -886,21 +890,21 @@ const grantFixtureContextPermissionAccess = Effect.fn('LiveOperations.grantConte
         }),
       ),
     });
-    yield* attemptFixtureSpiceDb(
+    yield* attemptFixturePromise(
       'Unable to grant live fixture context permission access',
-      spice.writeRelationships(request),
+      spice.promises.writeRelationships.bind(spice.promises, request),
     );
     return yield* verifyFixturePermission(spice, principal, 'context_permission', objectId, 'access', true);
   },
 );
 
-interface FixtureConfiguredModuleState<State = 'active' | 'suspended' | 'read_only'> {
+interface FixtureConfiguredModuleState {
   readonly moduleKey: string;
-  readonly state: State;
+  readonly state: 'active' | 'suspended';
 }
-type FixtureConfiguredModuleStateSetter = <State extends FixtureConfiguredModuleState['state']>(
-  ...request: [moduleKey: string, state: State]
-) => Effect.Effect<FixtureConfiguredModuleState<State>, LiveOperationFixtureError>;
+type FixtureConfiguredModuleStateSetter = (
+  ...request: [moduleKey: string, state: 'active' | 'suspended']
+) => Effect.Effect<FixtureConfiguredModuleState, LiveOperationFixtureError>;
 
 const invalidConfiguredFixtureModuleState = (cause?: unknown) =>
   fixtureFailure('Invalid configured fixture module state mutation', cause);
@@ -909,14 +913,14 @@ const makeFixtureConfiguredModuleStateSetter = (
   adminConfiguration: Effect.Success<ReturnType<typeof parseFixtureDatabaseConfig>>,
   { moduleKeys, tenantId }: { readonly moduleKeys: ReadonlySet<string>; readonly tenantId: string },
 ): FixtureConfiguredModuleStateSetter =>
-  Effect.fn('LiveOperations.setConfiguredModuleState')(function* setConfiguredModuleState<
-    State extends FixtureConfiguredModuleState['state'],
-  >(...request: [moduleKey: string, state: State]) {
+  Effect.fn('LiveOperations.setConfiguredModuleState')(function* setConfiguredModuleState(
+    ...request: Parameters<FixtureConfiguredModuleStateSetter>
+  ) {
     const [moduleKey, state] = yield* Schema.decodeUnknownEffect(
       Schema.Tuple([ServiceFixtureModuleKeySchema, TenantModuleStateSchema]),
       { onExcessProperty: 'error' },
     )(request).pipe(Effect.mapError(invalidConfiguredFixtureModuleState));
-    if (!moduleKeys.has(moduleKey) || (state !== 'active' && state !== 'suspended' && state !== 'read_only')) {
+    if (!moduleKeys.has(moduleKey) || (state !== 'active' && state !== 'suspended')) {
       return yield* invalidConfiguredFixtureModuleState();
     }
     return yield* Effect.scoped(
@@ -941,8 +945,7 @@ const makeFixtureConfiguredModuleStateSetter = (
                   .returning({
                     moduleKey: tenantModuleStates.moduleKey,
                     tenantId: tenantModuleStates.tenantId,
-                  })
-                  .pipe(Effect.withSpan('LiveOperations.setConfiguredModuleState'));
+                  });
                 if (changed.length !== 1 || changed[0]?.tenantId !== tenantId || changed[0]?.moduleKey !== moduleKey) {
                   return yield* fixtureFailure(
                     'Configured fixture module state update did not match exactly one existing row',
@@ -965,7 +968,7 @@ const makeFixtureConfiguredModuleStateSetter = (
                 ) {
                   return yield* fixtureFailure('Configured fixture module state readback did not match the update');
                 }
-                return { moduleKey: row.moduleKey, state: request[1] };
+                return { moduleKey: row.moduleKey, state: row.state };
               },
             ),
           )
@@ -1014,9 +1017,9 @@ const revokeFixtureResourceAccess = Effect.fn('LiveOperations.revokeResourceAcce
         }),
       ],
     });
-    return yield* attemptFixtureSpiceDb(
+    return yield* attemptFixturePromise(
       'Unable to revoke live fixture resource access',
-      spice.writeRelationships(request),
+      spice.promises.writeRelationships.bind(spice.promises, request),
     );
   },
 );
@@ -1138,9 +1141,9 @@ const grantExistingFixtureService = Effect.fn('LiveOperations.grantExistingServi
         v1.RelationshipUpdate.create({ operation: v1.RelationshipUpdate_Operation.TOUCH, relationship: item }),
       ),
     });
-    yield* attemptFixtureSpiceDb(
+    yield* attemptFixturePromise(
       'Unable to grant live fixture service authorization',
-      spice.writeRelationships(request),
+      spice.promises.writeRelationships.bind(spice.promises, request),
     );
     yield* permissionCheck('tenant', fixture.tenantId, 'access', true);
     yield* permissionCheck('legal_entity', entityObject, 'access', true);
@@ -1392,9 +1395,9 @@ const makeLiveOperationRuntime = Effect.fn('LiveOperations.makeRuntime')(functio
             }),
           ],
         });
-        return yield* attemptFixtureSpiceDb(
+        return yield* attemptFixturePromise(
           'Unable to change live fixture manager module access',
-          spice.writeRelationships(request),
+          spice.promises.writeRelationships.bind(spice.promises, request),
         );
       },
     ),
@@ -1507,7 +1510,7 @@ const makeLiveOperationFixtureEffect = Effect.fn('LiveOperations.makeLiveOperati
       Scope.provide(databaseScope),
       Effect.mapError((cause) => fixtureFailure('Unable to initialize fixture database', cause)),
     );
-    const spice = openSpiceDbGrpcRpc(spiceDb, LIVE_FIXTURE_SPICEDB_TIMEOUT_MS);
+    const spice = newSpiceDbGrpcClient(spiceDb);
     const [tenantId, legalEntityId] = yield* Effect.all([makeFixtureId(), makeFixtureId()], {
       concurrency: 2,
     });
@@ -1761,7 +1764,7 @@ export const makeLiveOperationFixtureRuntime = Effect.fn('LiveOperations.attachR
     if (!spiceDb.endpoint.startsWith('localhost:')) {
       return yield* fixtureFailure('Runtime fixture requires disposable localhost services');
     }
-    const spice = openSpiceDbGrpcRpc(spiceDb, LIVE_FIXTURE_SPICEDB_TIMEOUT_MS);
+    const spice = newSpiceDbGrpcClient(spiceDb);
     yield* Effect.addFinalizer(() => Effect.sync(spice.close.bind(spice))).pipe(Scope.provide(databaseScope));
     const closeResources = Scope.close(databaseScope, Exit.void);
     return yield* makeLiveOperationRuntime({

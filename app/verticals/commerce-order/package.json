@@ -82,5 +82,6 @@
       "registration": "./vertical.registration.ts",
       "schemaVersion": 2
     }
-  }
+  },
+  "type": "module"
 }
